@@ -1,0 +1,62 @@
+[package]
+name = "bugfinder"
+version = "1.0.0"
+edition = "2021"
+description = "Ultra-lightweight GlitchTip & Sentry drop-in clone in pure Rust (<15 MB VmRSS)"
+license = "MIT"
+
+[lib]
+name = "bugfinder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bugfinder"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path", "original-uri"] }
+http = "1.1"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+brotli = "7"
+ruzstd = "0.7"
+scrypt = { version = "0.11", default-features = false, features = ["std", "simple"] }
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+regex = { version = "1.11", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.10"
+webpki-roots = "0.26"
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.test.package.scrypt]
+opt-level = 3
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
