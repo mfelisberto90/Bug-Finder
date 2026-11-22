@@ -2,8 +2,11 @@
 name = "bugfinder"
 version = "1.0.0"
 edition = "2021"
-description = "Ultra-lightweight GlitchTip & Sentry drop-in clone in pure Rust (<15 MB VmRSS)"
+description = "Ultra-lightweight Rust error tracking, structured logs, OTLP, uptime monitoring & Anti-REA security shield (<15 MB VmRSS)"
+readme = "README.md"
 license = "MIT"
+keywords = ["error-tracking", "sentry", "observability", "opentelemetry", "security"]
+categories = ["web-programming::http-server", "development-tools::debugging"]
 
 [lib]
 name = "bugfinder"

@@ -1,17 +1,27 @@
 # Bug-Finder
 
-**Ultra-lightweight Error Tracking, Structured Logs, Performance Tracing & Uptime Monitoring in pure Rust** — a single **~6.5 MB** native binary running at **~8–11 MB VmRSS**, with drop-in compatibility for **Sentry SDKs**, **GlitchTip clients**, and **OpenTelemetry OTLP/HTTP**.
+[![Rust](https://img.shields.io/badge/Rust-Axum%20%2B%20Tokio-000000?logo=rust)](Cargo.toml)
+[![Memory](https://img.shields.io/badge/VmRSS-~8--11%20MB-16a34a)](#measured-benchmarks-empirical-single-host-comparison)
+[![Binary](https://img.shields.io/badge/Single%20Binary-~6.5%20MB-2563eb)](#quickstart)
+[![Telemetry](https://img.shields.io/badge/Protocols-Sentry%20%7C%20GlitchTip%20%7C%20OTLP-7c3aed)](#connect-any-app-in-30-seconds)
+[![Security](https://img.shields.io/badge/Defense-Anti--REA%20Shield%20%2B%20FORCE%20RLS-dc2626)](#anti-rea-security-shield-secret-leak-radar--mini-ids)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0d9488.svg)](Cargo.toml)
+
+**Ultra-lightweight Error Tracking, Structured Logs, Performance Tracing, Uptime Heartbeats & Active Runtime Security (Anti-REA Shield + Mini-IDS) in pure Rust** — compiled into a single **~6.5 MB** native executable running at **~8–11 MB VmRSS**, with drop-in compatibility for **Sentry SDKs**, **GlitchTip clients**, and **OpenTelemetry OTLP/HTTP**.
 
 ![Bug-Finder Issues Inbox](docs/screenshots/issues-inbox.png)
 
-## Why Bug-Finder?
+## What Bug-Finder Covers (Full Capabilities)
 
-Modern error-tracking stacks routinely demand **1–16+ GB of RAM** and half a dozen stateful containers before capturing a single exception. **Bug-Finder** collapses the entire ingestion pipeline, full-text search engine, source-map demangler, alert dispatcher, embedded web SPA, and runtime security shield into **one static-friendly Rust executable**:
+Bug-Finder combines observability and application self-defense into one self-contained Rust server without external queues or caches:
 
-- **Zero External Infrastructure Required (SQLite WAL + FTS5)** or scale out to **PostgreSQL 17** with strict `ENABLE + FORCE ROW LEVEL SECURITY` (`NOBYPASSRLS`).
-- **Drop-In Protocol Compatibility**: works with official Sentry SDKs (`@sentry/browser`, `@sentry/node`, `sentry-sdk`, `sentry-laravel`), GlitchTip clients (`/store/`, `/issues/`, `/stats_v2/`, `/heartbeat_check/`), and **OpenTelemetry OTLP/HTTP** (`application/x-protobuf` & JSON on `/v1/logs`).
-- **Under-3 KB Zero-Dep Browser SDK + 1-Click Connect App Wizard**: auto-captures `window.onerror`, `unhandledrejection`, click breadcrumbs, optional HTTP `5xx`/`console.error`, Anti-AdBlock tunnel routing (`/t/:slug`), and Sri (`sha384`) integrity.
-- **Enterprise-Grade Defense in Depth Built In**: `enc:v1:` AEAD at rest (`HKDF-SHA256` + `AES-256-GCM`), tamper-evident `SHA-256` hash-chained audit trail, TOTP RFC 6238 2FA + WebAuthn Passkeys + pure-Rust OIDC PKCE SSO, pre-connect DNS SSRF guard, per-request CSP nonces, in-place zero-alloc PII/JWT/PEM/Luhn scrubber, and built-in **Anti-REA Shield + Log-IDS**.
+1. **Error Tracking & SourceMap v3 Demangling** — Full-text FTS5 issue search, deterministic grouping & smart regression detection, stack traces with source context, breadcrumbs, CSV formula-safe exports, inbound filters (crawler/extension/domain allowlists), and LRU-cached SourceMap v3 VLQ demangling in pure Rust.
+2. **Structured Logs, OpenTelemetry OTLP & Live Tail** — Ingest Sentry `log` v2 envelopes, OTLP/HTTP (`application/x-protobuf` and JSON on `/v1/logs`), direct JSON logs, or terminal streams via `bugfinder wrap`/`pipe`, all correlated by `trace_id`/`span_id` and streamed live via SSE or CLI `bugfinder tail`.
+3. **Performance & Release Health** — Track endpoint latency percentiles (`p50` / `p95`), crash-free session rates, and issue volume across releases.
+4. **Uptime Heartbeats & Multi-Channel Alerts** — Check-in endpoints (`/heartbeat_check/:uuid/`) for cron jobs and microservices, plus event/threshold/fatal/uptime/security alerting to **Telegram** (AEAD-encrypted bot token), **Discord** Rich Embeds, **Slack**, **HMAC-signed Webhooks**, and native **TLS SMTP**.
+5. **Anti-REA Security Shield, Secret Leak Radar & Log-Driven Mini-IDS** — Active protection against reverse engineering, automated browser bots (CDP/Playwright/Puppeteer/WebDriver), monkey-patched hooks, source-map harvesting, canary endpoints (`/.env`, `/.git/config`), exploit payloads in logs, and accidental credential leaks (`JWT`, Bearer, PEM, API keys, Luhn PANs), paired with CGNAT-safe session/HMAC-IP quarantines and `ETag`-cached edge blocklist syncing.
+6. **Zero-Leak Same-Origin Proxy Pattern** — Serve the `< 3 KB` Mini-SDK, Anti-REA Shield, and ingestion endpoints under neutral first-party paths (`/_obs/*`) while locking the admin UI completely behind Cloudflare Zero Trust Access or a private VPN.
+7. **Enterprise Security, Auto-Check & AI MCP Server** — PostgreSQL 17 `ENABLE + FORCE ROW LEVEL SECURITY` (`NOBYPASSRLS`), `enc:v1:` AEAD at rest, immutable `SHA-256` hash-chained audit logs, TOTP 2FA + WebAuthn Passkeys + OIDC PKCE SSO, self-diagnostics (`Auto-Check` / `bugfinder doctor`), and a read-only stdio **MCP server** for AI debugging assistants.
 
 ---
 
@@ -77,6 +87,41 @@ Zero-dependency TypeScript SPA designed for fast mobile triage with bottom Thumb
 <p align="center">
   <img src="docs/screenshots/mobile-issues.png" alt="Bug-Finder Mobile Issues View" width="380" />
 </p>
+
+---
+
+## Anti-REA Security Shield, Secret Leak Radar & Mini-IDS
+
+Beyond passive crash logging, Bug-Finder ships an integrated active defense subsystem across three layers — **Browser Runtime**, **Backend Middleware**, and **Log/Payload Inspection** (`sdks/browser/bugfinder-shield.js` + `src/security/anti_rea.rs`):
+
+### What Anti-REA & Mini-IDS Cover
+
+| Layer | Detections & Active Controls |
+|---|---|
+| **Browser Anti-REA (`bugfinder-shield.js`)** | Detects `navigator.webdriver` / `HeadlessChrome` / `PhantomJS` (`webdriver_detected`), DevTools/CDP & automation bindings (`$cdc_*`, `cdc_*`, `__playwright__binding__`, `__pwInitScripts`, `_phantom`, `__nightmare`), post-init monkey-patching of `fetch`, `XMLHttpRequest.prototype.open`, `WebSocket`, or `Function.prototype.toString` (`runtime_hook_tamper`), getter traps on canary globals (`__BF_INTERNAL_SECRETS__` -> `honeypot_access`), and optional `MutationObserver` script-origin enforcement (`dom_script_injection`). |
+| **Enforcement Modes (`detect` / `defend` / `lockdown`)** | Deduplicates identical signal signatures for 30s (`sendBeacon` / `keepalive` `fetch`); skips `localhost`/`127.0.0.1`/`::1` unless `allowLocalhost: true`. When `risk_score >= threshold` under `defend` or `lockdown`, clears configured `clearStorageKeys` across `localStorage`/`sessionStorage` and enters locked-down state (`isLockedDown()`). |
+| **Backend Traps & Blocklist Sync** | Monitored backends can report server-side `sourcemap_harvest` (`*.js.map`) or `canary_route_hit` (`/.env`, `/.git/config`) signals with `Authorization: Bearer <API_TOKEN>` (`shield:write`) and sync `ETag`-cached HMAC-IP / session blocklists via `GET /api/0/projects/:org/:proj/shield/blocklist/` using project-derived HMAC keys (without exposing the master `app_key`). |
+| **Log-Driven Mini-IDS (`Log-IDS`)** | Evaluates ingested logs in real time for SQL injection (`UNION SELECT`, sleep payloads), multi-level path traversal (`../../etc/passwd`, `.env`, `.git/config`), cloud metadata SSRF (`169.254.169.254/latest/meta-data`, `metadata.google.internal`), JNDI/SSTI (`${jndi:...}`, `{{ 7*7 }}`), and `401`/`403`/`404` IDOR/enumeration bursts (`>= 20` hits per actor in 60s, ignoring static assets). |
+| **Secret Leak Radar** | Redacts emails, `Bearer` / JWT tokens, PEM private keys, API keys (`sk_live_...`, `ghp_...`, `bf_...`), URL query secrets, and Luhn-validated payment card numbers (`[Filtered]`) in-place before persistence or SSE broadcast, emitting security alerts when leaks hit logs or events. |
+| **CGNAT-Safe Quarantine** | Unauthenticated browser signals can only quarantine the **browser `session_id`** (never a shared mobile/CGNAT IP); IP-level HMAC quarantines require `backend_verified` API token authentication. |
+| **Self Runtime Integrity** | Inspects `/proc/self/status` (`TracerPid`), `/proc/self/maps` (`frida-agent`, `frida-gadget`, `libfrida`, `gdbserver`), and `LD_PRELOAD`/`LD_AUDIT` inside `Auto-Check`; optional `BUGFINDER_ANTI_PTRACE=1` calls `prctl(PR_SET_DUMPABLE, 0)` on Linux. |
+
+### Threat Signal Weights (Capped at Score `100`)
+
+| Signal | Weight | Category | Trigger Summary |
+|---|---|---|---|
+| `runtime_debugger_attached` | `80` | `anti_rea` | Attached process/runtime debugger check (`sys.gettrace()` / `TracerPid`) |
+| `canary_route_hit` | `75` | `anti_rea` | Probe hit decoys such as `/.env` or `/.git/config` |
+| `injection_probe` | `75` | `log_ids` | SQLi, traversal, cloud metadata SSRF, or JNDI/SSTI in logs/paths |
+| `honeypot_access` | `70` | `anti_rea` | Access to trap getters defined in `canaryGlobals` |
+| `sourcemap_harvest` | `65` | `anti_rea` | Unauthorized scraping of `.js.map` bundles |
+| `idor_or_enum_burst` | `65` | `log_ids` | `>= 20` `401`/`403`/`404` hits from one actor within 60s |
+| `secret_leak` | `60` | `secret_leak` | Credentials/secrets detected & redacted by Secret Leak Radar |
+| `cdp_automation` | `50` | `anti_rea` | Headless ChromeDriver / Playwright / Nightmare / Phantom globals |
+| `webdriver_detected` | `45` | `anti_rea` | `navigator.webdriver === true` or `HeadlessChrome` user-agent |
+| `runtime_hook_tamper` | `40` | `anti_rea` | Post-init tampering of `fetch`, XHR, `WebSocket`, or `Function.prototype.toString` |
+| `csp_script_tamper` | `40` | `csp` | CSP script tampering report |
+| `dom_script_injection` | `35` | `anti_rea` | Dynamic third-party `<script src>` outside `allowedScriptOrigins` |
 
 ---
 
@@ -253,7 +298,7 @@ bugfinder mcp --org acme-cloud --token bf_...
 
 - **Tenant & Auth Isolation**: PostgreSQL `ENABLE + FORCE ROW LEVEL SECURITY` (`NOBYPASSRLS`) with single-statement transaction-scoped GUCs; 5 RBAC roles (`owner` > `manager` > `admin` > `member` > `viewer`) plus scoped, expiring API tokens (`token:sha256` lookup, instant cache invalidation).
 - **Cryptography & MFA**: `scrypt` password hashing (`Semaphore(2)` bounded + `malloc_trim`), exponential backoff lockout, RFC 6238 TOTP (QR SVG + 10 single-use recovery codes), WebAuthn/FIDO2 Passkeys (`ES256`/`Ed25519`), optional OIDC SSO (`Authorization Code + PKCE S256`, JWKS verification via `ring`), Step-Up `/api/auth/reauth` before destructive mutations, and `HKDF-SHA256 + AES-256-GCM` (`enc:v1:`) encryption at rest.
-- **Ingestion & Network Hardening**: Streaming `gzip`/`deflate`/`br`/`zstd` decompression with strict `BUGFINDER_MAX_UNZIPPED_BYTES` cap (`413` anti-zip-bomb), in-place `Cow<'a, str>` scrubbing (emails, Bearer/JWT tokens, PEM private keys, API keys, URL query secrets, Luhn PAN validation), pre-connect DNS SSRF rejection of private/loopback/CGNAT/link-local/metadata IPs, CSV formula prefix neutralization, strict `BUGFINDER_ALLOWED_HOSTS` (no `*` wildcard), and multi-bucket `HMAC-SHA256` `BoundedMap` rate limiting (`429` + `X-Sentry-Rate-Limits`).
+- **Ingestion & Network Hardening**: Streaming `gzip`/`deflate`/`br`/`zstd` decompression with strict `BUGFINDER_MAX_UNZIPPED_BYTES` cap (`413` anti-zip-bomb), in-place `Cow<'a, str>` scrubbing, pre-connect DNS SSRF rejection of private/loopback/CGNAT/link-local/metadata IPs, CSV formula prefix neutralization, strict `BUGFINDER_ALLOWED_HOSTS` (no `*` wildcard), and multi-bucket `HMAC-SHA256` `BoundedMap` rate limiting (`429` + `X-Sentry-Rate-Limits`).
 - **CSP & Asset Delivery**: Per-request cryptographic CSP nonces (`script-src` & `style-src`), zero inline styles (`scripts/security-lint.py` CI gate), pre-compressed static assets in `.rodata` (`build.rs`), and BREACH defense (never compressing dynamic auth/HTML responses).
 
 ---
@@ -298,6 +343,10 @@ node --check sdks/browser/bugfinder-shield.js
 # Run unit + integration tests (SQLite in-process; pass BUGFINDER_TEST_PG_* for live PG17 RLS tests)
 cargo test
 ```
+
+## Searchable Topics
+
+`rust` · `error-tracking` · `sentry-alternative` · `glitchtip` · `observability` · `opentelemetry` · `log-aggregation` · `uptime-monitoring` · `self-hosted` · `low-memory` · `anti-reverse-engineering` · `security-monitoring` · `intrusion-detection` · `secret-scanning` · `sqlite` · `postgresql` · `row-level-security` · `mcp-server` · `axum` · `single-binary`
 
 ## License
 
