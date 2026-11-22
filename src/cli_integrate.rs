@@ -472,16 +472,32 @@ pub fn run_init_cli(
             );
         }
         DetectedStack::Rust => {
-            let wrote = write_connector_file(
-                &dir.join("src").join("bugfinder_hook.rs"),
-                zero_dep_rust_snippet(),
-                dry_run,
-                force,
-            )?;
-            println!(
-                "  - src/bugfinder_hook.rs: {}",
-                if wrote { "created" } else { "kept existing" }
-            );
+            let cargo_txt = fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
+            let is_workspace_root = cargo_txt.contains("[workspace]") && !dir.join("src").is_dir();
+            if is_workspace_root {
+                println!(
+                    "  - Rust workspace detected (skipping orphan root src/bugfinder_hook.rs)."
+                );
+                println!(
+                    "    Use `bugfinder wrap --dsn \"{dsn}\" -- <your-server-binary>` to capture backend crashes & stderr."
+                );
+                if dir.join("web").join("index.html").is_file() {
+                    println!(
+                        "    Frontend SPA detected at web/index.html — add `<script src=\"{origin}/sdk/bugfinder-mini.js\" data-dsn=\"{dsn}\" crossorigin=\"anonymous\" async></script>` (ensure CSP connect-src allows {origin})."
+                    );
+                }
+            } else {
+                let wrote = write_connector_file(
+                    &dir.join("src").join("bugfinder_hook.rs"),
+                    zero_dep_rust_snippet(),
+                    dry_run,
+                    force,
+                )?;
+                println!(
+                    "  - src/bugfinder_hook.rs: {}",
+                    if wrote { "created" } else { "kept existing" }
+                );
+            }
         }
     }
 
@@ -839,6 +855,10 @@ pub fn looks_like_real_error_line(raw: &str) -> bool {
         "stack overflow",
         "[error]",
         "[fatal]",
+        "[err]",
+        "-err]",
+        "error trace]:",
+        "fatal [",
         "level=error",
         "level=fatal",
         "\"level\":\"error\"",
@@ -1461,6 +1481,11 @@ mod tests {
         assert!(looks_like_real_error_line("PHP Fatal error: Call to undefined foo()"));
         assert!(looks_like_real_error_line("[ERROR] failed loading config"));
         assert!(looks_like_real_error_line(r#"{"level":"error","msg":"db down"}"#));
+        assert!(looks_like_real_error_line("[DB ERROR TRACE]: PoolTimedOut"));
+        assert!(looks_like_real_error_line("[INTERNAL ERROR TRACE]: redis unreachable"));
+        assert!(looks_like_real_error_line("FATAL [SEC-CFG-01]: refusing fail-open startup"));
+        assert!(looks_like_real_error_line("[GEMINI-SDR-ERR] Model gemini-3.8-flash request error"));
+        assert!(looks_like_real_error_line("[WEBCHAT-CRM-TX-ERR] tenant_id=1 err=deadlock"));
 
         // Exhaustive benign false-positive candidates MUST return false
         for benign in [
@@ -1475,6 +1500,9 @@ mod tests {
             "ErrorBoundary mounted cleanly",
             r#"127.0.0.1 - - "GET /api/0/errors 200 12ms""#,
             "worker started listening on port 8080",
+            "imob-on listening on http://127.0.0.1:3366",
+            "[WEBCHAT-INIT-CHIPS-WARN] tenant_id=1 err=none",
+            "[master-audit] ok",
         ] {
             assert!(
                 !looks_like_real_error_line(benign),
@@ -1489,5 +1517,25 @@ mod tests {
         assert!(!scrubbed.contains("secret_leak_abc123token"));
         assert!(!scrubbed.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"));
         assert!(!scrubbed.contains('\x1b'));
+    }
+
+    #[test]
+    fn rust_workspace_init_skips_orphan_root_hook() {
+        let d = TempDir::new().unwrap();
+        fs::write(
+            d.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(d.path().join("web")).unwrap();
+        fs::write(d.path().join("web/index.html"), "<html></html>").unwrap();
+
+        let dsn = "http://pub_key_ws@127.0.0.1:8080/1";
+        run_init_cli(d.path(), dsn, "auto", "zero-dep", false, false, true).unwrap();
+        assert!(
+            !d.path().join("src/bugfinder_hook.rs").exists(),
+            "workspace root without src/ must not get an orphan src/bugfinder_hook.rs"
+        );
+        assert!(d.path().join(".env").is_file());
     }
 }
