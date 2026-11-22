@@ -11,6 +11,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSession {
+    pub session_id: i64,
     pub user_id: i64,
     pub email: String,
     pub name: String,
@@ -18,6 +19,77 @@ pub struct AuthenticatedSession {
     pub organization_slug: String,
     pub role: UserRole,
     pub csrf_token: String,
+    pub reauth_at: Option<i64>,
+    pub totp_enabled: bool,
+    pub passkey_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserMfaRecord {
+    pub user_id: i64,
+    pub totp_secret_enc: String,
+    pub is_enabled: bool,
+    pub last_used_step: Option<i64>,
+    pub failed_attempts: i64,
+    pub locked_until: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryCodeRecord {
+    pub id: i64,
+    pub code_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MfaChallengeRecord {
+    pub user_id: i64,
+    pub target_org_id: i64,
+    pub ip_hmac: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebAuthnCredRecord {
+    pub id: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub credential_id_b64: String,
+    pub cose_alg: i32,
+    pub public_key_b64: String,
+    pub sign_count: u32,
+    pub last_used_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebAuthnChallengeRecord {
+    pub challenge_b64: String,
+    pub user_id: Option<i64>,
+    pub flow_kind: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvitationLookupInfo {
+    pub organization_id: i64,
+    pub organization_slug: String,
+    pub organization_name: String,
+    pub email: String,
+    pub role: String,
+    pub expires_at: i64,
+    pub accepted_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAuditLog {
+    pub organization_id: i64,
+    pub actor_user_id: Option<i64>,
+    pub actor_email: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub ip_hmac: String,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -198,12 +270,25 @@ pub trait StorageBackend: Send + Sync {
         user_id: i64,
         org_id: i64,
         csrf_token: &str,
+        user_agent: &str,
+        ip_hmac: &str,
+        now_sec: i64,
         expires_at: i64,
-    ) -> Result<(), String>;
-    async fn resolve_session(&self, token_sha256: &str, now_sec: i64) -> Result<Option<AuthenticatedSession>, String>;
+    ) -> Result<i64, String>;
+    async fn resolve_session(
+        &self,
+        token_sha256: &str,
+        now_sec: i64,
+        idle_ttl_sec: i64,
+    ) -> Result<Option<AuthenticatedSession>, String>;
     async fn delete_session(&self, token_sha256: &str) -> Result<(), String>;
 
-    async fn resolve_api_token(&self, token_sha256: &str, org_slug: Option<&str>) -> Result<Option<TenantCtx>, String>;
+    async fn resolve_api_token(
+        &self,
+        token_sha256: &str,
+        org_slug: Option<&str>,
+        now_sec: i64,
+    ) -> Result<Option<TenantCtx>, String>;
 
     async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String>;
     async fn tunnel_slug_exists(&self, tunnel_slug: &str) -> Result<bool, String>;
@@ -239,6 +324,14 @@ pub trait StorageBackend: Send + Sync {
         key_sha256: &str,
     ) -> Result<Option<ProjectKeyDto>, String>;
     async fn delete_project_key(&self, ctx: &TenantCtx, project_slug: &str, key_id: i64) -> Result<bool, String>;
+    async fn update_project_key(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+        key_id: i64,
+        rate_limit_per_min: u32,
+        is_active: bool,
+    ) -> Result<Option<ProjectKeyDto>, String>;
     async fn enable_project_tunnel(
         &self,
         ctx: &TenantCtx,
@@ -313,8 +406,68 @@ pub trait StorageBackend: Send + Sync {
         token_sha256: &str,
         token_prefix: &str,
         role: UserRole,
+        scopes: &str,
+        expires_at: Option<i64>,
     ) -> Result<ApiTokenDto, String>;
     async fn delete_api_token(&self, ctx: &TenantCtx, token_id: i64) -> Result<bool, String>;
+
+    // MFA (TOTP, Recovery Codes, Challenges)
+    async fn get_mfa_status(&self, user_id: i64) -> Result<MfaStatusDto, String>;
+    async fn get_user_mfa_record(&self, user_id: i64) -> Result<Option<UserMfaRecord>, String>;
+    async fn upsert_pending_totp(&self, user_id: i64, totp_secret_enc: &str, now_sec: i64) -> Result<(), String>;
+    async fn enable_totp_with_recovery_codes(&self, user_id: i64, code_hashes: &[String], now_sec: i64) -> Result<(), String>;
+    async fn disable_mfa(&self, user_id: i64, now_sec: i64) -> Result<(), String>;
+    async fn replace_recovery_codes(&self, user_id: i64, code_hashes: &[String], now_sec: i64) -> Result<(), String>;
+    async fn record_mfa_attempt(&self, user_id: i64, success_step: Option<i64>, now_sec: i64) -> Result<Option<i64>, String>;
+    async fn list_unused_recovery_codes(&self, user_id: i64) -> Result<Vec<RecoveryCodeRecord>, String>;
+    async fn mark_recovery_code_used(&self, user_id: i64, code_id: i64, now_sec: i64) -> Result<bool, String>;
+    async fn create_mfa_challenge(&self, token_sha256: &str, user_id: i64, target_org_id: i64, ip_hmac: &str, expires_at: i64) -> Result<(), String>;
+    async fn consume_mfa_challenge(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String>;
+    async fn get_mfa_challenge_user(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String>;
+
+    // Passkeys / WebAuthn
+    async fn save_webauthn_challenge(&self, challenge_b64: &str, user_id: Option<i64>, flow_kind: &str, expires_at: i64) -> Result<(), String>;
+    async fn consume_webauthn_challenge(&self, challenge_b64: &str, flow_kind: &str, now_sec: i64) -> Result<Option<WebAuthnChallengeRecord>, String>;
+    async fn create_webauthn_credential(&self, user_id: i64, name: &str, credential_id_b64: &str, cose_alg: i32, public_key_b64: &str, sign_count: u32) -> Result<PasskeyDto, String>;
+    async fn list_webauthn_credentials(&self, user_id: i64) -> Result<Vec<WebAuthnCredRecord>, String>;
+    async fn find_webauthn_credential(&self, credential_id_b64: &str) -> Result<Option<WebAuthnCredRecord>, String>;
+    async fn update_webauthn_sign_count(&self, cred_id: i64, sign_count: u32, now_sec: i64) -> Result<(), String>;
+    async fn delete_webauthn_credential(&self, user_id: i64, cred_id: i64) -> Result<bool, String>;
+
+    // Session lifecycle, step-up & password rotation
+    async fn list_user_sessions(&self, user_id: i64, org_id: i64, current_token_sha256: &str, now_sec: i64) -> Result<Vec<ActiveSessionDto>, String>;
+    async fn revoke_session_by_id(&self, user_id: i64, org_id: i64, session_id: i64) -> Result<bool, String>;
+    async fn revoke_other_sessions(&self, user_id: i64, org_id: i64, keep_token_sha256: &str) -> Result<usize, String>;
+    async fn mark_session_reauth(&self, token_sha256: &str, org_id: i64, now_sec: i64) -> Result<(), String>;
+    async fn find_user_password_hash(&self, user_id: i64) -> Result<Option<(String, String, String)>, String>;
+    async fn change_user_password(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        new_password_hash: &str,
+        old_session_sha: &str,
+        new_session_sha: &str,
+        new_csrf: &str,
+        user_agent: &str,
+        ip_hmac: &str,
+        now_sec: i64,
+        expires_at: i64,
+    ) -> Result<(), String>;
+
+    // Expirable member invitations (72h links)
+    async fn create_invitation(&self, ctx: &TenantCtx, email: &str, role: UserRole, token_sha256: &str, expires_at: i64) -> Result<InvitationDto, String>;
+    async fn list_invitations(&self, ctx: &TenantCtx) -> Result<Vec<InvitationDto>, String>;
+    async fn revoke_invitation(&self, ctx: &TenantCtx, inv_id: i64) -> Result<bool, String>;
+    async fn lookup_invitation(&self, token_sha256: &str) -> Result<Option<InvitationLookupInfo>, String>;
+    async fn accept_invitation(&self, token_sha256: &str, name: &str, password_hash: &str, now_sec: i64) -> Result<Result<(i64, i64, String, String, UserRole), String>, String>;
+
+    // Hash-chained Audit Logs & Org Security Settings
+    async fn append_audit_log(&self, entry: &NewAuditLog) -> Result<(), String>;
+    async fn list_audit_logs(&self, ctx: &TenantCtx, action_filter: Option<&str>, limit: i64, offset: i64) -> Result<Vec<AuditLogDto>, String>;
+    async fn verify_audit_chain(&self, ctx: &TenantCtx) -> Result<AuditVerifyDto, String>;
+    async fn get_org_security_settings(&self, ctx: &TenantCtx) -> Result<OrgSecuritySettings, String>;
+    async fn update_org_security_settings(&self, ctx: &TenantCtx, settings: &OrgSecuritySettings) -> Result<OrgSecuritySettings, String>;
+    async fn count_owners_without_mfa(&self, ctx: &TenantCtx) -> Result<i64, String>;
 
     async fn list_members(&self, ctx: &TenantCtx) -> Result<Vec<MemberDto>, String>;
     async fn invite_member(

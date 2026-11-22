@@ -64,6 +64,60 @@ impl CidrBlock {
         }
     }
 
+    pub fn expand_keyword_or_cidr(raw: &str) -> Result<Vec<Self>, String> {
+        let s = raw.trim();
+        if s.eq_ignore_ascii_case("loopback") {
+            return ["127.0.0.0/8", "::1/128"]
+                .iter()
+                .map(|c| Self::parse(c))
+                .collect();
+        }
+        if s.eq_ignore_ascii_case("private") {
+            return [
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "100.64.0.0/10",
+                "169.254.0.0/16",
+                "fc00::/7",
+                "fe80::/10",
+            ]
+            .iter()
+            .map(|c| Self::parse(c))
+            .collect();
+        }
+        if s.eq_ignore_ascii_case("cloudflare") {
+            return [
+                "173.245.48.0/20",
+                "103.21.244.0/22",
+                "103.22.200.0/22",
+                "103.31.4.0/22",
+                "141.101.64.0/18",
+                "108.162.192.0/18",
+                "190.93.240.0/20",
+                "188.114.96.0/20",
+                "197.234.240.0/22",
+                "198.41.128.0/17",
+                "162.158.0.0/15",
+                "104.16.0.0/13",
+                "104.24.0.0/14",
+                "172.64.0.0/13",
+                "131.0.72.0/22",
+                "2400:cb00::/32",
+                "2606:4700::/32",
+                "2803:f800::/32",
+                "2405:b500::/32",
+                "2405:8100::/32",
+                "2a06:98c0::/29",
+                "2c0f:f248::/32",
+            ]
+            .iter()
+            .map(|c| Self::parse(c))
+            .collect();
+        }
+        Ok(vec![Self::parse(s)?])
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
@@ -105,6 +159,10 @@ pub struct AppConfig {
     pub max_db_mb: u64,
     pub retention_days: u32,
     pub trusted_proxies: Vec<CidrBlock>,
+    pub allowed_hosts: Vec<String>,
+    pub public_url: Option<String>,
+    pub session_ttl_sec: i64,
+    pub session_idle_sec: i64,
     pub metrics_token: Option<String>,
     pub force_secure_cookies: bool,
     pub is_dev: bool,
@@ -180,9 +238,48 @@ impl AppConfig {
         let mut trusted_proxies = Vec::new();
         if let Ok(raw) = env::var("BUGFINDER_TRUSTED_PROXIES") {
             for part in raw.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
-                trusted_proxies.push(CidrBlock::parse(part)?);
+                trusted_proxies.extend(CidrBlock::expand_keyword_or_cidr(part)?);
             }
         }
+
+        let mut allowed_hosts = Vec::new();
+        if let Ok(raw) = env::var("BUGFINDER_ALLOWED_HOSTS") {
+            for part in raw.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                if part == "*" {
+                    return Err("Wildcard '*' in BUGFINDER_ALLOWED_HOSTS is forbidden".into());
+                }
+                let host = if part.starts_with('[') {
+                    part.split(']')
+                        .next()
+                        .map(|s| format!("{}]", s.to_ascii_lowercase()))
+                        .unwrap_or_default()
+                } else {
+                    part.split(':').next().unwrap_or("").to_ascii_lowercase()
+                };
+                if !host.is_empty() && !allowed_hosts.contains(&host) {
+                    allowed_hosts.push(host);
+                }
+            }
+        }
+
+        let public_url = env::var("BUGFINDER_PUBLIC_URL")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| s.starts_with("https://") || s.starts_with("http://"));
+
+        let session_ttl_hours = env::var("BUGFINDER_SESSION_TTL_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&v| (1..=720).contains(&v))
+            .unwrap_or(168);
+        let session_ttl_sec = session_ttl_hours * 3600;
+
+        let session_idle_hours = env::var("BUGFINDER_SESSION_IDLE_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&v| (1..=720).contains(&v))
+            .unwrap_or(24);
+        let session_idle_sec = session_idle_hours * 3600;
 
         let metrics_token = env::var("BUGFINDER_METRICS_TOKEN")
             .ok()
@@ -233,6 +330,10 @@ impl AppConfig {
             max_db_mb,
             retention_days,
             trusted_proxies,
+            allowed_hosts,
+            public_url,
+            session_ttl_sec,
+            session_idle_sec,
             metrics_token,
             force_secure_cookies,
             is_dev,

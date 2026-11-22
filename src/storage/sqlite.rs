@@ -2,7 +2,8 @@ use crate::alerts::dispatcher::AlertDispatchJob;
 use crate::domain::fingerprint::{extract_issue_metadata, should_reopen_on_regression};
 use crate::domain::models::*;
 use crate::runtime::trim_heap;
-use crate::security::auth::compute_lockout_seconds;
+use crate::security::auth::{compute_audit_entry_hash, compute_lockout_seconds};
+use crate::security::crypto::{open_secret, seal_secret};
 use crate::storage::*;
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
@@ -14,6 +15,29 @@ use std::sync::{Arc, Mutex};
 
 const SQLITE_SCHEMA: &str = include_str!("../../migrations/sqlite/001_init.sql");
 
+fn webhook_aad(org_id: i64) -> Vec<u8> {
+    format!("alert_rules:webhook_secret:{org_id}").into_bytes()
+}
+
+fn open_webhook_secret(app_key: &[u8; 32], org_id: i64, stored: &str) -> String {
+    open_secret(app_key, &webhook_aad(org_id), stored, true).unwrap_or_default()
+}
+
+fn sqlite_has_column(conn: &Connection, table: &str, col: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) else {
+        return false;
+    };
+    for r in rows.flatten() {
+        if r == col {
+            return true;
+        }
+    }
+    false
+}
+
 struct StormWindow {
     window_start_ms: i64,
     count: u32,
@@ -21,6 +45,7 @@ struct StormWindow {
 
 pub struct SqliteStorage {
     path: PathBuf,
+    app_key: [u8; 32],
     writer: Arc<Mutex<Connection>>,
     readers: Arc<Vec<Mutex<Connection>>>,
     rr_idx: Arc<AtomicUsize>,
@@ -29,6 +54,10 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub fn open(path: &Path) -> Result<Arc<Self>, String> {
+        Self::open_with_key(path, [0u8; 32])
+    }
+
+    pub fn open_with_key(path: &Path, app_key: [u8; 32]) -> Result<Arc<Self>, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed creating SQLite parent dir: {e}"))?;
@@ -37,6 +66,93 @@ impl SqliteStorage {
         writer
             .execute_batch(SQLITE_SCHEMA)
             .map_err(|e| format!("SQLite schema migration: {e}"))?;
+
+        // Idempotent upgrades for pre-existing SQLite databases
+        let upgrades = [
+            ("organizations", "settings_json", "ALTER TABLE organizations ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'"),
+            ("sessions", "user_agent", "ALTER TABLE sessions ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''"),
+            ("sessions", "ip_hmac", "ALTER TABLE sessions ADD COLUMN ip_hmac TEXT NOT NULL DEFAULT ''"),
+            ("sessions", "last_seen_at", "ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0"),
+            ("sessions", "reauth_at", "ALTER TABLE sessions ADD COLUMN reauth_at INTEGER"),
+            ("api_tokens", "expires_at", "ALTER TABLE api_tokens ADD COLUMN expires_at INTEGER"),
+            ("audit_logs", "actor_email", "ALTER TABLE audit_logs ADD COLUMN actor_email TEXT NOT NULL DEFAULT ''"),
+            ("audit_logs", "ip_hmac", "ALTER TABLE audit_logs ADD COLUMN ip_hmac TEXT NOT NULL DEFAULT ''"),
+            ("audit_logs", "metadata_json", "ALTER TABLE audit_logs ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"),
+            ("audit_logs", "prev_hash", "ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'GENESIS'"),
+            ("audit_logs", "entry_hash", "ALTER TABLE audit_logs ADD COLUMN entry_hash TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (tbl, col, ddl) in upgrades {
+            if !sqlite_has_column(&writer, tbl, col) {
+                writer
+                    .execute_batch(ddl)
+                    .map_err(|e| format!("SQLite column upgrade {tbl}.{col}: {e}"))?;
+            }
+        }
+
+        // Upgrade legacy organization_members / api_tokens role CHECK constraints if missing 'manager'
+        if let Ok(Some(sql_def)) = writer
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='organization_members'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        {
+            if !sql_def.contains("manager") {
+                writer
+                    .execute_batch(
+                        "PRAGMA foreign_keys = OFF;
+                         BEGIN IMMEDIATE;
+                         CREATE TABLE organization_members_v2 (
+                             organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                             role TEXT NOT NULL CHECK(role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
+                             PRIMARY KEY (organization_id, user_id)
+                         );
+                         INSERT INTO organization_members_v2 SELECT organization_id, user_id, role FROM organization_members;
+                         DROP TABLE organization_members;
+                         ALTER TABLE organization_members_v2 RENAME TO organization_members;
+                         COMMIT;
+                         PRAGMA foreign_keys = ON;",
+                    )
+                    .map_err(|e| format!("SQLite organization_members migration: {e}"))?;
+            }
+        }
+        if let Ok(Some(sql_def)) = writer
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='api_tokens'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        {
+            if !sql_def.contains("manager") {
+                writer
+                    .execute_batch(
+                        "PRAGMA foreign_keys = OFF;
+                         BEGIN IMMEDIATE;
+                         CREATE TABLE api_tokens_v2 (
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                             name TEXT NOT NULL,
+                             token_sha256 TEXT NOT NULL UNIQUE,
+                             token_prefix TEXT NOT NULL,
+                             role TEXT NOT NULL CHECK(role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
+                             scopes TEXT NOT NULL DEFAULT 'project:read project:write event:read',
+                             expires_at INTEGER,
+                             last_used_at INTEGER,
+                             created_at INTEGER NOT NULL
+                         );
+                         INSERT INTO api_tokens_v2 SELECT id, organization_id, user_id, name, token_sha256, token_prefix, role, scopes, expires_at, last_used_at, created_at FROM api_tokens;
+                         DROP TABLE api_tokens;
+                         ALTER TABLE api_tokens_v2 RENAME TO api_tokens;
+                         COMMIT;
+                         PRAGMA foreign_keys = ON;",
+                    )
+                    .map_err(|e| format!("SQLite api_tokens migration: {e}"))?;
+            }
+        }
 
         // Upgrade legacy alert_rules CHECK constraint in existing SQLite files if needed
         if let Ok(Some(sql_def)) = writer
@@ -96,6 +212,7 @@ impl SqliteStorage {
 
         Ok(Arc::new(Self {
             path: path.to_path_buf(),
+            app_key,
             writer: Arc::new(Mutex::new(writer)),
             readers: Arc::new(readers),
             rr_idx: Arc::new(AtomicUsize::new(0)),
@@ -172,6 +289,7 @@ fn map_sqlite_err<E: std::fmt::Display>(e: E) -> String {
 
 fn build_alert_jobs_for_event(
     tx: &Transaction<'_>,
+    app_key: &[u8; 32],
     organization_id: i64,
     project_id: i64,
     project_slug: &str,
@@ -206,7 +324,11 @@ fn build_alert_jobs_for_event(
         let cooldown_sec: i64 = r.get(5).map_err(map_sqlite_err)?;
         let channel_type: String = r.get(6).map_err(map_sqlite_err)?;
         let target_url: String = r.get(7).map_err(map_sqlite_err)?;
-        let webhook_secret: String = r.get(8).map_err(map_sqlite_err)?;
+        let webhook_secret: String = open_webhook_secret(
+            app_key,
+            organization_id,
+            &r.get::<_, String>(8).map_err(map_sqlite_err)?,
+        );
         let email_to: String = r.get(9).map_err(map_sqlite_err)?;
         let last_triggered_at: Option<i64> = r.get(10).map_err(map_sqlite_err)?;
 
@@ -670,50 +792,95 @@ impl StorageBackend for SqliteStorage {
         user_id: i64,
         org_id: i64,
         csrf_token: &str,
+        user_agent: &str,
+        ip_hmac: &str,
+        now_sec: i64,
         expires_at: i64,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         let sha = token_sha256.to_string();
         let csrf = csrf_token.to_string();
+        let ua = user_agent.chars().take(160).collect::<String>();
+        let iph = ip_hmac.to_string();
         self.write(move |conn| {
             conn.execute(
-                "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, expires_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![sha, user_id, org_id, csrf, expires_at, now_ms()],
+                "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, user_agent, ip_hmac, last_seen_at, reauth_at, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+                params![sha, user_id, org_id, csrf, ua, iph, now_sec, expires_at, now_ms()],
             )
             .map_err(map_sqlite_err)?;
-            Ok(())
+            let rid: i64 = conn
+                .query_row("SELECT rowid FROM sessions WHERE token_sha256 = ?1", params![sha], |r| r.get(0))
+                .unwrap_or(0);
+            Ok(rid)
         })
         .await
     }
 
-    async fn resolve_session(&self, token_sha256: &str, now_sec: i64) -> Result<Option<AuthenticatedSession>, String> {
+    async fn resolve_session(
+        &self,
+        token_sha256: &str,
+        now_sec: i64,
+        idle_ttl_sec: i64,
+    ) -> Result<Option<AuthenticatedSession>, String> {
         let sha = token_sha256.to_string();
-        self.read(move |conn| {
-            conn.query_row(
-                "SELECT u.id, u.email, u.name, s.organization_id, o.slug, m.role, s.csrf_token
-                 FROM sessions s
-                 JOIN users u ON u.id = s.user_id
-                 JOIN organizations o ON o.id = s.organization_id
-                 JOIN organization_members m ON m.organization_id = s.organization_id AND m.user_id = u.id
-                 WHERE s.token_sha256 = ?1 AND s.expires_at > ?2 AND u.is_active = 1",
-                params![sha, now_sec],
-                |r| {
-                    let role_s: String = r.get(5)?;
-                    Ok(AuthenticatedSession {
-                        user_id: r.get(0)?,
-                        email: r.get(1)?,
-                        name: r.get(2)?,
-                        organization_id: r.get(3)?,
-                        organization_slug: r.get(4)?,
-                        role: UserRole::from_db(&role_s).unwrap_or(UserRole::Viewer),
-                        csrf_token: r.get(6)?,
+        let sha_read = sha.clone();
+        let found: Option<(AuthenticatedSession, i64)> = self
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT s.rowid, u.id, u.email, u.name, s.organization_id, o.slug, m.role,
+                            s.csrf_token, s.last_seen_at, s.reauth_at,
+                            COALESCE((SELECT is_enabled FROM user_mfa WHERE user_id = u.id), 0),
+                            (SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = u.id)
+                     FROM sessions s
+                     JOIN users u ON u.id = s.user_id
+                     JOIN organizations o ON o.id = s.organization_id
+                     JOIN organization_members m ON m.organization_id = s.organization_id AND m.user_id = u.id
+                     WHERE s.token_sha256 = ?1
+                       AND s.expires_at > ?2
+                       AND (s.last_seen_at = 0 OR (s.last_seen_at + ?3) > ?2)
+                       AND u.is_active = 1",
+                    params![sha_read, now_sec, idle_ttl_sec],
+                    |r| {
+                        let role_s: String = r.get(6)?;
+                        let last_seen: i64 = r.get(8)?;
+                        Ok((
+                            AuthenticatedSession {
+                                session_id: r.get(0)?,
+                                user_id: r.get(1)?,
+                                email: r.get(2)?,
+                                name: r.get(3)?,
+                                organization_id: r.get(4)?,
+                                organization_slug: r.get(5)?,
+                                role: UserRole::from_db(&role_s).unwrap_or(UserRole::Viewer),
+                                csrf_token: r.get(7)?,
+                                reauth_at: r.get(9)?,
+                                totp_enabled: r.get::<_, i64>(10)? != 0,
+                                passkey_count: r.get(11)?,
+                            },
+                            last_seen,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_sqlite_err)
+            })
+            .await?;
+
+        if let Some((sess, last_seen)) = found {
+            if now_sec - last_seen >= 60 {
+                let _ = self
+                    .write(move |conn| {
+                        let _ = conn.execute(
+                            "UPDATE sessions SET last_seen_at = ?1 WHERE token_sha256 = ?2",
+                            params![now_sec, sha],
+                        );
+                        Ok(())
                     })
-                },
-            )
-            .optional()
-            .map_err(map_sqlite_err)
-        })
-        .await
+                    .await;
+            }
+            return Ok(Some(sess));
+        }
+        Ok(None)
     }
 
     async fn delete_session(&self, token_sha256: &str) -> Result<(), String> {
@@ -726,45 +893,80 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn resolve_api_token(&self, token_sha256: &str, org_slug: Option<&str>) -> Result<Option<TenantCtx>, String> {
+    async fn resolve_api_token(
+        &self,
+        token_sha256: &str,
+        org_slug: Option<&str>,
+        now_sec: i64,
+    ) -> Result<Option<TenantCtx>, String> {
         let sha = token_sha256.to_string();
+        let sha_upd = sha.clone();
         let slug_filter = org_slug.map(ToString::to_string);
-        self.read(move |conn| {
-            let row = conn
-                .query_row(
-                    "SELECT t.organization_id, o.slug, t.user_id, t.role
-                     FROM api_tokens t
-                     JOIN organizations o ON o.id = t.organization_id
-                     JOIN users u ON u.id = t.user_id
-                     WHERE t.token_sha256 = ?1 AND u.is_active = 1",
-                    params![sha],
-                    |r| {
-                        let role_s: String = r.get(3)?;
-                        Ok(TenantCtx {
-                            organization_id: r.get(0)?,
-                            organization_slug: r.get(1)?,
-                            user_id: Some(r.get(2)?),
-                            role: UserRole::from_db(&role_s).unwrap_or(UserRole::Viewer),
-                        })
-                    },
-                )
-                .optional()
-                .map_err(map_sqlite_err)?;
-            if let (Some(ref ctx), Some(ref want_slug)) = (&row, &slug_filter) {
-                if &ctx.organization_slug != want_slug {
-                    return Ok(None);
+        let found: Option<(TenantCtx, Option<i64>)> = self
+            .read(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT t.organization_id, o.slug, t.user_id, t.role, m.role, t.scopes, t.last_used_at
+                         FROM api_tokens t
+                         JOIN organizations o ON o.id = t.organization_id
+                         JOIN users u ON u.id = t.user_id
+                         JOIN organization_members m ON m.organization_id = t.organization_id AND m.user_id = t.user_id
+                         WHERE t.token_sha256 = ?1
+                           AND u.is_active = 1
+                           AND (t.expires_at IS NULL OR t.expires_at > ?2)",
+                        params![sha, now_sec],
+                        |r| {
+                            let tok_role = UserRole::from_db(&r.get::<_, String>(3)?).unwrap_or(UserRole::Viewer);
+                            let mem_role = UserRole::from_db(&r.get::<_, String>(4)?).unwrap_or(UserRole::Viewer);
+                            let eff_role = mem_role.min_role(tok_role);
+                            let raw_scopes: String = r.get(5)?;
+                            let lu: Option<i64> = r.get(6)?;
+                            Ok((
+                                TenantCtx::from_token(
+                                    r.get(0)?,
+                                    r.get(1)?,
+                                    r.get(2)?,
+                                    eff_role,
+                                    &raw_scopes,
+                                ),
+                                lu,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(map_sqlite_err)?;
+                if let (Some((ref ctx, _)), Some(ref want_slug)) = (&row, &slug_filter) {
+                    if &ctx.organization_slug != want_slug {
+                        return Ok(None);
+                    }
                 }
+                Ok(row)
+            })
+            .await?;
+
+        if let Some((ctx, lu)) = found {
+            let now_m = now_ms();
+            if lu.map(|prev| now_m - prev >= 300_000).unwrap_or(true) {
+                let _ = self
+                    .write(move |conn| {
+                        let _ = conn.execute(
+                            "UPDATE api_tokens SET last_used_at = ?1 WHERE token_sha256 = ?2",
+                            params![now_m, sha_upd],
+                        );
+                        Ok(())
+                    })
+                    .await;
             }
-            Ok(row)
-        })
-        .await
+            return Ok(Some(ctx));
+        }
+        Ok(None)
     }
 
     async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
         let sha = key_sha256.to_string();
         self.read(move |conn| {
             conn.query_row(
-                "SELECT p.id, p.organization_id, o.slug, p.slug, p.first_event_at, k.rate_limit_per_min, p.filters_json
+                "SELECT p.id, p.organization_id, o.slug, p.slug, p.first_event_at, k.rate_limit_per_min, p.filters_json, o.settings_json
                  FROM project_keys k
                  JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id
                  JOIN organizations o ON o.id = p.organization_id
@@ -772,7 +974,9 @@ impl StorageBackend for SqliteStorage {
                 params![project_id, sha],
                 |r| {
                     let fjson: String = r.get(6)?;
+                    let sjson: String = r.get(7)?;
                     let filters = serde_json::from_str(&fjson).unwrap_or_default();
+                    let org_sec: OrgSecuritySettings = serde_json::from_str(&sjson).unwrap_or_default();
                     Ok(ProjectAuthInfo {
                         project_id: r.get(0)?,
                         organization_id: r.get(1)?,
@@ -781,6 +985,8 @@ impl StorageBackend for SqliteStorage {
                         first_event_at: r.get(4)?,
                         rate_limit_per_min: r.get::<_, i64>(5)?.max(1) as u32,
                         filters,
+                        org_scrub_ip_addresses: org_sec.scrub_ip_addresses,
+                        org_event_throttle_rate: org_sec.event_throttle_rate,
                     })
                 },
             )
@@ -810,7 +1016,7 @@ impl StorageBackend for SqliteStorage {
         let sha = key_sha256.to_string();
         self.read(move |conn| {
             conn.query_row(
-                "SELECT p.id, p.organization_id, o.slug, p.slug, p.first_event_at, k.rate_limit_per_min, p.filters_json
+                "SELECT p.id, p.organization_id, o.slug, p.slug, p.first_event_at, k.rate_limit_per_min, p.filters_json, o.settings_json
                  FROM tunnel_routes tr
                  JOIN project_keys k ON k.project_id = tr.project_id AND k.organization_id = tr.organization_id
                  JOIN projects p ON p.id = tr.project_id AND p.organization_id = tr.organization_id
@@ -819,7 +1025,9 @@ impl StorageBackend for SqliteStorage {
                 params![tslug, project_id, sha],
                 |r| {
                     let fjson: String = r.get(6)?;
+                    let sjson: String = r.get(7)?;
                     let filters = serde_json::from_str(&fjson).unwrap_or_default();
+                    let org_sec: OrgSecuritySettings = serde_json::from_str(&sjson).unwrap_or_default();
                     Ok(ProjectAuthInfo {
                         project_id: r.get(0)?,
                         organization_id: r.get(1)?,
@@ -828,6 +1036,8 @@ impl StorageBackend for SqliteStorage {
                         first_event_at: r.get(4)?,
                         rate_limit_per_min: r.get::<_, i64>(5)?.max(1) as u32,
                         filters,
+                        org_scrub_ip_addresses: org_sec.scrub_ip_addresses,
+                        org_event_throttle_rate: org_sec.event_throttle_rate,
                     })
                 },
             )
@@ -844,7 +1054,8 @@ impl StorageBackend for SqliteStorage {
                     "SELECT o.id, o.slug, o.name, m.role, o.created_at
                      FROM organizations o
                      JOIN organization_members m ON m.organization_id = o.id
-                     WHERE m.user_id = ?1
+                     JOIN users u ON u.id = m.user_id
+                     WHERE m.user_id = ?1 AND u.is_active = 1
                      ORDER BY o.id ASC",
                 )
                 .map_err(map_sqlite_err)?;
@@ -880,12 +1091,15 @@ impl StorageBackend for SqliteStorage {
                 params![user_id, slug],
                 |r| {
                     let role_s: String = r.get(2)?;
-                    Ok(TenantCtx {
-                        organization_id: r.get(0)?,
-                        organization_slug: r.get(1)?,
-                        user_id: Some(user_id),
-                        role: UserRole::from_db(&role_s).unwrap_or(UserRole::Viewer),
-                    })
+                    let role = UserRole::from_db(&role_s).unwrap_or(UserRole::Viewer);
+                    Ok(TenantCtx::from_session(
+                        r.get(0)?,
+                        r.get(1)?,
+                        user_id,
+                        role,
+                        None,
+                        None,
+                    ))
                 },
             )
             .optional()
@@ -2229,6 +2443,7 @@ impl StorageBackend for SqliteStorage {
     async fn create_alert_rule(&self, ctx: &TenantCtx, rule: &NewAlertRule) -> Result<AlertRuleDto, String> {
         let org_id = ctx.organization_id;
         let r = rule.clone();
+        let enc_secret = seal_secret(&self.app_key, &webhook_aad(org_id), &r.webhook_secret)?;
         self.write(move |conn| {
             let owns: Option<i64> = conn
                 .query_row(
@@ -2247,7 +2462,7 @@ impl StorageBackend for SqliteStorage {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12)",
                 params![
                     org_id, r.project_id, r.name, r.trigger_type, r.threshold_count, r.window_sec,
-                    r.cooldown_sec, r.channel_type, r.target_url, r.webhook_secret, r.email_to, now
+                    r.cooldown_sec, r.channel_type, r.target_url, enc_secret, r.email_to, now
                 ],
             )
             .map_err(map_sqlite_err)?;
@@ -2292,6 +2507,7 @@ impl StorageBackend for SqliteStorage {
 
     async fn get_alert_rule_for_dispatch(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<(AlertRuleDto, String)>, String> {
         let org_id = ctx.organization_id;
+        let app_key = self.app_key;
         self.read(move |conn| {
             conn.query_row(
                 "SELECT id, project_id, name, trigger_type, threshold_count, window_sec, cooldown_sec,
@@ -2299,7 +2515,8 @@ impl StorageBackend for SqliteStorage {
                  FROM alert_rules WHERE id = ?1 AND organization_id = ?2",
                 params![rule_id, org_id],
                 |r| {
-                    let secret: String = r.get(9)?;
+                    let stored: String = r.get(9)?;
+                    let secret = open_webhook_secret(&app_key, org_id, &stored);
                     let dto = AlertRuleDto {
                         id: r.get(0)?,
                         project_id: r.get(1)?,
@@ -2310,7 +2527,7 @@ impl StorageBackend for SqliteStorage {
                         cooldown_sec: r.get(6)?,
                         channel_type: r.get(7)?,
                         target_url: r.get(8)?,
-                        has_secret: !secret.is_empty(),
+                        has_secret: !stored.is_empty(),
                         email_to: r.get(10)?,
                         last_triggered_at: r.get(11)?,
                         is_active: r.get::<_, i64>(12)? != 0,
@@ -2330,13 +2547,14 @@ impl StorageBackend for SqliteStorage {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, token_prefix, role, scopes, last_used_at, created_at
+                    "SELECT id, name, token_prefix, role, scopes, last_used_at, expires_at, created_at
                      FROM api_tokens WHERE organization_id = ?1 ORDER BY id DESC",
                 )
                 .map_err(map_sqlite_err)?;
             let rows = stmt
                 .query_map(params![org_id], |r| {
                     let lu: Option<i64> = r.get(5)?;
+                    let exp: Option<i64> = r.get(6)?;
                     Ok(ApiTokenDto {
                         id: r.get(0)?,
                         name: r.get(1)?,
@@ -2344,7 +2562,8 @@ impl StorageBackend for SqliteStorage {
                         role: r.get(3)?,
                         scopes: r.get(4)?,
                         last_used_at: lu.map(iso_from_ms),
-                        created_at: iso_from_ms(r.get(6)?),
+                        expires_at: exp.map(|s| iso_from_ms(s * 1000)),
+                        created_at: iso_from_ms(r.get(7)?),
                     })
                 })
                 .map_err(map_sqlite_err)?;
@@ -2364,6 +2583,8 @@ impl StorageBackend for SqliteStorage {
         token_sha256: &str,
         token_prefix: &str,
         role: UserRole,
+        scopes: &str,
+        expires_at: Option<i64>,
     ) -> Result<ApiTokenDto, String> {
         let org_id = ctx.organization_id;
         let user_id = ctx.user_id.ok_or("Missing actor user_id")?;
@@ -2371,12 +2592,13 @@ impl StorageBackend for SqliteStorage {
         let sha = token_sha256.to_string();
         let pref = token_prefix.to_string();
         let role_s = role.as_str().to_string();
+        let scopes_s = scopes.to_string();
         self.write(move |conn| {
             let now = now_ms();
             conn.execute(
-                "INSERT INTO api_tokens (organization_id, user_id, name, token_sha256, token_prefix, role, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![org_id, user_id, name, sha, pref, role_s, now],
+                "INSERT INTO api_tokens (organization_id, user_id, name, token_sha256, token_prefix, role, scopes, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![org_id, user_id, name, sha, pref, role_s, scopes_s, expires_at, now],
             )
             .map_err(map_sqlite_err)?;
             let id = conn.last_insert_rowid();
@@ -2385,8 +2607,9 @@ impl StorageBackend for SqliteStorage {
                 name,
                 token_prefix: pref,
                 role: role_s,
-                scopes: "project:read project:write event:read".into(),
+                scopes: scopes_s,
                 last_used_at: None,
+                expires_at: expires_at.map(|s| iso_from_ms(s * 1000)),
                 created_at: iso_from_ms(now),
             })
         })
@@ -2520,6 +2743,27 @@ impl StorageBackend for SqliteStorage {
                 params![role_s, org_id, target_user_id],
             )
             .map_err(map_sqlite_err)?;
+            // Rotate out stale sessions & revoke any API tokens exceeding the new role rank
+            tx.execute(
+                "DELETE FROM sessions WHERE organization_id = ?1 AND user_id = ?2",
+                params![org_id, target_user_id],
+            )
+            .map_err(map_sqlite_err)?;
+            let mut tok_stmt = tx
+                .prepare("SELECT id, role FROM api_tokens WHERE organization_id = ?1 AND user_id = ?2")
+                .map_err(map_sqlite_err)?;
+            let tok_ids: Vec<(i64, String)> = tok_stmt
+                .query_map(params![org_id, target_user_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(map_sqlite_err)?
+                .filter_map(Result::ok)
+                .collect();
+            drop(tok_stmt);
+            for (tid, trole) in tok_ids {
+                if UserRole::from_db(&trole).map(|r| r.rank() > role.rank()).unwrap_or(true) {
+                    tx.execute("DELETE FROM api_tokens WHERE id = ?1", params![tid])
+                        .map_err(map_sqlite_err)?;
+                }
+            }
             let dto = tx
                 .query_row(
                     "SELECT u.id, u.email, u.name, m.role, u.is_active
@@ -2577,6 +2821,11 @@ impl StorageBackend for SqliteStorage {
             .map_err(map_sqlite_err)?;
             tx.execute(
                 "DELETE FROM sessions WHERE organization_id = ?1 AND user_id = ?2",
+                params![org_id, target_user_id],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.execute(
+                "DELETE FROM api_tokens WHERE organization_id = ?1 AND user_id = ?2",
                 params![org_id, target_user_id],
             )
             .map_err(map_sqlite_err)?;
@@ -2669,6 +2918,7 @@ impl StorageBackend for SqliteStorage {
         }
         let writer = self.writer.clone();
         let storm_counters = self.storm_counters.clone();
+        let app_key = self.app_key;
         tokio::task::spawn_blocking(move || {
             let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
             let tx = guard.transaction().map_err(map_sqlite_err)?;
@@ -2696,6 +2946,7 @@ impl StorageBackend for SqliteStorage {
                         if issue_id > 0 {
                             let jobs = build_alert_jobs_for_event(
                                 &tx,
+                                &app_key,
                                 auth.organization_id,
                                 auth.project_id,
                                 &auth.project_slug,
@@ -2786,6 +3037,8 @@ impl StorageBackend for SqliteStorage {
                                         first_event_at: Some(l.timestamp_ms),
                                         rate_limit_per_min: 300,
                                         filters: ProjectFilters::default(),
+                                        org_scrub_ip_addresses: false,
+                                        org_event_throttle_rate: 0,
                                     };
                                     let (issue_id, short_id, is_new, is_reg) = insert_event_in_txn(
                                         &tx,
@@ -2798,6 +3051,7 @@ impl StorageBackend for SqliteStorage {
                                     if issue_id > 0 {
                                         let jobs = build_alert_jobs_for_event(
                                             &tx,
+                                            &app_key,
                                             organization_id,
                                             project_id,
                                             &project_slug,
@@ -2816,6 +3070,7 @@ impl StorageBackend for SqliteStorage {
                             if !fatal_alert_checked && l.level == LogLevel::Fatal {
                                 let jobs = build_alert_jobs_for_event(
                                     &tx,
+                                    &app_key,
                                     organization_id,
                                     project_id,
                                     &project_slug,
@@ -2919,6 +3174,7 @@ impl StorageBackend for SqliteStorage {
 
     async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String> {
         let size_bytes = self.db_size_bytes().await;
+        let app_key = self.app_key;
         self.write(move |conn| {
             let now = now_ms();
             let cutoff_ms = now - (retention_days as i64) * 86_400_000;
@@ -2928,6 +3184,10 @@ impl StorageBackend for SqliteStorage {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
             tx.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now_sec])
                 .map_err(map_sqlite_err)?;
+            let _ = tx.execute("DELETE FROM mfa_challenges WHERE expires_at <= ?1", params![now_sec]);
+            let _ = tx.execute("DELETE FROM webauthn_challenges WHERE expires_at <= ?1", params![now_sec]);
+            let _ = tx.execute("DELETE FROM org_invitations WHERE accepted_at IS NULL AND expires_at <= ?1", params![now_sec]);
+            let _ = tx.execute("DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at <= ?1", params![now_sec]);
             tx.execute(
                 "DELETE FROM idempotency_keys WHERE created_at < ?1",
                 params![now - 86_400_000],
@@ -3042,7 +3302,7 @@ impl StorageBackend for SqliteStorage {
                             rule_name: rr.get(1).map_err(map_sqlite_err)?,
                             channel_type: rr.get(2).map_err(map_sqlite_err)?,
                             target_url: rr.get(3).map_err(map_sqlite_err)?,
-                            webhook_secret: rr.get(4).map_err(map_sqlite_err)?,
+                            webhook_secret: open_webhook_secret(&app_key, org_id, &rr.get::<_, String>(4).map_err(map_sqlite_err)?),
                             email_to: rr.get(5).map_err(map_sqlite_err)?,
                             title: format!("Uptime monitor down: {mname}"),
                             message: format!("Heartbeat missed for monitor {muuid}"),
@@ -3131,6 +3391,7 @@ impl StorageBackend for SqliteStorage {
         ev: &NewSecurityEvent,
     ) -> Result<(SecurityEventDto, Vec<AlertDispatchJob>), String> {
         let ev = ev.clone();
+        let app_key = self.app_key;
         self.write(move |conn| {
             let now_sec = ev.timestamp_ms / 1000;
             let details_str = ev.details_json.to_string();
@@ -3207,7 +3468,7 @@ impl StorageBackend for SqliteStorage {
                         rule_name: r.get(1).map_err(map_sqlite_err)?,
                         channel_type: r.get(4).map_err(map_sqlite_err)?,
                         target_url: r.get(5).map_err(map_sqlite_err)?,
-                        webhook_secret: r.get(6).map_err(map_sqlite_err)?,
+                        webhook_secret: open_webhook_secret(&app_key, ev.organization_id, &r.get::<_, String>(6).map_err(map_sqlite_err)?),
                         email_to: r.get(7).map_err(map_sqlite_err)?,
                         title: format!("[{}:{}] {} (score {})", ev.category, ev.severity, ev.signal_type, ev.risk_score),
                         message: format!(
@@ -3396,6 +3657,975 @@ impl StorageBackend for SqliteStorage {
                 )
                 .map_err(map_sqlite_err)?;
             Ok(changed > 0)
+        })
+        .await
+    }
+
+    async fn update_project_key(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+        key_id: i64,
+        rate_limit_per_min: u32,
+        is_active: bool,
+    ) -> Result<Option<ProjectKeyDto>, String> {
+        let org_id = ctx.organization_id;
+        let pslug = project_slug.to_string();
+        let rpm = rate_limit_per_min.clamp(10, 100_000) as i64;
+        let act = if is_active { 1i64 } else { 0i64 };
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE project_keys SET rate_limit_per_min = ?1, is_active = ?2
+                     WHERE id = ?3 AND organization_id = ?4
+                       AND project_id = (SELECT id FROM projects WHERE organization_id = ?4 AND slug = ?5)",
+                    params![rpm, act, key_id, org_id, pslug],
+                )
+                .map_err(map_sqlite_err)?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            conn.query_row(
+                "SELECT id, project_id, label, public_key, rate_limit_per_min, is_active, created_at
+                 FROM project_keys WHERE id = ?1 AND organization_id = ?2",
+                params![key_id, org_id],
+                |r| {
+                    Ok(ProjectKeyDto {
+                        id: r.get(0)?,
+                        project_id: r.get(1)?,
+                        label: r.get(2)?,
+                        public_key: r.get(3)?,
+                        rate_limit_per_min: r.get::<_, i64>(4)?.max(1) as u32,
+                        is_active: r.get::<_, i64>(5)? != 0,
+                        created_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn get_mfa_status(&self, user_id: i64) -> Result<MfaStatusDto, String> {
+        self.read(move |conn| {
+            let totp_enabled: bool = conn
+                .query_row(
+                    "SELECT is_enabled FROM user_mfa WHERE user_id = ?1",
+                    params![user_id],
+                    |r| Ok(r.get::<_, i64>(0)? != 0),
+                )
+                .optional()
+                .map_err(map_sqlite_err)?
+                .unwrap_or(false);
+            let recovery_codes_remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_mfa_recovery_codes WHERE user_id = ?1 AND used_at IS NULL",
+                    params![user_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite_err)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, cose_alg, sign_count, last_used_at, created_at
+                     FROM webauthn_credentials WHERE user_id = ?1 ORDER BY id DESC",
+                )
+                .map_err(map_sqlite_err)?;
+            let passkeys: Vec<PasskeyDto> = stmt
+                .query_map(params![user_id], |r| {
+                    let lu: Option<i64> = r.get(4)?;
+                    Ok(PasskeyDto {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        cose_alg: r.get(2)?,
+                        sign_count: r.get::<_, i64>(3)?.max(0) as u32,
+                        last_used_at: lu.map(|s| iso_from_ms(s * 1000)),
+                        created_at: iso_from_ms(r.get(5)?),
+                    })
+                })
+                .map_err(map_sqlite_err)?
+                .filter_map(Result::ok)
+                .collect();
+            Ok(MfaStatusDto {
+                totp_enabled,
+                recovery_codes_remaining,
+                passkeys,
+            })
+        })
+        .await
+    }
+
+    async fn get_user_mfa_record(&self, user_id: i64) -> Result<Option<UserMfaRecord>, String> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT user_id, totp_secret_enc, is_enabled, last_used_step, failed_attempts, locked_until
+                 FROM user_mfa WHERE user_id = ?1",
+                params![user_id],
+                |r| {
+                    Ok(UserMfaRecord {
+                        user_id: r.get(0)?,
+                        totp_secret_enc: r.get(1)?,
+                        is_enabled: r.get::<_, i64>(2)? != 0,
+                        last_used_step: r.get(3)?,
+                        failed_attempts: r.get(4)?,
+                        locked_until: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn upsert_pending_totp(&self, user_id: i64, totp_secret_enc: &str, now_sec: i64) -> Result<(), String> {
+        let enc = totp_secret_enc.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO user_mfa (user_id, totp_secret_enc, is_enabled, failed_attempts, updated_at)
+                 VALUES (?1, ?2, 0, 0, ?3)
+                 ON CONFLICT(user_id) DO UPDATE SET totp_secret_enc = ?2, is_enabled = 0, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = ?3",
+                params![user_id, enc, now_sec],
+            )
+            .map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn enable_totp_with_recovery_codes(&self, user_id: i64, code_hashes: &[String], now_sec: i64) -> Result<(), String> {
+        let hashes = code_hashes.to_vec();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            tx.execute(
+                "UPDATE user_mfa SET is_enabled = 1, enabled_at = ?1, failed_attempts = 0, locked_until = NULL, updated_at = ?1
+                 WHERE user_id = ?2",
+                params![now_sec, user_id],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.execute("DELETE FROM user_mfa_recovery_codes WHERE user_id = ?1", params![user_id])
+                .map_err(map_sqlite_err)?;
+            let now_m = now_ms();
+            for h in hashes {
+                tx.execute(
+                    "INSERT INTO user_mfa_recovery_codes (user_id, code_hash, created_at) VALUES (?1, ?2, ?3)",
+                    params![user_id, h, now_m],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn disable_mfa(&self, user_id: i64, now_sec: i64) -> Result<(), String> {
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            tx.execute(
+                "UPDATE user_mfa SET is_enabled = 0, totp_secret_enc = '', last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = ?1 WHERE user_id = ?2",
+                params![now_sec, user_id],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.execute("DELETE FROM user_mfa_recovery_codes WHERE user_id = ?1", params![user_id])
+                .map_err(map_sqlite_err)?;
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn replace_recovery_codes(&self, user_id: i64, code_hashes: &[String], _now_sec: i64) -> Result<(), String> {
+        let hashes = code_hashes.to_vec();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            tx.execute("DELETE FROM user_mfa_recovery_codes WHERE user_id = ?1", params![user_id])
+                .map_err(map_sqlite_err)?;
+            let now_m = now_ms();
+            for h in hashes {
+                tx.execute(
+                    "INSERT INTO user_mfa_recovery_codes (user_id, code_hash, created_at) VALUES (?1, ?2, ?3)",
+                    params![user_id, h, now_m],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_mfa_attempt(&self, user_id: i64, success_step: Option<i64>, now_sec: i64) -> Result<Option<i64>, String> {
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            if let Some(step) = success_step {
+                tx.execute(
+                    "UPDATE user_mfa SET last_used_step = ?1, failed_attempts = 0, locked_until = NULL, updated_at = ?2 WHERE user_id = ?3",
+                    params![step, now_sec, user_id],
+                )
+                .map_err(map_sqlite_err)?;
+                tx.commit().map_err(map_sqlite_err)?;
+                return Ok(None);
+            }
+            let prev: i64 = tx
+                .query_row(
+                    "SELECT failed_attempts FROM user_mfa WHERE user_id = ?1",
+                    params![user_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_sqlite_err)?
+                .unwrap_or(0);
+            let next = prev + 1;
+            let lock_secs = compute_lockout_seconds(next);
+            let locked_until = lock_secs.map(|s| now_sec + s);
+            tx.execute(
+                "INSERT INTO user_mfa (user_id, totp_secret_enc, is_enabled, failed_attempts, locked_until, updated_at)
+                 VALUES (?1, '', 0, ?2, ?3, ?4)
+                 ON CONFLICT(user_id) DO UPDATE SET failed_attempts = ?2, locked_until = ?3, updated_at = ?4",
+                params![user_id, next, locked_until, now_sec],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(lock_secs)
+        })
+        .await
+    }
+
+    async fn list_unused_recovery_codes(&self, user_id: i64) -> Result<Vec<RecoveryCodeRecord>, String> {
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT id, code_hash FROM user_mfa_recovery_codes WHERE user_id = ?1 AND used_at IS NULL")
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![user_id], |r| {
+                    Ok(RecoveryCodeRecord { id: r.get(0)?, code_hash: r.get(1)? })
+                })
+                .map_err(map_sqlite_err)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+    }
+
+    async fn mark_recovery_code_used(&self, user_id: i64, code_id: i64, now_sec: i64) -> Result<bool, String> {
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE user_mfa_recovery_codes SET used_at = ?1 WHERE id = ?2 AND user_id = ?3 AND used_at IS NULL",
+                    params![now_sec, code_id, user_id],
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    async fn create_mfa_challenge(&self, token_sha256: &str, user_id: i64, target_org_id: i64, ip_hmac: &str, expires_at: i64) -> Result<(), String> {
+        let sha = token_sha256.to_string();
+        let iph = ip_hmac.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO mfa_challenges (token_sha256, user_id, target_org_id, ip_hmac, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![sha, user_id, target_org_id, iph, expires_at, now_ms()],
+            )
+            .map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn consume_mfa_challenge(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String> {
+        let sha = token_sha256.to_string();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            let row = tx
+                .query_row(
+                    "SELECT user_id, target_org_id, ip_hmac, expires_at FROM mfa_challenges WHERE token_sha256 = ?1",
+                    params![sha],
+                    |r| {
+                        Ok(MfaChallengeRecord {
+                            user_id: r.get(0)?,
+                            target_org_id: r.get(1)?,
+                            ip_hmac: r.get(2)?,
+                            expires_at: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(map_sqlite_err)?;
+            if let Some(ref rec) = row {
+                tx.execute("DELETE FROM mfa_challenges WHERE token_sha256 = ?1", params![sha])
+                    .map_err(map_sqlite_err)?;
+                tx.commit().map_err(map_sqlite_err)?;
+                if rec.expires_at > now_sec {
+                    return Ok(Some(rec.clone()));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    async fn get_mfa_challenge_user(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String> {
+        let sha = token_sha256.to_string();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT user_id, target_org_id, ip_hmac, expires_at FROM mfa_challenges WHERE token_sha256 = ?1 AND expires_at > ?2",
+                params![sha, now_sec],
+                |r| {
+                    Ok(MfaChallengeRecord {
+                        user_id: r.get(0)?,
+                        target_org_id: r.get(1)?,
+                        ip_hmac: r.get(2)?,
+                        expires_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn save_webauthn_challenge(&self, challenge_b64: &str, user_id: Option<i64>, flow_kind: &str, expires_at: i64) -> Result<(), String> {
+        let cb = challenge_b64.to_string();
+        let fk = flow_kind.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO webauthn_challenges (challenge_b64, user_id, flow_kind, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![cb, user_id, fk, expires_at, now_ms()],
+            )
+            .map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn consume_webauthn_challenge(&self, challenge_b64: &str, flow_kind: &str, now_sec: i64) -> Result<Option<WebAuthnChallengeRecord>, String> {
+        let cb = challenge_b64.to_string();
+        let fk = flow_kind.to_string();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            let row = tx
+                .query_row(
+                    "SELECT challenge_b64, user_id, flow_kind, expires_at FROM webauthn_challenges WHERE challenge_b64 = ?1 AND flow_kind = ?2",
+                    params![cb, fk],
+                    |r| {
+                        Ok(WebAuthnChallengeRecord {
+                            challenge_b64: r.get(0)?,
+                            user_id: r.get(1)?,
+                            flow_kind: r.get(2)?,
+                            expires_at: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(map_sqlite_err)?;
+            if let Some(ref rec) = row {
+                tx.execute("DELETE FROM webauthn_challenges WHERE challenge_b64 = ?1", params![cb])
+                    .map_err(map_sqlite_err)?;
+                tx.commit().map_err(map_sqlite_err)?;
+                if rec.expires_at > now_sec {
+                    return Ok(Some(rec.clone()));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    async fn create_webauthn_credential(&self, user_id: i64, name: &str, credential_id_b64: &str, cose_alg: i32, public_key_b64: &str, sign_count: u32) -> Result<PasskeyDto, String> {
+        let nm = name.to_string();
+        let cid = credential_id_b64.to_string();
+        let pk = public_key_b64.to_string();
+        let now = now_ms();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO webauthn_credentials (user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![user_id, nm, cid, cose_alg, pk, sign_count as i64, now],
+            )
+            .map_err(map_sqlite_err)?;
+            let id = conn.last_insert_rowid();
+            Ok(PasskeyDto {
+                id,
+                name: nm,
+                cose_alg,
+                sign_count,
+                last_used_at: None,
+                created_at: iso_from_ms(now),
+            })
+        })
+        .await
+    }
+
+    async fn list_webauthn_credentials(&self, user_id: i64) -> Result<Vec<WebAuthnCredRecord>, String> {
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, last_used_at, created_at
+                     FROM webauthn_credentials WHERE user_id = ?1 ORDER BY id DESC",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![user_id], |r| {
+                    Ok(WebAuthnCredRecord {
+                        id: r.get(0)?,
+                        user_id: r.get(1)?,
+                        name: r.get(2)?,
+                        credential_id_b64: r.get(3)?,
+                        cose_alg: r.get(4)?,
+                        public_key_b64: r.get(5)?,
+                        sign_count: r.get::<_, i64>(6)?.max(0) as u32,
+                        last_used_at: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                })
+                .map_err(map_sqlite_err)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+    }
+
+    async fn find_webauthn_credential(&self, credential_id_b64: &str) -> Result<Option<WebAuthnCredRecord>, String> {
+        let cid = credential_id_b64.to_string();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT id, user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, last_used_at, created_at
+                 FROM webauthn_credentials WHERE credential_id_b64 = ?1",
+                params![cid],
+                |r| {
+                    Ok(WebAuthnCredRecord {
+                        id: r.get(0)?,
+                        user_id: r.get(1)?,
+                        name: r.get(2)?,
+                        credential_id_b64: r.get(3)?,
+                        cose_alg: r.get(4)?,
+                        public_key_b64: r.get(5)?,
+                        sign_count: r.get::<_, i64>(6)?.max(0) as u32,
+                        last_used_at: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn update_webauthn_sign_count(&self, cred_id: i64, sign_count: u32, now_sec: i64) -> Result<(), String> {
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE webauthn_credentials SET sign_count = ?1, last_used_at = ?2 WHERE id = ?3",
+                params![sign_count as i64, now_sec, cred_id],
+            )
+            .map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_webauthn_credential(&self, user_id: i64, cred_id: i64) -> Result<bool, String> {
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM webauthn_credentials WHERE id = ?1 AND user_id = ?2",
+                    params![cred_id, user_id],
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    async fn list_user_sessions(&self, user_id: i64, org_id: i64, current_token_sha256: &str, now_sec: i64) -> Result<Vec<ActiveSessionDto>, String> {
+        let cur = current_token_sha256.to_string();
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, token_sha256, user_agent, ip_hmac, last_seen_at, created_at
+                     FROM sessions
+                     WHERE user_id = ?1 AND organization_id = ?2 AND expires_at > ?3
+                     ORDER BY rowid DESC",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![user_id, org_id, now_sec], |r| {
+                    let sha: String = r.get(1)?;
+                    let iph: String = r.get(3)?;
+                    let lseen: i64 = r.get(4)?;
+                    let crt: i64 = r.get(5)?;
+                    Ok(ActiveSessionDto {
+                        id: r.get(0)?,
+                        user_agent: r.get(2)?,
+                        ip_hmac_short: iph.chars().take(12).collect(),
+                        last_seen_at: iso_from_ms(if lseen > 0 { lseen * 1000 } else { crt }),
+                        created_at: iso_from_ms(crt),
+                        is_current: sha == cur,
+                    })
+                })
+                .map_err(map_sqlite_err)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+    }
+
+    async fn revoke_session_by_id(&self, user_id: i64, org_id: i64, session_id: i64) -> Result<bool, String> {
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM sessions WHERE rowid = ?1 AND user_id = ?2 AND organization_id = ?3",
+                    params![session_id, user_id, org_id],
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    async fn revoke_other_sessions(&self, user_id: i64, org_id: i64, keep_token_sha256: &str) -> Result<usize, String> {
+        let keep = keep_token_sha256.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM sessions WHERE user_id = ?1 AND organization_id = ?2 AND token_sha256 != ?3",
+                params![user_id, org_id, keep],
+            )
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn mark_session_reauth(&self, token_sha256: &str, org_id: i64, now_sec: i64) -> Result<(), String> {
+        let sha = token_sha256.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET reauth_at = ?1, last_seen_at = ?1 WHERE token_sha256 = ?2 AND organization_id = ?3",
+                params![now_sec, sha, org_id],
+            )
+            .map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn find_user_password_hash(&self, user_id: i64) -> Result<Option<(String, String, String)>, String> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT email, name, password_hash FROM users WHERE id = ?1 AND is_active = 1",
+                params![user_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn change_user_password(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        new_password_hash: &str,
+        old_session_sha: &str,
+        new_session_sha: &str,
+        new_csrf: &str,
+        user_agent: &str,
+        ip_hmac: &str,
+        now_sec: i64,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        let npw = new_password_hash.to_string();
+        let old_s = old_session_sha.to_string();
+        let new_s = new_session_sha.to_string();
+        let csrf = new_csrf.to_string();
+        let ua = user_agent.chars().take(160).collect::<String>();
+        let iph = ip_hmac.to_string();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            tx.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+                params![npw, user_id],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
+                .map_err(map_sqlite_err)?;
+            let _ = old_s;
+            tx.execute(
+                "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, user_agent, ip_hmac, last_seen_at, reauth_at, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+                params![new_s, user_id, org_id, csrf, ua, iph, now_sec, expires_at, now_ms()],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn create_invitation(&self, ctx: &TenantCtx, email: &str, role: UserRole, token_sha256: &str, expires_at: i64) -> Result<InvitationDto, String> {
+        let org_id = ctx.organization_id;
+        let uid = ctx.user_id;
+        let email_norm = email.trim().to_ascii_lowercase();
+        let role_s = role.as_str().to_string();
+        let sha = token_sha256.to_string();
+        let now = now_ms();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO org_invitations (organization_id, email, role, token_sha256, invited_by, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![org_id, email_norm, role_s, sha, uid, expires_at, now],
+            )
+            .map_err(map_sqlite_err)?;
+            let id = conn.last_insert_rowid();
+            let inv_email: String = uid
+                .and_then(|u| conn.query_row("SELECT email FROM users WHERE id = ?1", params![u], |r| r.get(0)).ok())
+                .unwrap_or_default();
+            Ok(InvitationDto {
+                id,
+                email: email_norm,
+                role: role_s,
+                invited_by_email: inv_email,
+                expires_at: iso_from_ms(expires_at * 1000),
+                accepted_at: None,
+                created_at: iso_from_ms(now),
+            })
+        })
+        .await
+    }
+
+    async fn list_invitations(&self, ctx: &TenantCtx) -> Result<Vec<InvitationDto>, String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT i.id, i.email, i.role, COALESCE(u.email, ''), i.expires_at, i.accepted_at, i.created_at
+                     FROM org_invitations i
+                     LEFT JOIN users u ON u.id = i.invited_by
+                     WHERE i.organization_id = ?1
+                     ORDER BY i.id DESC LIMIT 100",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![org_id], |r| {
+                    let acc: Option<i64> = r.get(5)?;
+                    Ok(InvitationDto {
+                        id: r.get(0)?,
+                        email: r.get(1)?,
+                        role: r.get(2)?,
+                        invited_by_email: r.get(3)?,
+                        expires_at: iso_from_ms(r.get::<_, i64>(4)? * 1000),
+                        accepted_at: acc.map(|s| iso_from_ms(s * 1000)),
+                        created_at: iso_from_ms(r.get(6)?),
+                    })
+                })
+                .map_err(map_sqlite_err)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+    }
+
+    async fn revoke_invitation(&self, ctx: &TenantCtx, inv_id: i64) -> Result<bool, String> {
+        let org_id = ctx.organization_id;
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM org_invitations WHERE id = ?1 AND organization_id = ?2",
+                    params![inv_id, org_id],
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    async fn lookup_invitation(&self, token_sha256: &str) -> Result<Option<InvitationLookupInfo>, String> {
+        let sha = token_sha256.to_string();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT i.organization_id, o.slug, o.name, i.email, i.role, i.expires_at, i.accepted_at
+                 FROM org_invitations i
+                 JOIN organizations o ON o.id = i.organization_id
+                 WHERE i.token_sha256 = ?1",
+                params![sha],
+                |r| {
+                    Ok(InvitationLookupInfo {
+                        organization_id: r.get(0)?,
+                        organization_slug: r.get(1)?,
+                        organization_name: r.get(2)?,
+                        email: r.get(3)?,
+                        role: r.get(4)?,
+                        expires_at: r.get(5)?,
+                        accepted_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn accept_invitation(
+        &self,
+        token_sha256: &str,
+        name: &str,
+        password_hash: &str,
+        now_sec: i64,
+    ) -> Result<Result<(i64, i64, String, String, UserRole), String>, String> {
+        let sha = token_sha256.to_string();
+        let nm = name.to_string();
+        let pwh = password_hash.to_string();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            let inv: Option<(i64, i64, String, String, String, i64, Option<i64>)> = tx
+                .query_row(
+                    "SELECT i.id, i.organization_id, o.slug, i.email, i.role, i.expires_at, i.accepted_at
+                     FROM org_invitations i
+                     JOIN organizations o ON o.id = i.organization_id
+                     WHERE i.token_sha256 = ?1",
+                    params![sha],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                )
+                .optional()
+                .map_err(map_sqlite_err)?;
+            let Some((inv_id, org_id, org_slug, email, role_s, exp, acc)) = inv else {
+                return Ok(Err("Invitation not found".into()));
+            };
+            if acc.is_some() {
+                return Ok(Err("Invitation has already been used".into()));
+            }
+            if exp <= now_sec {
+                return Ok(Err("Invitation has expired".into()));
+            }
+            let updated = tx
+                .execute(
+                    "UPDATE org_invitations SET accepted_at = ?1 WHERE id = ?2 AND accepted_at IS NULL",
+                    params![now_sec, inv_id],
+                )
+                .map_err(map_sqlite_err)?;
+            if updated == 0 {
+                return Ok(Err("Invitation already claimed".into()));
+            }
+            let existing_uid: Option<i64> = tx
+                .query_row("SELECT id FROM users WHERE email = ?1", params![email], |r| r.get(0))
+                .optional()
+                .map_err(map_sqlite_err)?;
+            let uid = match existing_uid {
+                Some(id) => id,
+                None => {
+                    tx.execute(
+                        "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
+                        params![email, nm, pwh, now_ms()],
+                    )
+                    .map_err(map_sqlite_err)?;
+                    tx.last_insert_rowid()
+                }
+            };
+            let role = UserRole::from_db(&role_s).unwrap_or(UserRole::Member);
+            tx.execute(
+                "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(organization_id, user_id) DO UPDATE SET role = ?3",
+                params![org_id, uid, role.as_str()],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(Ok((uid, org_id, org_slug, email, role)))
+        })
+        .await
+    }
+
+    async fn append_audit_log(&self, entry: &NewAuditLog) -> Result<(), String> {
+        let e = entry.clone();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+            let prev_hash: String = tx
+                .query_row(
+                    "SELECT entry_hash FROM audit_logs WHERE organization_id = ?1 ORDER BY id DESC LIMIT 1",
+                    params![e.organization_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_sqlite_err)?
+                .filter(|s: &String| !s.is_empty())
+                .unwrap_or_else(|| "GENESIS".to_string());
+            let created_at = now_ms();
+            let meta_str = serde_json::to_string(&e.metadata).unwrap_or_else(|_| "{}".into());
+            let entry_hash = compute_audit_entry_hash(
+                &prev_hash,
+                e.organization_id,
+                e.actor_user_id,
+                &e.action,
+                &e.target_type,
+                &e.target_id,
+                &e.metadata,
+                created_at,
+            );
+            tx.execute(
+                "INSERT INTO audit_logs (organization_id, actor_user_id, actor_email, action, target_type, target_id, ip_hmac, metadata_json, prev_hash, entry_hash, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    e.organization_id, e.actor_user_id, e.actor_email, e.action, e.target_type,
+                    e.target_id, e.ip_hmac, meta_str, prev_hash, entry_hash, created_at
+                ],
+            )
+            .map_err(map_sqlite_err)?;
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_audit_logs(&self, ctx: &TenantCtx, action_filter: Option<&str>, limit: i64, offset: i64) -> Result<Vec<AuditLogDto>, String> {
+        let org_id = ctx.organization_id;
+        let act = action_filter.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let lim = limit.clamp(1, 200);
+        let off = offset.max(0);
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, actor_user_id, actor_email, action, target_type, target_id, ip_hmac, metadata_json, entry_hash, created_at
+                     FROM audit_logs
+                     WHERE organization_id = ?1 AND (?2 IS NULL OR action = ?2)
+                     ORDER BY id DESC LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![org_id, act, lim, off], |r| {
+                    let meta_s: String = r.get(7)?;
+                    Ok(AuditLogDto {
+                        id: r.get(0)?,
+                        actor_user_id: r.get(1)?,
+                        actor_email: r.get(2)?,
+                        action: r.get(3)?,
+                        target_type: r.get(4)?,
+                        target_id: r.get(5)?,
+                        ip_hmac: r.get(6)?,
+                        metadata: serde_json::from_str(&meta_s).unwrap_or_else(|_| json!({})),
+                        entry_hash: r.get(8)?,
+                        created_at: iso_from_ms(r.get(9)?),
+                    })
+                })
+                .map_err(map_sqlite_err)?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })
+        .await
+    }
+
+    async fn verify_audit_chain(&self, ctx: &TenantCtx) -> Result<AuditVerifyDto, String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, actor_user_id, action, target_type, target_id, metadata_json, prev_hash, entry_hash, created_at
+                     FROM audit_logs WHERE organization_id = ?1 ORDER BY id ASC",
+                )
+                .map_err(map_sqlite_err)?;
+            let mut rows = stmt.query(params![org_id]).map_err(map_sqlite_err)?;
+            let mut expected_prev = "GENESIS".to_string();
+            let mut count = 0usize;
+            while let Some(r) = rows.next().map_err(map_sqlite_err)? {
+                let id: i64 = r.get(0).map_err(map_sqlite_err)?;
+                let actor_uid: Option<i64> = r.get(1).map_err(map_sqlite_err)?;
+                let action: String = r.get(2).map_err(map_sqlite_err)?;
+                let target_type: String = r.get(3).map_err(map_sqlite_err)?;
+                let target_id: String = r.get(4).map_err(map_sqlite_err)?;
+                let metadata_json: String = r.get(5).map_err(map_sqlite_err)?;
+                let prev_hash: String = r.get(6).map_err(map_sqlite_err)?;
+                let entry_hash: String = r.get(7).map_err(map_sqlite_err)?;
+                let created_at: i64 = r.get(8).map_err(map_sqlite_err)?;
+                count += 1;
+                if prev_hash != expected_prev {
+                    return Ok(AuditVerifyDto {
+                        valid: false,
+                        checked_entries: count,
+                        broken_at_id: Some(id),
+                        detail: format!("Previous hash link mismatch at audit_logs.id={id}"),
+                    });
+                }
+                let meta_val: Value = serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({}));
+                let recomputed = compute_audit_entry_hash(
+                    &prev_hash,
+                    org_id,
+                    actor_uid,
+                    &action,
+                    &target_type,
+                    &target_id,
+                    &meta_val,
+                    created_at,
+                );
+                if recomputed != entry_hash {
+                    return Ok(AuditVerifyDto {
+                        valid: false,
+                        checked_entries: count,
+                        broken_at_id: Some(id),
+                        detail: format!("SHA-256 tamper detected at audit_logs.id={id}"),
+                    });
+                }
+                expected_prev = entry_hash;
+            }
+            Ok(AuditVerifyDto {
+                valid: true,
+                checked_entries: count,
+                broken_at_id: None,
+                detail: if count == 0 {
+                    "No audit entries yet".into()
+                } else {
+                    format!("Verified {count} immutable hash-chained entries")
+                },
+            })
+        })
+        .await
+    }
+
+    async fn get_org_security_settings(&self, ctx: &TenantCtx) -> Result<OrgSecuritySettings, String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            let s: String = conn
+                .query_row(
+                    "SELECT settings_json FROM organizations WHERE id = ?1",
+                    params![org_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(serde_json::from_str(&s).unwrap_or_default())
+        })
+        .await
+    }
+
+    async fn update_org_security_settings(&self, ctx: &TenantCtx, settings: &OrgSecuritySettings) -> Result<OrgSecuritySettings, String> {
+        let org_id = ctx.organization_id;
+        let mut clean = settings.clone();
+        clean.event_throttle_rate = clean.event_throttle_rate.min(100);
+        let sjson = serde_json::to_string(&clean).map_err(map_sqlite_err)?;
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE organizations SET settings_json = ?1 WHERE id = ?2",
+                params![sjson, org_id],
+            )
+            .map_err(map_sqlite_err)?;
+            Ok(clean)
+        })
+        .await
+    }
+
+    async fn count_owners_without_mfa(&self, ctx: &TenantCtx) -> Result<i64, String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM organization_members m
+                 JOIN users u ON u.id = m.user_id
+                 WHERE m.organization_id = ?1
+                   AND m.role = 'owner'
+                   AND u.is_active = 1
+                   AND NOT EXISTS (SELECT 1 FROM user_mfa f WHERE f.user_id = u.id AND f.is_enabled = 1)
+                   AND NOT EXISTS (SELECT 1 FROM webauthn_credentials w WHERE w.user_id = u.id)",
+                params![org_id],
+                |r| r.get(0),
+            )
+            .map_err(map_sqlite_err)
         })
         .await
     }

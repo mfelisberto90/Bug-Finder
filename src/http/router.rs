@@ -103,7 +103,7 @@ async fn prometheus_metrics(
         .into_response()
 }
 
-async fn serve_spa(uri: Uri, ext: axum::http::Extensions) -> Response {
+async fn serve_spa(uri: Uri, ext: axum::http::Extensions, headers: HeaderMap) -> Response {
     let raw_path = uri.path().trim_start_matches('/');
     if raw_path.starts_with("api/") || raw_path.starts_with("v1/") {
         return (
@@ -124,14 +124,31 @@ async fn serve_spa(uri: Uri, ext: axum::http::Extensions) -> Response {
             if lookup == "index.html" {
                 return render_index_with_nonce(bytes, ext);
             }
+            let quoted_etag = format!("\"{etag}\"");
+            if lookup.starts_with("assets/") {
+                if let Some(if_none_match) =
+                    headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+                {
+                    if if_none_match.split(',').any(|tag| tag.trim() == quoted_etag) {
+                        return (
+                            StatusCode::NOT_MODIFIED,
+                            [
+                                (header::ETAG, quoted_etag.as_str()),
+                                (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
+                            ],
+                        )
+                            .into_response();
+                    }
+                }
+            }
             let mut resp = (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response();
-            if let Ok(v) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+            if let Ok(v) = HeaderValue::from_str(&quoted_etag) {
                 resp.headers_mut().insert(header::ETAG, v);
             }
             if lookup.starts_with("assets/") {
                 resp.headers_mut().insert(
                     header::CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    HeaderValue::from_static("public, max-age=0, must-revalidate"),
                 );
             }
             return resp;
@@ -209,6 +226,25 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(auth_routes::auth_login))
         .route("/api/auth/logout", post(auth_routes::auth_logout))
         .route("/api/auth/me", get(auth_routes::auth_me))
+        .route("/api/auth/mfa/verify", post(auth_routes::mfa_verify))
+        .route("/api/auth/mfa/status", get(auth_routes::mfa_status))
+        .route("/api/auth/mfa/totp/enroll", post(auth_routes::mfa_totp_enroll))
+        .route("/api/auth/mfa/totp/confirm", post(auth_routes::mfa_totp_confirm))
+        .route("/api/auth/mfa/totp/disable", post(auth_routes::mfa_totp_disable))
+        .route("/api/auth/mfa/recovery/regenerate", post(auth_routes::mfa_recovery_regenerate))
+        .route("/api/auth/passkey/register/begin", post(auth_routes::passkey_register_begin))
+        .route("/api/auth/passkey/register/finish", post(auth_routes::passkey_register_finish))
+        .route("/api/auth/passkeys", get(auth_routes::list_passkeys))
+        .route("/api/auth/passkeys/:id", delete(auth_routes::delete_passkey))
+        .route("/api/auth/passkey/login/begin", post(auth_routes::passkey_login_begin))
+        .route("/api/auth/passkey/login/finish", post(auth_routes::passkey_login_finish))
+        .route("/api/auth/reauth", post(auth_routes::auth_reauth))
+        .route("/api/auth/password/change", post(auth_routes::change_password))
+        .route("/api/auth/sessions", get(auth_routes::list_sessions))
+        .route("/api/auth/sessions/revoke-others", post(auth_routes::revoke_other_sessions))
+        .route("/api/auth/sessions/:id", delete(auth_routes::revoke_session))
+        .route("/api/auth/invites/:token", get(auth_routes::get_public_invitation))
+        .route("/api/auth/invites/:token/accept", post(auth_routes::accept_public_invitation))
         .route("/api/0/organizations/:org/self-check/", get(api_v0::get_self_check))
         .route("/api/0/organizations/:org/self-check/probe/", post(api_v0::run_self_check_probe))
         .route("/api/0/organizations/:org/self-check/ack/", post(api_v0::ack_self_check_errors))
@@ -216,8 +252,25 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/0/organizations/:org/projects/", get(api_v0::list_projects).post(api_v0::create_project))
         .route("/api/0/projects/:org/:proj/settings/", put(api_v0::update_project_settings))
         .route("/api/0/projects/:org/:proj/keys/", get(api_v0::list_project_keys).post(api_v0::create_project_key))
-        .route("/api/0/projects/:org/:proj/keys/:key_id/", delete(api_v0::delete_project_key))
+        .route(
+            "/api/0/projects/:org/:proj/keys/:key_id/",
+            put(api_v0::update_project_key).delete(api_v0::delete_project_key),
+        )
         .route("/api/0/projects/:org/:proj/tunnel/", post(api_v0::enable_project_tunnel))
+        .route("/api/0/organizations/:org/audit-logs/", get(api_v0::list_audit_logs))
+        .route("/api/0/organizations/:org/audit-logs/verify/", get(api_v0::verify_audit_logs))
+        .route(
+            "/api/0/organizations/:org/security-settings/",
+            get(api_v0::get_org_security_settings).put(api_v0::update_org_security_settings),
+        )
+        .route(
+            "/api/0/organizations/:org/invitations/",
+            get(api_v0::list_invitations).post(api_v0::create_invitation),
+        )
+        .route(
+            "/api/0/organizations/:org/invitations/:inv_id/",
+            delete(api_v0::revoke_invitation),
+        )
         .route("/api/0/organizations/:org/issues/", get(api_v0::list_issues))
         .route("/api/0/organizations/:org/issues/export.csv", get(api_v0::export_issues_csv))
         .route("/api/0/organizations/:org/issues/:issue_id/", get(api_v0::get_issue).put(api_v0::update_issue))

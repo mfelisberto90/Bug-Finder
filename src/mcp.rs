@@ -15,10 +15,11 @@ pub async fn run_mcp_stdio(
     // Resolve TenantCtx strictly from supplied API token (or explicit local CLI org context when token omitted in local-only mode)
     let ctx: TenantCtx = if let Some(raw_tok) = token {
         let sha = sha256_hex(raw_tok.trim().as_bytes());
+        let now_sec = chrono::Utc::now().timestamp();
         storage
-            .resolve_api_token(&sha, Some(org_slug))
+            .resolve_api_token(&sha, Some(org_slug), now_sec)
             .await?
-            .ok_or_else(|| "Invalid API token or organization mismatch".to_string())?
+            .ok_or_else(|| "Invalid or expired API token or organization mismatch".to_string())?
     } else {
         // Local CLI read-only mode still requires resolving org_id explicitly; fail-closed if missing
         return Err("MCP stdio server requires --token <api_token> or BUGFINDER_API_TOKEN".into());
@@ -133,6 +134,9 @@ pub async fn handle_mcp_request(
             ]
         })),
         "tools/call" => {
+            if !ctx.has_scope("event:read") {
+                return Err((-32001, "API token lacks required event:read scope".into()));
+            }
             let name = params
                 .get("name")
                 .and_then(|v| v.as_str())

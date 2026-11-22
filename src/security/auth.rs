@@ -109,6 +109,79 @@ pub fn canonical_json_sha256(val: &serde_json::Value) -> String {
     sha256_hex(&bytes)
 }
 
+const COMMON_WEAK_PASSWORDS: &[&str] = &[
+    "1234567890", "123456789012", "password123", "password1234", "qwerty12345",
+    "qwertyuiop", "admin12345", "welcome123", "letmein123", "changeme123",
+    "bugfinder123", "1111111111", "0000000000", "iloveyou12", "abc1234567",
+    "football123", "monkey1234", "dragon1234", "baseball12", "master1234",
+    "trustno123", "sunshine12", "princess12", "adminadmin", "passw0rd12",
+    "p@ssword12", "qwerty123!", "zaq12wsxcde", "superman12", "shadow1234",
+];
+
+/// Enforces NIST SP 800-63B style password strength: >= 10 chars, common breach blocklist,
+/// and rejection of email/local-part substrings.
+pub fn validate_password_strength(password: &str, email: &str, name: &str) -> Result<(), String> {
+    let char_len = password.chars().count();
+    if char_len < 10 {
+        return Err("Password must be at least 10 characters long".into());
+    }
+    if char_len > 256 || password.len() > 1024 {
+        return Err("Password must not exceed 256 characters".into());
+    }
+    if password.chars().all(|c| c.is_ascii_whitespace()) {
+        return Err("Password cannot consist solely of whitespace".into());
+    }
+    let lower = password.to_ascii_lowercase();
+    if COMMON_WEAK_PASSWORDS.iter().any(|&w| lower == w) {
+        return Err("Password is too common; choose a stronger passphrase".into());
+    }
+    let email_norm = email.trim().to_ascii_lowercase();
+    if !email_norm.is_empty() && lower.contains(&email_norm) {
+        return Err("Password must not contain your email address".into());
+    }
+    if let Some((local, _)) = email_norm.split_once('@') {
+        if local.len() >= 4 && lower.contains(local) {
+            return Err("Password must not contain your email username".into());
+        }
+    }
+    let name_norm = name.trim().to_ascii_lowercase();
+    if name_norm.len() >= 4 && lower == name_norm {
+        return Err("Password must not match your display name".into());
+    }
+    if password.chars().collect::<std::collections::HashSet<char>>().len() < 4 {
+        return Err("Password must include more character variety".into());
+    }
+    Ok(())
+}
+
+/// Computes an injective SHA-256 link in the immutable per-organization audit hash chain.
+pub fn compute_audit_entry_hash(
+    prev_hash: &str,
+    org_id: i64,
+    actor_user_id: Option<i64>,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    metadata: &serde_json::Value,
+    created_at: i64,
+) -> String {
+    let mut h = Sha256::new();
+    let feed = |h: &mut Sha256, bytes: &[u8]| {
+        h.update(&(bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+    };
+    let meta_sha = canonical_json_sha256(metadata);
+    feed(&mut h, prev_hash.as_bytes());
+    h.update(&org_id.to_be_bytes());
+    h.update(&actor_user_id.unwrap_or(-1).to_be_bytes());
+    feed(&mut h, action.as_bytes());
+    feed(&mut h, target_type.as_bytes());
+    feed(&mut h, target_id.as_bytes());
+    feed(&mut h, meta_sha.as_bytes());
+    h.update(&created_at.to_be_bytes());
+    hex::encode(h.finalize())
+}
+
 fn sort_json_keys(val: &serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(map) => {

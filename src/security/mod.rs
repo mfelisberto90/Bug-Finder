@@ -1,7 +1,10 @@
 pub mod anti_rea;
 pub mod auth;
+pub mod crypto;
 pub mod csv;
 pub mod headers;
 pub mod metrics;
+pub mod mfa;
 pub mod ratelimit;
 pub mod ssrf;
+pub mod webauthn;

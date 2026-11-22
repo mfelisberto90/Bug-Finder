@@ -66,6 +66,7 @@ struct ScrubRegexes {
     jwt: Regex,
     prefixed_secret: Regex,
     query_secret: Regex,
+    url_credentials: Regex,
     card_candidate: Regex,
     email: Regex,
 }
@@ -96,6 +97,9 @@ fn regexes() -> &'static ScrubRegexes {
         ),
         query_secret: build_ascii_regex(
             r"(?i)([?&](?:token|api_key|apikey|secret|password|passwd|auth|access_token|sentry_key)=)[A-Za-z0-9%._\-~+/]+",
+        ),
+        url_credentials: build_ascii_regex(
+            r"(?i)(https?://)([A-Za-z0-9._%+\-]+):([A-Za-z0-9._%+\-!$&'()*+,;=]+)@",
         ),
         card_candidate: build_ascii_regex(
             r"\b(?:\d[ \-]?){12,18}\d\b",
@@ -227,10 +231,16 @@ pub struct Scrubber {
     sensitive_keys: HashSet<String>,
     scrub_emails: bool,
     scrub_ips: bool,
+    aggressive_key_match: bool,
 }
 
 impl Scrubber {
     pub fn from_filters(filters: &ProjectFilters) -> Self {
+        Self::from_filters_with_org(filters, false)
+    }
+
+    /// Org-level `scrub_ip_addresses` overrides the project setting (matching GlitchTip).
+    pub fn from_filters_with_org(filters: &ProjectFilters, org_scrub_ip: bool) -> Self {
         Self {
             safe_keys: filters.safe_keys.iter().map(|k| normalize_whole_key(k)).collect(),
             sensitive_keys: filters
@@ -239,13 +249,29 @@ impl Scrubber {
                 .map(|k| normalize_whole_key(k))
                 .collect(),
             scrub_emails: filters.scrub_emails,
-            scrub_ips: filters.scrub_ip_addresses,
+            scrub_ips: filters.scrub_ip_addresses || org_scrub_ip,
+            aggressive_key_match: filters.aggressive_key_match,
         }
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {
         let whole = normalize_whole_key(key);
-        if whole.is_empty() || self.safe_keys.contains(&whole) {
+        if whole.is_empty() {
+            return false;
+        }
+        if self.aggressive_key_match {
+            if self.safe_keys.iter().any(|s| !s.is_empty() && whole.contains(s)) {
+                return false;
+            }
+            if self.sensitive_keys.iter().any(|s| !s.is_empty() && whole.contains(s))
+                || DEFAULT_WHOLE_KEYS.iter().any(|k| whole.contains(k))
+                || DEFAULT_KEY_TOKENS.iter().any(|k| whole.contains(k))
+            {
+                return true;
+            }
+            return false;
+        }
+        if self.safe_keys.contains(&whole) {
             return false;
         }
         if self.sensitive_keys.contains(&whole) || DEFAULT_WHOLE_KEYS.contains(&whole.as_str()) {
@@ -300,6 +326,10 @@ impl Scrubber {
                 }
             }
             s = rx.prefixed_secret.replace_all(&s, PLACEHOLDER).into_owned();
+        }
+        if s.contains("://") && s.contains('@') && rx.url_credentials.is_match(&s) {
+            report.push_unique("url_credentials");
+            s = rx.url_credentials.replace_all(&s, "$1[Filtered]:[Filtered]@").into_owned();
         }
         if s.contains('=') && (s.contains('?') || s.contains('&')) {
             s = rx.query_secret.replace_all(&s, "$1[Filtered]").into_owned();

@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     id BIGSERIAL PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
+    settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at BIGINT NOT NULL
 );
 
@@ -28,15 +29,20 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS organization_members (
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member', 'viewer')),
+    role TEXT NOT NULL CHECK (role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
     PRIMARY KEY (organization_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
+    id BIGSERIAL UNIQUE,
     token_sha256 TEXT PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     csrf_token TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    ip_hmac TEXT NOT NULL DEFAULT '',
+    last_seen_at BIGINT NOT NULL DEFAULT 0,
+    reauth_at BIGINT,
     expires_at BIGINT NOT NULL,
     created_at BIGINT NOT NULL
 );
@@ -48,8 +54,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     name TEXT NOT NULL,
     token_sha256 TEXT NOT NULL UNIQUE,
     token_prefix TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member', 'viewer')),
+    role TEXT NOT NULL CHECK (role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
     scopes TEXT NOT NULL DEFAULT 'project:read project:write event:read',
+    expires_at BIGINT,
     last_used_at BIGINT,
     created_at BIGINT NOT NULL
 );
@@ -332,11 +339,80 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     id BIGSERIAL PRIMARY KEY,
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     actor_user_id BIGINT,
+    actor_email TEXT NOT NULL DEFAULT '',
     action TEXT NOT NULL,
     target_type TEXT NOT NULL,
     target_id TEXT NOT NULL,
+    ip_hmac TEXT NOT NULL DEFAULT '',
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    prev_hash TEXT NOT NULL DEFAULT 'GENESIS',
+    entry_hash TEXT NOT NULL DEFAULT '',
     created_at BIGINT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_pg_audit_logs_org_id ON audit_logs(organization_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS user_mfa (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    totp_secret_enc TEXT NOT NULL DEFAULT '',
+    is_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    last_used_step BIGINT,
+    failed_attempts BIGINT NOT NULL DEFAULT 0,
+    locked_until BIGINT,
+    enabled_at BIGINT,
+    updated_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_mfa_recovery_codes (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    used_at BIGINT,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pg_mfa_recovery_user ON user_mfa_recovery_codes(user_id);
+
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    token_sha256 TEXT PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_org_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    ip_hmac TEXT NOT NULL DEFAULT '',
+    expires_at BIGINT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    credential_id_b64 TEXT NOT NULL UNIQUE,
+    cose_alg INTEGER NOT NULL,
+    public_key_b64 TEXT NOT NULL,
+    sign_count BIGINT NOT NULL DEFAULT 0,
+    last_used_at BIGINT,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pg_webauthn_creds_user ON webauthn_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS webauthn_challenges (
+    challenge_b64 TEXT PRIMARY KEY,
+    user_id BIGINT,
+    flow_kind TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS org_invitations (
+    id BIGSERIAL PRIMARY KEY,
+    organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
+    token_sha256 TEXT NOT NULL UNIQUE,
+    invited_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    expires_at BIGINT NOT NULL,
+    accepted_at BIGINT,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pg_org_invitations_org ON org_invitations(organization_id, created_at DESC);
 
 -- Capability-GUC Lookup Tables (unauthenticated pre-tenant resolution under NOBYPASSRLS)
 CREATE TABLE IF NOT EXISTS dsn_key_lookup (
@@ -347,6 +423,7 @@ CREATE TABLE IF NOT EXISTS dsn_key_lookup (
     project_slug TEXT NOT NULL,
     rate_limit_per_min INTEGER NOT NULL,
     filters_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    org_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     first_event_at BIGINT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE
 );
@@ -356,16 +433,21 @@ CREATE TABLE IF NOT EXISTS api_token_lookup (
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     organization_slug TEXT NOT NULL,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role TEXT NOT NULL
+    role TEXT NOT NULL,
+    scopes TEXT NOT NULL DEFAULT 'project:read project:write event:read',
+    expires_at BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS session_lookup (
     token_sha256 TEXT PRIMARY KEY,
+    session_id BIGINT NOT NULL DEFAULT 0,
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     organization_slug TEXT NOT NULL,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role TEXT NOT NULL,
     csrf_token TEXT NOT NULL,
+    last_seen_at BIGINT NOT NULL DEFAULT 0,
+    reauth_at BIGINT,
     expires_at BIGINT NOT NULL
 );
 
@@ -375,6 +457,43 @@ CREATE TABLE IF NOT EXISTS tunnel_lookup (
     project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     is_active BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+CREATE TABLE IF NOT EXISTS invitation_lookup (
+    token_sha256 TEXT PRIMARY KEY,
+    organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    organization_slug TEXT NOT NULL,
+    organization_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    accepted_at BIGINT
+);
+
+-- Idempotent column & constraint upgrades for existing PostgreSQL deployments
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS settings_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS id BIGSERIAL UNIQUE;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip_hmac TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS reauth_at BIGINT;
+ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_email TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ip_hmac TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'GENESIS';
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS entry_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE dsn_key_lookup ADD COLUMN IF NOT EXISTS org_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE api_token_lookup ADD COLUMN IF NOT EXISTS scopes TEXT NOT NULL DEFAULT 'project:read project:write event:read';
+ALTER TABLE api_token_lookup ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+ALTER TABLE session_lookup ADD COLUMN IF NOT EXISTS session_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE session_lookup ADD COLUMN IF NOT EXISTS last_seen_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE session_lookup ADD COLUMN IF NOT EXISTS reauth_at BIGINT;
+ALTER TABLE organization_members DROP CONSTRAINT IF EXISTS organization_members_role_check;
+ALTER TABLE organization_members ADD CONSTRAINT organization_members_role_check
+    CHECK (role IN ('owner', 'manager', 'admin', 'member', 'viewer'));
+ALTER TABLE api_tokens DROP CONSTRAINT IF EXISTS api_tokens_role_check;
+ALTER TABLE api_tokens ADD CONSTRAINT api_tokens_role_check
+    CHECK (role IN ('owner', 'manager', 'admin', 'member', 'viewer'));
 
 -- Enable + FORCE RLS on EVERY tenant table (fail-closed)
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
@@ -424,7 +543,8 @@ DECLARE
         'alert_rules',
         'audit_logs',
         'security_events',
-        'shield_quarantine'
+        'shield_quarantine',
+        'org_invitations'
     ];
 BEGIN
     FOREACH tbl IN ARRAY tenant_tables LOOP
@@ -456,14 +576,20 @@ ALTER TABLE dsn_key_lookup ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dsn_key_lookup FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS cap_dsn ON dsn_key_lookup;
 CREATE POLICY cap_dsn ON dsn_key_lookup
-    USING (key_sha256 = NULLIF(current_setting('app.ingest_dsn_key_sha256', true), ''))
+    USING (
+        key_sha256 = NULLIF(current_setting('app.ingest_dsn_key_sha256', true), '')
+        OR organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+    )
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
 
 ALTER TABLE api_token_lookup ENABLE ROW LEVEL SECURITY;
 ALTER TABLE api_token_lookup FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS cap_token ON api_token_lookup;
 CREATE POLICY cap_token ON api_token_lookup
-    USING (token_sha256 = NULLIF(current_setting('app.api_token_sha256', true), ''))
+    USING (
+        token_sha256 = NULLIF(current_setting('app.api_token_sha256', true), '')
+        OR organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+    )
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
 
 ALTER TABLE session_lookup ENABLE ROW LEVEL SECURITY;
@@ -472,6 +598,7 @@ DROP POLICY IF EXISTS cap_session ON session_lookup;
 CREATE POLICY cap_session ON session_lookup
     USING (
         token_sha256 = NULLIF(current_setting('app.session_sha256', true), '')
+        OR organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
         OR (
             NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
             AND expires_at <= EXTRACT(EPOCH FROM NOW())::bigint
@@ -483,7 +610,24 @@ ALTER TABLE tunnel_lookup ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tunnel_lookup FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS cap_tunnel ON tunnel_lookup;
 CREATE POLICY cap_tunnel ON tunnel_lookup
-    USING (slug = NULLIF(current_setting('app.tunnel_slug', true), ''))
+    USING (
+        slug = NULLIF(current_setting('app.tunnel_slug', true), '')
+        OR organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+    )
+    WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
+
+ALTER TABLE invitation_lookup ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invitation_lookup FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS cap_invite ON invitation_lookup;
+CREATE POLICY cap_invite ON invitation_lookup
+    USING (
+        token_sha256 = NULLIF(current_setting('app.invite_token_sha256', true), '')
+        OR organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+        OR (
+            NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
+            AND expires_at <= EXTRACT(EPOCH FROM NOW())::bigint
+        )
+    )
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
 
 GRANT USAGE ON SCHEMA public TO bugfinder_app;

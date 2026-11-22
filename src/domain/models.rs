@@ -7,15 +7,35 @@ use uuid::Uuid;
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     Owner,
+    Manager,
     Admin,
     Member,
     Viewer,
 }
 
+pub const ALL_SCOPES: &[&str] = &[
+    "org:read",
+    "org:write",
+    "org:admin",
+    "member:read",
+    "member:write",
+    "member:admin",
+    "project:read",
+    "project:write",
+    "project:admin",
+    "project:releases",
+    "event:read",
+    "event:write",
+    "event:admin",
+    "shield:read",
+    "shield:write",
+];
+
 impl UserRole {
     pub fn from_db(s: &str) -> Option<Self> {
-        match s {
+        match s.trim().to_ascii_lowercase().as_str() {
             "owner" => Some(Self::Owner),
+            "manager" => Some(Self::Manager),
             "admin" => Some(Self::Admin),
             "member" => Some(Self::Member),
             "viewer" => Some(Self::Viewer),
@@ -26,27 +46,104 @@ impl UserRole {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Owner => "owner",
+            Self::Manager => "manager",
             Self::Admin => "admin",
             Self::Member => "member",
             Self::Viewer => "viewer",
         }
     }
 
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Viewer => 0,
+            Self::Member => 1,
+            Self::Admin => 2,
+            Self::Manager => 3,
+            Self::Owner => 4,
+        }
+    }
+
+    pub fn min_role(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+
+    pub fn default_scopes(&self) -> &'static [&'static str] {
+        match self {
+            Self::Viewer => &["org:read", "project:read", "event:read", "shield:read"],
+            Self::Member => &[
+                "org:read",
+                "member:read",
+                "project:read",
+                "project:releases",
+                "event:read",
+                "event:write",
+                "event:admin",
+                "shield:read",
+            ],
+            Self::Admin => &[
+                "org:read",
+                "member:read",
+                "project:read",
+                "project:write",
+                "project:admin",
+                "project:releases",
+                "event:read",
+                "event:write",
+                "event:admin",
+                "shield:read",
+                "shield:write",
+            ],
+            Self::Manager => &[
+                "org:read",
+                "org:write",
+                "member:read",
+                "member:write",
+                "member:admin",
+                "project:read",
+                "project:write",
+                "project:admin",
+                "project:releases",
+                "event:read",
+                "event:write",
+                "event:admin",
+                "shield:read",
+                "shield:write",
+            ],
+            Self::Owner => ALL_SCOPES,
+        }
+    }
+
     pub fn can_manage_org(&self) -> bool {
-        matches!(self, Self::Owner | Self::Admin)
+        matches!(self, Self::Owner | Self::Manager | Self::Admin)
     }
 
     pub fn can_write_project(&self) -> bool {
-        matches!(self, Self::Owner | Self::Admin)
+        matches!(self, Self::Owner | Self::Manager | Self::Admin)
     }
 
     pub fn can_mutate_issues(&self) -> bool {
-        matches!(self, Self::Owner | Self::Admin | Self::Member)
+        matches!(self, Self::Owner | Self::Manager | Self::Admin | Self::Member)
     }
 
     pub fn can_read(&self) -> bool {
         true
     }
+}
+
+pub fn intersect_scopes(role: UserRole, raw_scopes: &str) -> Vec<String> {
+    let allowed = role.default_scopes();
+    let mut out = Vec::new();
+    for tok in raw_scopes.split(|c: char| c.is_ascii_whitespace() || c == ',') {
+        let s = tok.trim();
+        if !s.is_empty() && allowed.contains(&s) && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
 }
 
 /// Server-derived tenant & capability boundary.
@@ -57,6 +154,67 @@ pub struct TenantCtx {
     pub organization_slug: String,
     pub user_id: Option<i64>,
     pub role: UserRole,
+    pub scopes: Vec<String>,
+    pub is_session_auth: bool,
+    pub reauth_at: Option<i64>,
+    pub session_id: Option<i64>,
+}
+
+impl TenantCtx {
+    pub fn from_session(
+        organization_id: i64,
+        organization_slug: String,
+        user_id: i64,
+        role: UserRole,
+        reauth_at: Option<i64>,
+        session_id: Option<i64>,
+    ) -> Self {
+        Self {
+            organization_id,
+            organization_slug,
+            user_id: Some(user_id),
+            role,
+            scopes: role.default_scopes().iter().map(|s| (*s).to_string()).collect(),
+            is_session_auth: true,
+            reauth_at,
+            session_id,
+        }
+    }
+
+    pub fn from_token(
+        organization_id: i64,
+        organization_slug: String,
+        user_id: i64,
+        effective_role: UserRole,
+        raw_scopes: &str,
+    ) -> Self {
+        Self {
+            organization_id,
+            organization_slug,
+            user_id: Some(user_id),
+            role: effective_role,
+            scopes: intersect_scopes(effective_role, raw_scopes),
+            is_session_auth: false,
+            reauth_at: None,
+            session_id: None,
+        }
+    }
+
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+
+    pub fn has_any_scope(&self, required: &[&str]) -> bool {
+        required.iter().any(|s| self.has_scope(s))
+    }
+
+    pub fn has_recent_reauth(&self, now_sec: i64) -> bool {
+        self.is_session_auth
+            && self
+                .reauth_at
+                .map(|t| now_sec.saturating_sub(t) <= 600)
+                .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,9 +378,11 @@ pub struct ProjectFilters {
     pub ignore_messages: Vec<String>,
     pub storm_sample_threshold: u32,
     pub storm_sample_every: u32,
+    pub event_throttle_rate: u8,
     pub auto_promote_log_level: Option<String>,
     pub scrub_ip_addresses: bool,
     pub scrub_emails: bool,
+    pub aggressive_key_match: bool,
     pub safe_keys: Vec<String>,
     pub sensitive_keys: Vec<String>,
     pub shield: ShieldPolicy,
@@ -238,9 +398,11 @@ impl Default for ProjectFilters {
             ignore_messages: Vec::new(),
             storm_sample_threshold: 50,
             storm_sample_every: 10,
+            event_throttle_rate: 0,
             auto_promote_log_level: None,
             scrub_ip_addresses: true,
             scrub_emails: false,
+            aggressive_key_match: false,
             safe_keys: Vec::new(),
             sensitive_keys: Vec::new(),
             shield: ShieldPolicy::default(),
@@ -340,6 +502,16 @@ pub struct ProjectAuthInfo {
     pub first_event_at: Option<i64>,
     pub rate_limit_per_min: u32,
     pub filters: ProjectFilters,
+    pub org_scrub_ip_addresses: bool,
+    pub org_event_throttle_rate: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OrgSecuritySettings {
+    pub scrub_ip_addresses: bool,
+    pub event_throttle_rate: u8,
+    pub require_mfa_for_admins: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,6 +713,67 @@ pub struct ApiTokenDto {
     pub role: String,
     pub scopes: String,
     pub last_used_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogDto {
+    pub id: i64,
+    pub actor_user_id: Option<i64>,
+    pub actor_email: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub ip_hmac: String,
+    pub metadata: Value,
+    pub entry_hash: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditVerifyDto {
+    pub valid: bool,
+    pub checked_entries: usize,
+    pub broken_at_id: Option<i64>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSessionDto {
+    pub id: i64,
+    pub user_agent: String,
+    pub ip_hmac_short: String,
+    pub last_seen_at: String,
+    pub created_at: String,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasskeyDto {
+    pub id: i64,
+    pub name: String,
+    pub cose_alg: i32,
+    pub sign_count: u32,
+    pub last_used_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MfaStatusDto {
+    pub totp_enabled: bool,
+    pub recovery_codes_remaining: i64,
+    pub passkeys: Vec<PasskeyDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitationDto {
+    pub id: i64,
+    pub email: String,
+    pub role: String,
+    pub invited_by_email: String,
+    pub expires_at: String,
+    pub accepted_at: Option<String>,
     pub created_at: String,
 }
 

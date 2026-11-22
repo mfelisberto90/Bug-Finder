@@ -1,18 +1,27 @@
 import {
   apiFetch,
+  b64uToBuf,
+  bufToB64u,
   setCsrfToken,
   setTransportErrorHook,
+  type ActiveSessionItem,
   type AlertRule,
   type ApiTokenItem,
+  type AuditLogItem,
+  type AuditVerifyResult,
+  type InvitationItem,
   type IssueEventDetail,
   type IssueSummary,
   type LocalSelfError,
   type LogEventItem,
   type MemberItem,
+  type MfaStatus,
+  type OrgSecuritySettings,
   type Organization,
   type Project,
   type ProjectFilters,
   type ProjectKeyItem,
+  type PublicInvitationInfo,
   type QuarantineItem,
   type ReleaseHealth,
   type SecurityEventItem,
@@ -26,7 +35,25 @@ import {
 } from "./api";
 
 type TabId = "issues" | "logs" | "perf" | "uptime" | "projects" | "shield" | "selfcheck";
-type MountedMode = "none" | "loading" | "setup" | "login" | "dashboard";
+type ShieldSubTab = "anti-rea" | "mfa" | "audit";
+type MountedMode = "none" | "loading" | "setup" | "login" | "mfa" | "invite" | "dashboard";
+
+const ALL_TOKEN_SCOPES = [
+  "org:read",
+  "org:write",
+  "member:read",
+  "member:write",
+  "member:admin",
+  "project:read",
+  "project:write",
+  "project:admin",
+  "project:releases",
+  "event:read",
+  "event:write",
+  "event:admin",
+  "shield:read",
+  "shield:write"
+];
 
 interface AppStateModel {
   loading: boolean;
@@ -35,6 +62,7 @@ interface AppStateModel {
   orgSlug: string;
   orgs: Organization[];
   tab: TabId;
+  shieldSubTab: ShieldSubTab;
   projects: Project[];
   issues: IssueSummary[];
   issueFilterStatus: string;
@@ -56,10 +84,24 @@ interface AppStateModel {
   alerts: AlertRule[];
   tokens: ApiTokenItem[];
   members: MemberItem[];
+  invitations: InvitationItem[];
+  lastInviteUrl: string | null;
   shieldEvents: SecurityEventItem[];
   shieldSummary: ShieldSummary;
   shieldQuarantine: QuarantineItem[];
   shieldProjectFilter: number | null;
+  mfaStatus: MfaStatus | null;
+  totpEnrollData: { secret_b32: string; otpauth_uri: string; qr_svg: string } | null;
+  recoveryCodes: string[] | null;
+  sessions: ActiveSessionItem[];
+  orgSecurity: OrgSecuritySettings;
+  auditLogs: AuditLogItem[];
+  auditVerify: AuditVerifyResult | null;
+  inviteToken: string | null;
+  inviteInfo: PublicInvitationInfo | null;
+  inviteError: string | null;
+  mfaChallenge: { challenge_token: string; methods: string[] } | null;
+  mfaMethod: "totp" | "recovery";
   activeProjectModalId: number | null;
   activeProjectKeys: ProjectKeyItem[];
   lastCreatedToken: string | null;
@@ -74,6 +116,11 @@ interface AppStateModel {
 const ISSUES_PAGE_SIZE = 25;
 const LOGS_PAGE_SIZE = 50;
 
+function parseInviteTokenFromUrl(): string | null {
+  const m = location.pathname.match(/^\/invite\/([A-Za-z0-9_\-]+)$/);
+  return m ? m[1] : null;
+}
+
 const state: AppStateModel = {
   loading: true,
   needsSetup: false,
@@ -81,6 +128,7 @@ const state: AppStateModel = {
   orgSlug: "",
   orgs: [],
   tab: "issues",
+  shieldSubTab: "anti-rea",
   projects: [],
   issues: [],
   issueFilterStatus: "unresolved",
@@ -102,10 +150,24 @@ const state: AppStateModel = {
   alerts: [],
   tokens: [],
   members: [],
+  invitations: [],
+  lastInviteUrl: null,
   shieldEvents: [],
   shieldSummary: { events_24h: 0, high_critical_24h: 0, secret_leaks_24h: 0, active_quarantines: 0 },
   shieldQuarantine: [],
   shieldProjectFilter: null,
+  mfaStatus: null,
+  totpEnrollData: null,
+  recoveryCodes: null,
+  sessions: [],
+  orgSecurity: { scrub_ip_addresses: false, event_throttle_rate: 0, require_mfa_for_admins: false },
+  auditLogs: [],
+  auditVerify: null,
+  inviteToken: parseInviteTokenFromUrl(),
+  inviteInfo: null,
+  inviteError: null,
+  mfaChallenge: null,
+  mfaMethod: "totp",
   activeProjectModalId: null,
   activeProjectKeys: [],
   lastCreatedToken: null,
@@ -375,8 +437,25 @@ setTransportErrorHook((info) => {
 });
 
 async function boot(): Promise<void> {
+  if (state.inviteToken) {
+    const invRes = await apiFetch<PublicInvitationInfo>(
+      `/api/auth/invites/${encodeURIComponent(state.inviteToken)}`
+    );
+    if (invRes.ok && invRes.data) {
+      state.inviteInfo = invRes.data;
+      state.inviteError = null;
+    } else {
+      state.inviteInfo = null;
+      state.inviteError = invRes.error || "Convite inválido ou expirado";
+    }
+    state.loading = false;
+    render();
+    return;
+  }
+
   const me = await apiFetch<any>("/api/auth/me");
   if (me.ok && me.data) {
+    state.needsSetup = false;
     state.user = me.data.user;
     state.orgs = me.data.organizations || [];
     const preferredExists = state.orgs.some((o) => o.slug === state.orgSlug);
@@ -473,27 +552,53 @@ async function loadCurrentTabData(): Promise<void> {
     if (monRes.ok && monRes.data) state.monitors = monRes.data;
     if (alRes.ok && alRes.data) state.alerts = alRes.data;
   } else if (state.tab === "projects") {
-    const [tokRes, memRes] = await Promise.all([
+    const [tokRes, memRes, invRes] = await Promise.all([
       apiFetch<ApiTokenItem[]>(`/api/0/api-tokens/`),
-      apiFetch<MemberItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`)
+      apiFetch<MemberItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`),
+      apiFetch<InvitationItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/`)
     ]);
     if (tokRes.ok && tokRes.data) state.tokens = tokRes.data;
     if (memRes.ok && memRes.data) state.members = memRes.data;
+    if (invRes.ok && invRes.data) state.invitations = invRes.data;
   } else if (state.tab === "shield") {
-    const q = state.shieldProjectFilter ? `?project_id=${state.shieldProjectFilter}` : "";
-    const [evRes, qRes] = await Promise.all([
-      apiFetch<{ summary: ShieldSummary; events: SecurityEventItem[] }>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/events/${q}`
-      ),
-      apiFetch<QuarantineItem[]>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/quarantine/${q}`
-      )
-    ]);
-    if (evRes.ok && evRes.data) {
-      state.shieldEvents = evRes.data.events || [];
-      state.shieldSummary = evRes.data.summary || state.shieldSummary;
+    if (state.shieldSubTab === "anti-rea") {
+      const q = state.shieldProjectFilter ? `?project_id=${state.shieldProjectFilter}` : "";
+      const [evRes, qRes] = await Promise.all([
+        apiFetch<{ summary: ShieldSummary; events: SecurityEventItem[] }>(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/events/${q}`
+        ),
+        apiFetch<QuarantineItem[]>(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/quarantine/${q}`
+        )
+      ]);
+      if (evRes.ok && evRes.data) {
+        state.shieldEvents = evRes.data.events || [];
+        state.shieldSummary = evRes.data.summary || state.shieldSummary;
+      }
+      if (qRes.ok && qRes.data) state.shieldQuarantine = qRes.data;
+    } else if (state.shieldSubTab === "mfa") {
+      const [mfaRes, sessRes] = await Promise.all([
+        apiFetch<MfaStatus>("/api/auth/mfa/status"),
+        apiFetch<ActiveSessionItem[]>("/api/auth/sessions")
+      ]);
+      if (mfaRes.ok && mfaRes.data) state.mfaStatus = mfaRes.data;
+      if (sessRes.ok && sessRes.data) state.sessions = sessRes.data;
+    } else if (state.shieldSubTab === "audit") {
+      const [secRes, audRes, verRes] = await Promise.all([
+        apiFetch<OrgSecuritySettings>(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/security-settings/`
+        ),
+        apiFetch<AuditLogItem[]>(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/?limit=50`
+        ),
+        apiFetch<AuditVerifyResult>(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/verify/`
+        )
+      ]);
+      if (secRes.ok && secRes.data) state.orgSecurity = secRes.data;
+      if (audRes.ok && audRes.data) state.auditLogs = audRes.data;
+      if (verRes.ok && verRes.data) state.auditVerify = verRes.data;
     }
-    if (qRes.ok && qRes.data) state.shieldQuarantine = qRes.data;
   } else if (state.tab === "selfcheck") {
     await refreshSelfCheck();
   }
@@ -614,6 +719,43 @@ function renderAuthScreen(): string {
     ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
     : "";
 
+  if (state.inviteToken) {
+    if (!state.inviteInfo) {
+      return `
+      <main class="auth-wrap">
+        <section class="card auth-card stack-col">
+          <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Convite de Organização</div></div>
+          <p class="badge badge-error">${esc(state.inviteError || "Convite inválido ou expirado")}</p>
+          <button type="button" id="btn-invite-home">Voltar ao Login</button>
+        </section>
+      </main>
+      <div id="auth-selfcheck-slot">${errBanner}</div>`;
+    }
+    return `
+      <main class="auth-wrap">
+        <section class="card auth-card stack-col">
+          <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Aceitar Convite</div></div>
+          <p>Você foi convidado para <strong>${esc(state.inviteInfo.organization_name)}</strong> (${esc(state.inviteInfo.role)}) com o e-mail <span class="mono">${esc(state.inviteInfo.email)}</span>.</p>
+          <form id="invite-accept-form" class="stack-col">
+            <div class="hp-field" aria-hidden="true">
+              <label for="inv-website">Website</label>
+              <input id="inv-website" name="website" tabindex="-1" autocomplete="off">
+            </div>
+            <label for="inv-name">Seu Nome Completo
+              <input id="inv-name" name="name" type="text" required autocomplete="name" enterkeyhint="next" autofocus>
+            </label>
+            <label for="inv-password">Nova Senha (mín. 10 caracteres)
+              <input id="inv-password" name="password" type="password" required minlength="10" autocomplete="new-password" enterkeyhint="done">
+            </label>
+            <div class="cta-dock">
+              <button type="submit" data-primary-cta="true">Aceitar Convite e Entrar</button>
+            </div>
+          </form>
+        </section>
+      </main>
+      <div id="auth-selfcheck-slot">${errBanner}</div>`;
+  }
+
   if (state.needsSetup) {
     return `
       <main class="auth-wrap">
@@ -639,8 +781,8 @@ function renderAuthScreen(): string {
             <label for="setup-email">Email
               <input id="setup-email" name="email" type="email" required autocomplete="email" spellcheck="false" enterkeyhint="next" placeholder="you@company.com">
             </label>
-            <label for="setup-password">Password (min 8 chars)
-              <input id="setup-password" name="password" type="password" required minlength="8" autocomplete="new-password" enterkeyhint="next">
+            <label for="setup-password">Password (min 10 chars)
+              <input id="setup-password" name="password" type="password" required minlength="10" autocomplete="new-password" enterkeyhint="next">
             </label>
             <label for="setup-project-name">First Project Name
               <input id="setup-project-name" name="project_name" type="text" required autocomplete="off" enterkeyhint="done" value="Main App">
@@ -654,9 +796,54 @@ function renderAuthScreen(): string {
       <div id="auth-selfcheck-slot">${errBanner}</div>`;
   }
 
+  if (state.mfaChallenge) {
+    const methods = state.mfaChallenge.methods || [];
+    const hasTotp = methods.includes("totp");
+    const hasPasskey = methods.includes("passkey");
+    const isRecovery = state.mfaMethod === "recovery" || !hasTotp;
+    return `
+      <main class="auth-wrap">
+        <section class="card auth-card stack-col">
+          <div class="brand-row">
+            <div class="brand-title"><span class="brand-mark">BF</span> Verificação em 2 Etapas (2FA)</div>
+          </div>
+          <p>Confirme sua identidade usando seu autenticador TOTP, código de recuperação ou Passkey.</p>
+          ${
+            hasTotp
+              ? `<div class="subtabs" role="tablist">
+                  <button type="button" class="subtab-btn" role="tab" aria-selected="${!isRecovery ? "true" : "false"}" id="btn-mfa-tab-totp">Código 2FA (6 dígitos)</button>
+                  <button type="button" class="subtab-btn" role="tab" aria-selected="${isRecovery ? "true" : "false"}" id="btn-mfa-tab-rec">Código de Recuperação</button>
+                </div>`
+              : ""
+          }
+          <form id="mfa-verify-form" class="stack-col">
+            ${
+              !isRecovery
+                ? `<label for="mfa-code-input">Código TOTP (6 dígitos)
+                    <input id="mfa-code-input" name="code" type="text" inputmode="numeric" pattern="[0-9]{6}" required autocomplete="one-time-code" placeholder="123456" autofocus>
+                  </label>`
+                : `<label for="mfa-rec-input">Código de Recuperação
+                    <input id="mfa-rec-input" name="recovery_code" type="text" pattern="[A-Za-z0-9\\-]{10,12}" required autocomplete="off" placeholder="XXXXX-XXXXX" autofocus>
+                  </label>`
+            }
+            <div class="cta-dock">
+              <button type="submit" data-primary-cta="true">Verificar e Entrar</button>
+            </div>
+          </form>
+          ${
+            hasPasskey
+              ? `<button type="button" id="btn-mfa-passkey">Validar com Passkey (FIDO2)</button>`
+              : ""
+          }
+          <button type="button" id="btn-mfa-cancel">Voltar ao Login</button>
+        </section>
+      </main>
+      <div id="auth-selfcheck-slot">${errBanner}</div>`;
+  }
+
   return `
     <main class="auth-wrap">
-      <section class="card auth-card">
+      <section class="card auth-card stack-col">
         <div class="brand-row">
           <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
         </div>
@@ -676,6 +863,8 @@ function renderAuthScreen(): string {
             <button type="submit" data-primary-cta="true">Sign In</button>
           </div>
         </form>
+        <div class="divider-row">ou</div>
+        <button type="button" id="btn-passkey-login">Entrar com Passkey</button>
       </section>
     </main>
     <div id="auth-selfcheck-slot">${errBanner}</div>`;
@@ -991,6 +1180,8 @@ function renderProjectsTab(): string {
         <th scope="row">${esc(t.name)}</th>
         <td data-label="Prefix" class="mono">${esc(t.token_prefix)}...</td>
         <td data-label="Role">${esc(t.role)}</td>
+        <td data-label="Scopes" class="mono">${esc(t.scopes || "(default)")}</td>
+        <td data-label="Expires" class="tabular">${esc(t.expires_at ? t.expires_at.slice(0, 10) : "Nunca")}</td>
         <td data-label="Revoke"><button type="button" class="btn-danger" data-del-token="${t.id}">Revoke</button></td>
       </tr>`
     )
@@ -1008,6 +1199,7 @@ function renderProjectsTab(): string {
         <td data-label="Role">
           <select id="member-role-${m.user_id}" name="member_role_${m.user_id}" aria-label="Role for ${esc(m.email)}" data-member-role="${m.user_id}" ${isSelf ? "disabled" : ""}>
             <option value="owner" ${m.role === "owner" ? "selected" : ""}>owner</option>
+            <option value="manager" ${m.role === "manager" ? "selected" : ""}>manager</option>
             <option value="admin" ${m.role === "admin" ? "selected" : ""}>admin</option>
             <option value="member" ${m.role === "member" ? "selected" : ""}>member</option>
             <option value="viewer" ${m.role === "viewer" ? "selected" : ""}>viewer</option>
@@ -1023,6 +1215,21 @@ function renderProjectsTab(): string {
     })
     .join("");
 
+  const inviteRows = state.invitations
+    .map(
+      (inv) => `
+      <tr>
+        <th scope="row" class="mono">${esc(inv.email)}</th>
+        <td data-label="Role">${esc(inv.role)}</td>
+        <td data-label="Status">
+          <span class="badge badge-${inv.accepted_at ? "ok" : "info"}">${inv.accepted_at ? "Aceito" : "Pendente"}</span>
+        </td>
+        <td data-label="Expira" class="tabular">${esc(inv.expires_at.slice(0, 16).replace("T", " "))}</td>
+        <td data-label="Ação"><button type="button" class="btn-danger" data-del-invite="${inv.id}">Revogar</button></td>
+      </tr>`
+    )
+    .join("");
+
   return `
     <div class="page-header">
       <h1 class="page-title">Projects, DSNs &amp; SDK Integrations</h1>
@@ -1036,13 +1243,27 @@ function renderProjectsTab(): string {
     <section class="card stack-col">
       <div class="row-gap">
         <h2>Team Members</h2>
+        <button type="button" id="btn-create-invite-link">Gerar Link de Convite (72h)</button>
         <button type="button" id="btn-add-member">Add Member</button>
       </div>
+      ${
+        state.lastInviteUrl
+          ? `<div class="secret-banner secret-banner-info">Link de convite (72h): <span class="mono">${esc(state.lastInviteUrl)}</span> <button type="button" data-copy-text="${esc(state.lastInviteUrl)}">Copiar Link</button></div>`
+          : ""
+      }
       <div tabindex="0" role="region" aria-labelledby="mem-cap" class="table-wrapper">
         <table class="data-table">
           <caption id="mem-cap" class="hp-field">Team Members</caption>
           <thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
           <tbody>${memberRows || '<tr><td colspan="4">No team members found.</td></tr>'}</tbody>
+        </table>
+      </div>
+      <h3>Convites Expiráveis Pendentes / Históricos</h3>
+      <div tabindex="0" role="region" aria-labelledby="inv-cap" class="table-wrapper">
+        <table class="data-table">
+          <caption id="inv-cap" class="hp-field">Organization Invitations</caption>
+          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Expira</th><th>Ação</th></tr></thead>
+          <tbody>${inviteRows || '<tr><td colspan="5">Nenhum link de convite gerado ainda.</td></tr>'}</tbody>
         </table>
       </div>
     </section>
@@ -1069,18 +1290,18 @@ bugfinder mcp --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;</pre>
     <section class="card stack-col">
       <div class="row-gap">
         <h2>API Tokens (RoleLane ReadClient / CLI / MCP)</h2>
-        <button type="button" id="btn-create-token">Generate API Token</button>
+        <button type="button" id="btn-create-token">Generate Scoped API Token</button>
       </div>
       ${
         state.lastCreatedToken
-          ? `<div class="badge badge-ok">Copy token now (shown once): <span class="mono">${esc(state.lastCreatedToken)}</span></div>`
+          ? `<div class="secret-banner secret-banner-ok">Copy token now (shown once): <span class="mono">${esc(state.lastCreatedToken)}</span> <button type="button" data-copy-text="${esc(state.lastCreatedToken)}">Copiar Token</button></div>`
           : ""
       }
       <div tabindex="0" role="region" aria-labelledby="tok-cap" class="table-wrapper">
         <table class="data-table">
           <caption id="tok-cap" class="hp-field">API Tokens</caption>
-          <thead><tr><th>Name</th><th>Prefix</th><th>Role</th><th>Action</th></tr></thead>
-          <tbody>${tokRows || '<tr><td colspan="4">No API tokens yet.</td></tr>'}</tbody>
+          <thead><tr><th>Name</th><th>Prefix</th><th>Role</th><th>Scopes</th><th>Expires</th><th>Action</th></tr></thead>
+          <tbody>${tokRows || '<tr><td colspan="6">No API tokens yet.</td></tr>'}</tbody>
         </table>
       </div>
     </section>`;
@@ -1125,7 +1346,222 @@ function getEffectiveSelfStatus(): {
   };
 }
 
+function renderShieldSubTabsHtml(): string {
+  return `
+    <div class="subtabs" role="tablist" aria-label="Security Shield Sub-Tabs">
+      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "anti-rea" ? "true" : "false"}" data-shield-subtab="anti-rea">Escudo Anti-REA</button>
+      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "mfa" ? "true" : "false"}" data-shield-subtab="mfa">Conta &amp; MFA</button>
+      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "audit" ? "true" : "false"}" data-shield-subtab="audit">Auditoria &amp; Org</button>
+    </div>`;
+}
+
+function renderShieldMfaSubTab(): string {
+  const mfa = state.mfaStatus;
+  const totpOn = Boolean(mfa?.totp_enabled || state.user?.totp_enabled);
+  const enroll = state.totpEnrollData;
+  const recCodes = state.recoveryCodes;
+
+  const qrPreview = enroll && enroll.qr_svg.startsWith('<svg class="qr-svg"') ? enroll.qr_svg : "";
+  const passkeyRows = (mfa?.passkeys || []).length
+    ? (mfa?.passkeys || [])
+        .map(
+          (pk) => `
+          <tr>
+            <th scope="row">${esc(pk.name)}</th>
+            <td data-label="Algoritmo" class="mono">${pk.cose_alg === -7 ? "ES256" : pk.cose_alg === -8 ? "Ed25519" : esc(pk.cose_alg)}</td>
+            <td data-label="Counter" class="tabular">${pk.sign_count}</td>
+            <td data-label="Ação"><button type="button" class="btn-danger" data-del-passkey="${pk.id}">Remover</button></td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="4">Nenhuma Passkey WebAuthn cadastrada ainda.</td></tr>`;
+
+  const sessionRows = state.sessions.length
+    ? state.sessions
+        .map(
+          (s) => `
+          <tr>
+            <th scope="row">
+              <div>${esc(s.user_agent)}</div>
+              <div class="mono">IP HMAC: ${esc(s.ip_hmac_short)}</div>
+            </th>
+            <td data-label="Último acesso" class="tabular">${esc(s.last_seen_at.slice(0, 19).replace("T", " "))}</td>
+            <td data-label="Status">${s.is_current ? '<span class="badge badge-ok">Atual</span>' : '<span class="badge badge-muted">Ativa</span>'}</td>
+            <td data-label="Ação"><button type="button" class="btn-danger" data-revoke-session="${s.id}" ${s.is_current ? "disabled" : ""}>Revogar</button></td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="4">Nenhuma sessão encontrada.</td></tr>`;
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">Conta, Autenticação 2FA (TOTP) &amp; Passkeys</h1>
+      <div class="cta-dock">
+        <button type="button" id="btn-refresh-shield" data-primary-cta="true">Atualizar Segurança</button>
+      </div>
+    </div>
+    ${renderShieldSubTabsHtml()}
+    <div class="stack-col">
+      <section class="card stack-col">
+        <div class="row-gap">
+          <h2>Autenticação em 2 Etapas (TOTP RFC 6238)</h2>
+          <span class="badge badge-${totpOn ? "ok" : "warn"}">${totpOn ? "Ativo" : "Inativo"}</span>
+          ${totpOn ? `<span class="badge badge-info">Códigos restantes: ${mfa?.recovery_codes_remaining ?? 0}</span>` : ""}
+        </div>
+        ${
+          !totpOn
+            ? `<div class="row-gap"><button type="button" id="btn-totp-enroll">Configurar 2FA (TOTP)</button></div>`
+            : `<div class="row-gap">
+                <button type="button" id="btn-regen-recovery">Regenerar Códigos de Recuperação</button>
+                <button type="button" class="btn-danger" id="btn-totp-disable">Desativar 2FA</button>
+              </div>`
+        }
+        ${
+          enroll
+            ? `<div class="qr-box">
+                ${qrPreview}
+                <div class="stack-col">
+                  <div><strong>Escaneie no app autenticador</strong> ou copie a chave secreta Base32:</div>
+                  <div class="mono">${esc(enroll.secret_b32)}</div>
+                  <button type="button" data-copy-text="${esc(enroll.secret_b32)}">Copiar Chave Base32</button>
+                  <form id="totp-confirm-form" class="row-gap">
+                    <label for="totp-confirm-code">Código de 6 dígitos
+                      <input id="totp-confirm-code" name="code" type="text" inputmode="numeric" pattern="[0-9]{6}" required autocomplete="one-time-code" placeholder="123456">
+                    </label>
+                    <button type="submit">Ativar 2FA</button>
+                  </form>
+                </div>
+              </div>`
+            : ""
+        }
+        ${
+          recCodes
+            ? `<div class="stack-col">
+                <div class="badge badge-ok">Guarde estes 10 códigos de recuperação (exibidos uma única vez):</div>
+                <div class="code-grid">${recCodes.map((c) => `<div class="code-pill">${esc(c)}</div>`).join("")}</div>
+                <button type="button" data-copy-text="${esc(recCodes.join("\n"))}">Copiar Códigos</button>
+              </div>`
+            : ""
+        }
+      </section>
+
+      <section class="card stack-col">
+        <h2>Passkeys (WebAuthn FIDO2)</h2>
+        <form id="passkey-reg-form" class="row-gap">
+          <label for="passkey-name-input">Nome do Dispositivo
+            <input id="passkey-name-input" name="name" type="text" required autocomplete="off" placeholder="MacBook / YubiKey / Chrome">
+          </label>
+          <button type="submit">Registrar Passkey</button>
+        </form>
+        <div tabindex="0" role="region" aria-labelledby="pk-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="pk-cap" class="hp-field">Registered Passkeys</caption>
+            <thead><tr><th>Nome</th><th>Algoritmo</th><th>Sign Count</th><th>Ação</th></tr></thead>
+            <tbody>${passkeyRows}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card stack-col">
+        <h2>Trocar Senha</h2>
+        <form id="pw-change-form" class="stack-col">
+          <input class="hp-field" type="text" tabindex="-1" aria-hidden="true" autocomplete="username" value="${esc(state.user?.email || "")}" readonly>
+          <label for="pw-cur">Senha Atual
+            <input id="pw-cur" name="current_password" type="password" required autocomplete="current-password">
+          </label>
+          <label for="pw-new">Nova Senha (mín. 10 caracteres; revoga outras sessões)
+            <input id="pw-new" name="new_password" type="password" required minlength="10" autocomplete="new-password">
+          </label>
+          <div><button type="submit">Atualizar Senha</button></div>
+        </form>
+      </section>
+
+      <section class="card stack-col">
+        <div class="row-gap">
+          <h2>Sessões Ativas</h2>
+          <button type="button" class="btn-danger" id="btn-revoke-other-sessions">Encerrar Outras Sessões</button>
+        </div>
+        <div tabindex="0" role="region" aria-labelledby="sess-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="sess-cap" class="hp-field">Active Sessions</caption>
+            <thead><tr><th>Agente / IP HMAC</th><th>Último Acesso</th><th>Status</th><th>Ação</th></tr></thead>
+            <tbody>${sessionRows}</tbody>
+          </table>
+        </div>
+      </section>
+    </div>`;
+}
+
+function renderShieldAuditSubTab(): string {
+  const s = state.orgSecurity;
+  const ver = state.auditVerify;
+  const rows = state.auditLogs.length
+    ? state.auditLogs
+        .map(
+          (a) => `
+          <tr>
+            <th scope="row" class="tabular">${esc(a.created_at.slice(0, 19).replace("T", " "))}</th>
+            <td data-label="Ator">${esc(a.actor_email)}</td>
+            <td data-label="Ação"><span class="badge badge-muted">${esc(a.action)}</span></td>
+            <td data-label="Alvo" class="mono">${esc(a.target_type)}:${esc(a.target_id)}</td>
+            <td data-label="Hash SHA-256" class="mono">${esc(a.entry_hash.slice(0, 14))}...</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5">Nenhum registro na trilha de auditoria ainda.</td></tr>`;
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">Auditoria Imutável &amp; Políticas da Organização</h1>
+      <div class="cta-dock">
+        <button type="button" id="btn-refresh-shield" data-primary-cta="true">Atualizar Auditoria</button>
+      </div>
+    </div>
+    ${renderShieldSubTabsHtml()}
+    <div class="stack-col">
+      <section class="card stack-col">
+        <h2>Políticas de Segurança da Organização</h2>
+        <form id="org-sec-form" class="stack-col">
+          <label class="check-row" for="org-sec-ip">
+            <input id="org-sec-ip" type="checkbox" name="scrub_ip_addresses" ${s.scrub_ip_addresses ? "checked" : ""}>
+            <span>Anonimizar endereços IP globalmente (sobrescreve todos os projetos da org)</span>
+          </label>
+          <label class="check-row" for="org-sec-mfa">
+            <input id="org-sec-mfa" type="checkbox" name="require_mfa_for_admins" ${s.require_mfa_for_admins ? "checked" : ""}>
+            <span>Exigir MFA (TOTP ou Passkey) para Owners/Admins</span>
+          </label>
+          <label for="org-sec-throttle">Throttle Global de Eventos (0% a 100% descartados)
+            <input id="org-sec-throttle" name="event_throttle_rate" type="number" min="0" max="100" value="${s.event_throttle_rate ?? 0}">
+          </label>
+          <div><button type="submit">Salvar Políticas da Organização</button></div>
+        </form>
+      </section>
+
+      <section class="card stack-col">
+        <div class="row-gap">
+          <h2>Trilha de Auditoria SHA-256 Hash Chain</h2>
+          <button type="button" id="btn-verify-audit">Verificar Integridade</button>
+          ${
+            ver
+              ? `<span class="badge badge-${ver.valid ? "ok" : "error"}">${ver.valid ? "Válida" : "Violada"} (${ver.checked_entries} entradas)</span>`
+              : ""
+          }
+        </div>
+        ${ver && !ver.valid ? `<div class="badge badge-error">${esc(ver.detail)}</div>` : ""}
+        <div tabindex="0" role="region" aria-labelledby="aud-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="aud-cap" class="hp-field">Audit Log Chain</caption>
+            <thead><tr><th>Data/Hora</th><th>Ator</th><th>Ação</th><th>Alvo</th><th>Hash SHA-256</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </section>
+    </div>`;
+}
+
 function renderShieldTab(): string {
+  if (state.shieldSubTab === "mfa") return renderShieldMfaSubTab();
+  if (state.shieldSubTab === "audit") return renderShieldAuditSubTab();
   const origin = location.origin;
   const firstProj = state.projects[0];
   const sampleDsn = firstProj?.dsn_public_key
@@ -1245,6 +1681,7 @@ if sys.gettrace() is not None:
         </div>
       </div>
     </div>
+    ${renderShieldSubTabsHtml()}
 
     <div class="toolbar">
       <label for="shield-project-filter">Projeto
@@ -1658,6 +2095,14 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
         <button type="button" data-cmdk-tab="shield">Go to Anti-REA Security Shield &amp; Mini-IDS</button>
         <button type="button" data-cmdk-tab="selfcheck">Go to Auto-Check &amp; One-Command Install</button>
       </div>
+    </dialog>
+
+    <dialog id="dlg-reauth" class="bf-dialog" closedby="any" aria-labelledby="dlg-reauth-title">
+      <div class="dialog-head">
+        <h2 id="dlg-reauth-title">Confirmação de Identidade (Step-Up)</h2>
+        <button type="button" id="dlg-reauth-close">Close</button>
+      </div>
+      <div id="dlg-reauth-body"></div>
     </dialog>`;
 
   bindChromeHandlers();
@@ -1746,8 +2191,14 @@ function render(): void {
 
   if (!state.user) {
     closeAllDialogs();
-    const targetMode: MountedMode = state.needsSetup ? "setup" : "login";
-    if (mountedMode !== targetMode) {
+    const targetMode: MountedMode = state.inviteToken
+      ? "invite"
+      : state.needsSetup
+      ? "setup"
+      : state.mfaChallenge
+      ? "mfa"
+      : "login";
+    if (mountedMode !== targetMode || targetMode === "mfa" || targetMode === "invite") {
       mountedMode = targetMode;
       roots.dialogs.innerHTML = "";
       roots.shell.innerHTML = renderAuthScreen();
@@ -1870,7 +2321,90 @@ function populateTraceDialog(): void {
   bodyEl.innerHTML = `<pre class="snippet-box">${esc(state.traceView ? JSON.stringify(state.traceView, null, 2) : "")}</pre>`;
 }
 
+async function performPasskeyLogin(challengeToken?: string): Promise<void> {
+  if (!window.PublicKeyCredential || !navigator.credentials) {
+    showToast("WebAuthn Passkeys não suportado neste navegador");
+    return;
+  }
+  const emailVal = (document.getElementById("login-email") as HTMLInputElement | null)?.value?.trim();
+  const begin = await apiFetch<any>("/api/auth/passkey/login/begin", {
+    method: "POST",
+    body: {
+      email: emailVal || undefined,
+      challenge_token: challengeToken || undefined
+    }
+  });
+  if (!begin.ok || !begin.data) {
+    showToast(begin.error || "Falha ao iniciar login com Passkey");
+    return;
+  }
+  try {
+    const opts = begin.data;
+    const publicKey: PublicKeyCredentialRequestOptions = {
+      challenge: b64uToBuf(opts.challenge),
+      rpId: opts.rpId,
+      timeout: opts.timeout || 120000,
+      userVerification: opts.userVerification || "preferred",
+      allowCredentials: Array.isArray(opts.allowCredentials)
+        ? opts.allowCredentials.map((c: any) => ({ type: "public-key", id: b64uToBuf(c.id) }))
+        : []
+    };
+    const cred = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
+    if (!cred) {
+      showToast("Autenticação com Passkey cancelada");
+      return;
+    }
+    const resp = cred.response as AuthenticatorAssertionResponse;
+    const fin = await apiFetch<any>("/api/auth/passkey/login/finish", {
+      method: "POST",
+      body: {
+        credentialId: cred.id || bufToB64u(cred.rawId),
+        clientDataJSON: bufToB64u(resp.clientDataJSON),
+        authenticatorData: bufToB64u(resp.authenticatorData),
+        signature: bufToB64u(resp.signature),
+        challenge_token: challengeToken || undefined
+      }
+    });
+    if (!fin.ok) {
+      showToast(fin.error || "Passkey recusada");
+      return;
+    }
+    state.mfaChallenge = null;
+    await boot();
+  } catch (err: any) {
+    showToast(err?.message ? String(err.message) : "Erro ao validar Passkey");
+  }
+}
+
 function bindAuthHandlers(): void {
+  document.getElementById("btn-invite-home")?.addEventListener("click", () => {
+    state.inviteToken = null;
+    state.inviteInfo = null;
+    state.inviteError = null;
+    history.replaceState({}, "", "/");
+    void boot();
+  });
+
+  const inviteForm = document.getElementById("invite-accept-form") as HTMLFormElement | null;
+  if (inviteForm && state.inviteToken) {
+    inviteForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(inviteForm);
+      const res = await apiFetch<any>(
+        `/api/auth/invites/${encodeURIComponent(state.inviteToken!)}/accept`,
+        { method: "POST", body: Object.fromEntries(fd.entries()) }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Falha ao aceitar convite");
+        return;
+      }
+      state.inviteToken = null;
+      state.inviteInfo = null;
+      history.replaceState({}, "", "/");
+      await boot();
+    });
+  }
+
   const setupForm = document.getElementById("setup-form") as HTMLFormElement | null;
   if (setupForm) {
     setupForm.addEventListener("submit", async (e) => {
@@ -1901,6 +2435,55 @@ function bindAuthHandlers(): void {
         showToast(res.error || "Invalid credentials");
         return;
       }
+      if (res.data?.mfa_required && res.data?.challenge_token) {
+        const methods: string[] = res.data.methods || ["totp"];
+        state.mfaChallenge = {
+          challenge_token: res.data.challenge_token,
+          methods
+        };
+        state.mfaMethod = methods.includes("totp") ? "totp" : "recovery";
+        render();
+        return;
+      }
+      await boot();
+    });
+  }
+
+  document.getElementById("btn-mfa-tab-totp")?.addEventListener("click", () => {
+    state.mfaMethod = "totp";
+    render();
+  });
+  document.getElementById("btn-mfa-tab-rec")?.addEventListener("click", () => {
+    state.mfaMethod = "recovery";
+    render();
+  });
+  document.getElementById("btn-mfa-cancel")?.addEventListener("click", () => {
+    state.mfaChallenge = null;
+    render();
+  });
+  document.getElementById("btn-mfa-passkey")?.addEventListener("click", () => {
+    void performPasskeyLogin(state.mfaChallenge?.challenge_token);
+  });
+  document.getElementById("btn-passkey-login")?.addEventListener("click", () => {
+    void performPasskeyLogin();
+  });
+
+  const mfaForm = document.getElementById("mfa-verify-form") as HTMLFormElement | null;
+  if (mfaForm && state.mfaChallenge) {
+    mfaForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(mfaForm);
+      const payload: Record<string, string> = {
+        challenge_token: state.mfaChallenge!.challenge_token
+      };
+      if (fd.get("code")) payload.code = String(fd.get("code"));
+      if (fd.get("recovery_code")) payload.recovery_code = String(fd.get("recovery_code"));
+      const res = await apiFetch<any>("/api/auth/mfa/verify", { method: "POST", body: payload });
+      if (!res.ok) {
+        showToast(res.error || "Código 2FA inválido");
+        return;
+      }
+      state.mfaChallenge = null;
       await boot();
     });
   }
@@ -1927,8 +2510,15 @@ function bindChromeHandlers(): void {
     stopLiveTail();
     closeAllDialogs();
     await apiFetch("/api/auth/logout", { method: "POST", body: {} });
+    state.needsSetup = false;
     state.user = null;
     state.orgs = [];
+    state.mfaChallenge = null;
+    state.totpEnrollData = null;
+    state.recoveryCodes = null;
+    state.auditVerify = null;
+    state.auditLogs = [];
+    state.lastInviteUrl = null;
     setCsrfToken("");
     render();
   });
@@ -1966,6 +2556,9 @@ function bindChromeHandlers(): void {
   document.getElementById("dlg-cmdk-close")?.addEventListener("click", () => {
     (document.getElementById("dlg-cmdk") as HTMLDialogElement | null)?.close();
   });
+  document.getElementById("dlg-reauth-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-reauth") as HTMLDialogElement | null)?.close();
+  });
 
   document.getElementById("btn-apply-filters")?.addEventListener("click", async () => {
     const sel = document.getElementById("filter-status-sel") as HTMLSelectElement | null;
@@ -1994,6 +2587,45 @@ function bindTraceOpenButtons(scope: ParentNode): void {
       }
     });
   });
+}
+
+function openReauthDialog(onSuccess: () => Promise<void> | void): void {
+  const dlg = document.getElementById("dlg-reauth") as HTMLDialogElement | null;
+  const body = document.getElementById("dlg-reauth-body");
+  if (!dlg || !body) return;
+  body.innerHTML = `
+    <form id="reauth-form" class="stack-col">
+      <p>Esta ação sensível requer confirmação recente da sua senha ou código 2FA (válida por 10 minutos).</p>
+      <label for="reauth-pw">Senha Atual
+        <input id="reauth-pw" name="password" type="password" autocomplete="current-password" placeholder="Sua senha">
+      </label>
+      <label for="reauth-totp">Ou código TOTP (6 dígitos)
+        <input id="reauth-totp" name="totp_code" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="123456">
+      </label>
+      <button type="submit" autofocus>Confirmar Identidade</button>
+    </form>`;
+
+  const form = document.getElementById("reauth-form") as HTMLFormElement | null;
+  form?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const pw = String(fd.get("password") || "");
+    const totp = String(fd.get("totp_code") || "").trim();
+    const res = await apiFetch("/api/auth/reauth", {
+      method: "POST",
+      body: {
+        password: pw || undefined,
+        totp_code: totp || undefined
+      }
+    });
+    if (!res.ok) {
+      showToast(res.error || "Falha na confirmação de identidade");
+      return;
+    }
+    dlg.close();
+    await onSuccess();
+  });
+  openDialog(dlg);
 }
 
 function bindCopyButtons(scope: ParentNode): void {
@@ -2149,9 +2781,11 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     });
   });
 
-  // Projects, Members & API Tokens handlers
+  // Projects, Members, Invitations & API Tokens handlers
   document.getElementById("btn-new-project")?.addEventListener("click", () => openCreateDialog("project"));
   document.getElementById("btn-add-member")?.addEventListener("click", () => openCreateDialog("member"));
+  document.getElementById("btn-create-invite-link")?.addEventListener("click", () => openCreateDialog("invite"));
+  document.getElementById("btn-create-token")?.addEventListener("click", () => openCreateDialog("token"));
 
   mainPane.querySelectorAll<HTMLButtonElement>("[data-enable-tunnel]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -2182,51 +2816,64 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     sel.addEventListener("change", async () => {
       const uid = Number(sel.dataset.memberRole);
       const role = sel.value;
-      const res = await apiFetch<MemberItem>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
-        { method: "PUT", body: { role } }
-      );
-      if (!res.ok) {
-        showToast(res.error || "Failed updating member role");
+      const sendRole = async () => {
+        const res = await apiFetch<MemberItem>(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
+          { method: "PUT", body: { role } }
+        );
+        if (res.reauth_required) {
+          openReauthDialog(sendRole);
+          return;
+        }
+        if (!res.ok) {
+          showToast(res.error || "Failed updating member role");
+          await loadCurrentTabData();
+          renderMainPane();
+          return;
+        }
+        showToast("Member role updated");
         await loadCurrentTabData();
         renderMainPane();
-        return;
-      }
-      showToast("Member role updated");
-      await loadCurrentTabData();
-      renderMainPane();
+      };
+      await sendRole();
     });
   });
 
   mainPane.querySelectorAll<HTMLButtonElement>("[data-del-member]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const uid = Number(btn.dataset.delMember);
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
-        { method: "DELETE" }
-      );
-      if (!res.ok) {
-        showToast(res.error || "Failed removing member");
-        return;
-      }
-      showToast("Member removed");
-      await loadCurrentTabData();
-      renderMainPane();
+      const sendDel = async () => {
+        const res = await apiFetch(
+          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
+          { method: "DELETE" }
+        );
+        if (res.reauth_required) {
+          openReauthDialog(sendDel);
+          return;
+        }
+        if (!res.ok) {
+          showToast(res.error || "Failed removing member");
+          return;
+        }
+        showToast("Member removed");
+        await loadCurrentTabData();
+        renderMainPane();
+      };
+      await sendDel();
     });
   });
 
-  document.getElementById("btn-create-token")?.addEventListener("click", async () => {
-    const res = await apiFetch<{ token: string }>(
-      `/api/0/api-tokens/`,
-      { method: "POST", body: { name: `Token ${new Date().toISOString().slice(0, 10)}`, role: "admin" } }
-    );
-    if (res.ok && res.data) {
-      state.lastCreatedToken = res.data.token;
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-invite]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.delInvite!;
+      const res = await apiFetch(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/${encodeURIComponent(id)}/`,
+        { method: "DELETE" }
+      );
+      showToast(res.ok ? "Convite revogado" : res.error || "Falha ao revogar convite");
       await loadCurrentTabData();
       renderMainPane();
-    } else {
-      showToast(res.error || "Token creation failed");
-    }
+    });
   });
 
   mainPane.querySelectorAll<HTMLButtonElement>("[data-del-token]").forEach((btn) => {
@@ -2279,11 +2926,244 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     syncSelfCheckSlots();
   });
 
-  // Security Shield tab handlers
+  // Security Shield, MFA & Audit sub-tabs handlers
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-shield-subtab]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      state.shieldSubTab = (btn.dataset.shieldSubtab as ShieldSubTab) || "anti-rea";
+      await loadCurrentTabData();
+      renderMainPane();
+    });
+  });
+
   document.getElementById("btn-refresh-shield")?.addEventListener("click", async () => {
     await loadCurrentTabData();
     renderMainPane();
-    showToast("Escudo atualizado");
+    showToast("Segurança atualizada");
+  });
+
+  document.getElementById("btn-totp-enroll")?.addEventListener("click", async () => {
+    const res = await apiFetch<{ secret_b32: string; otpauth_uri: string; qr_svg: string }>(
+      "/api/auth/mfa/totp/enroll",
+      { method: "POST", body: {} }
+    );
+    if (!res.ok || !res.data) {
+      showToast(res.error || "Falha ao gerar QR 2FA");
+      return;
+    }
+    state.totpEnrollData = res.data;
+    state.recoveryCodes = null;
+    renderMainPane();
+  });
+
+  const totpConfirmForm = document.getElementById("totp-confirm-form") as HTMLFormElement | null;
+  totpConfirmForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const code = (document.getElementById("totp-confirm-code") as HTMLInputElement | null)?.value || "";
+    const res = await apiFetch<{ ok: boolean; recovery_codes: string[] }>(
+      "/api/auth/mfa/totp/confirm",
+      { method: "POST", body: { code } }
+    );
+    if (!res.ok || !res.data) {
+      showToast(res.error || "Código 2FA inválido");
+      return;
+    }
+    state.totpEnrollData = null;
+    state.recoveryCodes = res.data.recovery_codes;
+    showToast("Autenticação 2FA ativada com sucesso!");
+    await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+    renderMainPane();
+  });
+
+  document.getElementById("btn-totp-disable")?.addEventListener("click", async () => {
+    const sendDisable = async () => {
+      const res = await apiFetch("/api/auth/mfa/totp/disable", { method: "POST", body: {} });
+      if (res.reauth_required) {
+        openReauthDialog(sendDisable);
+        return;
+      }
+      if (!res.ok) {
+        showToast(res.error || "Falha ao desativar 2FA");
+        return;
+      }
+      state.recoveryCodes = null;
+      showToast("2FA desativado");
+      await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+      renderMainPane();
+    };
+    await sendDisable();
+  });
+
+  document.getElementById("btn-regen-recovery")?.addEventListener("click", async () => {
+    const sendRegen = async () => {
+      const res = await apiFetch<{ recovery_codes: string[] }>(
+        "/api/auth/mfa/recovery/regenerate",
+        { method: "POST", body: {} }
+      );
+      if (res.reauth_required) {
+        openReauthDialog(sendRegen);
+        return;
+      }
+      if (!res.ok || !res.data) {
+        showToast(res.error || "Falha ao regenerar códigos");
+        return;
+      }
+      state.recoveryCodes = res.data.recovery_codes;
+      showToast("Novos códigos de recuperação gerados");
+      await loadCurrentTabData();
+      renderMainPane();
+    };
+    await sendRegen();
+  });
+
+  const passkeyRegForm = document.getElementById("passkey-reg-form") as HTMLFormElement | null;
+  passkeyRegForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!window.PublicKeyCredential || !navigator.credentials) {
+      showToast("Passkeys WebAuthn não suportado neste navegador");
+      return;
+    }
+    const name = (document.getElementById("passkey-name-input") as HTMLInputElement | null)?.value?.trim() || "Security Passkey";
+    const begin = await apiFetch<any>("/api/auth/passkey/register/begin", { method: "POST", body: {} });
+    if (!begin.ok || !begin.data) {
+      showToast(begin.error || "Falha ao iniciar registro de Passkey");
+      return;
+    }
+    try {
+      const o = begin.data;
+      const publicKey: PublicKeyCredentialCreationOptions = {
+        challenge: b64uToBuf(o.challenge),
+        rp: o.rp,
+        user: { ...o.user, id: b64uToBuf(o.user.id) },
+        pubKeyCredParams: o.pubKeyCredParams,
+        excludeCredentials: Array.isArray(o.excludeCredentials)
+          ? o.excludeCredentials.map((c: any) => ({ type: "public-key", id: b64uToBuf(c.id) }))
+          : [],
+        timeout: o.timeout || 120000,
+        authenticatorSelection: o.authenticatorSelection,
+        attestation: "none"
+      };
+      const cred = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
+      if (!cred) {
+        showToast("Cadastro de Passkey cancelado");
+        return;
+      }
+      const resp = cred.response as AuthenticatorAttestationResponse;
+      const fin = await apiFetch("/api/auth/passkey/register/finish", {
+        method: "POST",
+        body: {
+          name,
+          clientDataJSON: bufToB64u(resp.clientDataJSON),
+          attestationObject: bufToB64u(resp.attestationObject)
+        }
+      });
+      if (!fin.ok) {
+        showToast(fin.error || "Falha ao salvar Passkey");
+        return;
+      }
+      showToast("Passkey registrada!");
+      await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+      renderMainPane();
+    } catch (err: any) {
+      showToast(err?.message ? String(err.message) : "Erro ao registrar Passkey");
+    }
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-passkey]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.dataset.delPasskey);
+      const sendDel = async () => {
+        const res = await apiFetch(`/api/auth/passkeys/${id}`, { method: "DELETE" });
+        if (res.reauth_required) {
+          openReauthDialog(sendDel);
+          return;
+        }
+        showToast(res.ok ? "Passkey removida" : res.error || "Falha ao remover Passkey");
+        await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+        renderMainPane();
+      };
+      await sendDel();
+    });
+  });
+
+  const pwChangeForm = document.getElementById("pw-change-form") as HTMLFormElement | null;
+  pwChangeForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(pwChangeForm);
+    const res = await apiFetch<{ ok: boolean; csrf_token?: string }>("/api/auth/password/change", {
+      method: "POST",
+      body: Object.fromEntries(fd.entries())
+    });
+    if (!res.ok) {
+      showToast(res.error || "Falha ao atualizar senha");
+      return;
+    }
+    if (res.data?.csrf_token) setCsrfToken(res.data.csrf_token);
+    pwChangeForm.reset();
+    showToast("Senha alterada e outras sessões encerradas");
+    await loadCurrentTabData();
+    renderMainPane();
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-revoke-session]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.dataset.revokeSession);
+      const res = await apiFetch(`/api/auth/sessions/${id}`, { method: "DELETE" });
+      showToast(res.ok ? "Sessão revogada" : res.error || "Falha ao revogar sessão");
+      await loadCurrentTabData();
+      renderMainPane();
+    });
+  });
+
+  document.getElementById("btn-revoke-other-sessions")?.addEventListener("click", async () => {
+    const res = await apiFetch("/api/auth/sessions/revoke-others", { method: "POST", body: {} });
+    showToast(res.ok ? "Outras sessões encerradas" : res.error || "Falha ao encerrar sessões");
+    await loadCurrentTabData();
+    renderMainPane();
+  });
+
+  const orgSecForm = document.getElementById("org-sec-form") as HTMLFormElement | null;
+  orgSecForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const payload: OrgSecuritySettings = {
+      scrub_ip_addresses: (document.getElementById("org-sec-ip") as HTMLInputElement | null)?.checked ?? false,
+      require_mfa_for_admins: (document.getElementById("org-sec-mfa") as HTMLInputElement | null)?.checked ?? false,
+      event_throttle_rate: Math.min(
+        100,
+        Math.max(0, Number((document.getElementById("org-sec-throttle") as HTMLInputElement | null)?.value || 0))
+      )
+    };
+    const sendSave = async () => {
+      const res = await apiFetch<OrgSecuritySettings>(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/security-settings/`,
+        { method: "PUT", body: payload }
+      );
+      if (res.reauth_required) {
+        openReauthDialog(sendSave);
+        return;
+      }
+      if (!res.ok || !res.data) {
+        showToast(res.error || "Falha ao salvar políticas da organização");
+        return;
+      }
+      state.orgSecurity = res.data;
+      showToast("Políticas de segurança salvas");
+      await loadCurrentTabData();
+      renderMainPane();
+    };
+    await sendSave();
+  });
+
+  document.getElementById("btn-verify-audit")?.addEventListener("click", async () => {
+    const res = await apiFetch<AuditVerifyResult>(
+      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/verify/`
+    );
+    if (res.ok && res.data) {
+      state.auditVerify = res.data;
+      renderMainPane();
+      showToast(res.data.valid ? "Cadeia SHA-256 íntegra e válida" : "Violação detectada na trilha de auditoria!");
+    } else {
+      showToast(res.error || "Falha ao verificar integridade");
+    }
   });
 
   document.getElementById("btn-shield-settings")?.addEventListener("click", () => {
@@ -2371,6 +3251,13 @@ function openProjectSettingsDialog(projectId: number): void {
         <input id="pf-emails" type="checkbox" name="scrub_emails" ${f.scrub_emails ? "checked" : ""}>
         <span>Scrub email addresses from payloads</span>
       </label>
+      <label class="check-row" for="pf-agg-keys">
+        <input id="pf-agg-keys" type="checkbox" name="aggressive_key_match" ${f.aggressive_key_match ? "checked" : ""}>
+        <span>Aggressive Sensitive Key Substring Scrubbing (custom_auth_token, user_secret...)</span>
+      </label>
+      <label for="pf-throttle">Project Event Throttle Rate (% dropped, 0-100)
+        <input id="pf-throttle" name="event_throttle_rate" type="number" min="0" max="100" value="${f.event_throttle_rate ?? 0}">
+      </label>
       <label for="pf-storm-thresh">Storm Sample Threshold (events/min)
         <input id="pf-storm-thresh" name="storm_sample_threshold" type="number" min="0" value="${f.storm_sample_threshold}">
       </label>
@@ -2443,7 +3330,9 @@ function openProjectSettingsDialog(projectId: number): void {
       scrub_emails: getChecked("pf-emails"),
       storm_sample_threshold: Math.max(0, Number(getVal("pf-storm-thresh") || 0)),
       storm_sample_every: Math.max(1, Number(getVal("pf-storm-every") || 1)),
+      event_throttle_rate: Math.min(100, Math.max(0, Number(getVal("pf-throttle") || 0))),
       auto_promote_log_level: getVal("pf-promote") || null,
+      aggressive_key_match: getChecked("pf-agg-keys"),
       safe_keys: splitFilterList(getVal("pf-safe-keys")),
       sensitive_keys: splitFilterList(getVal("pf-sens-keys")),
       shield: {
@@ -2489,9 +3378,15 @@ function renderProjectKeysDialogBody(proj: Project): void {
           <tr>
             <th scope="row">${esc(k.label)}</th>
             <td data-label="Public Key" class="mono">${esc(k.public_key)}</td>
-            <td data-label="Rate Limit" class="tabular">${k.rate_limit_per_min}/min</td>
+            <td data-label="Rate Limit (min)">
+              <input type="number" class="compact-input" min="1" max="100000" aria-label="Rate limit for ${esc(k.label)}" data-key-rate="${k.id}" value="${k.rate_limit_per_min}">
+            </td>
+            <td data-label="Active">
+              <input type="checkbox" aria-label="Active state for ${esc(k.label)}" data-key-active="${k.id}" ${k.is_active ? "checked" : ""}>
+            </td>
             <td data-label="Actions">
               <div class="row-gap">
+                <button type="button" data-save-proj-key="${k.id}">Save</button>
                 <button type="button" data-copy-text="${esc(dsn)}">Copy DSN</button>
                 <button type="button" class="btn-danger" data-del-proj-key="${k.id}">Revoke</button>
               </div>
@@ -2499,7 +3394,7 @@ function renderProjectKeysDialogBody(proj: Project): void {
           </tr>`;
         })
         .join("")
-    : `<tr><td colspan="4">No active DSN keys for this project.</td></tr>`;
+    : `<tr><td colspan="5">No active DSN keys for this project.</td></tr>`;
 
   bodyEl.innerHTML = `
     <div class="stack-col">
@@ -2512,13 +3407,29 @@ function renderProjectKeysDialogBody(proj: Project): void {
       <div tabindex="0" role="region" aria-labelledby="pkeys-cap" class="table-wrapper">
         <table class="data-table">
           <caption id="pkeys-cap" class="hp-field">Project DSN Keys</caption>
-          <thead><tr><th>Label</th><th>Public Key</th><th>Limit</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Label</th><th>Public Key</th><th>Limit/min</th><th>Active</th><th>Actions</th></tr></thead>
           <tbody>${keyRows}</tbody>
         </table>
       </div>
     </div>`;
 
   bindCopyButtons(bodyEl);
+
+  bodyEl.querySelectorAll<HTMLButtonElement>("[data-save-proj-key]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const keyId = Number(btn.dataset.saveProjKey);
+      const rateEl = bodyEl.querySelector<HTMLInputElement>(`[data-key-rate="${keyId}"]`);
+      const activeEl = bodyEl.querySelector<HTMLInputElement>(`[data-key-active="${keyId}"]`);
+      const rate = Math.min(100000, Math.max(1, Number(rateEl?.value || 600)));
+      const active = activeEl?.checked ?? true;
+      const res = await apiFetch<ProjectKeyItem>(
+        `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/keys/${keyId}/`,
+        { method: "PUT", body: { rate_limit_per_min: rate, is_active: active } }
+      );
+      showToast(res.ok ? "DSN key updated" : res.error || "Failed updating DSN key");
+      await refreshProjectKeysAndProjects(proj);
+    });
+  });
 
   const form = document.getElementById("proj-key-create-form") as HTMLFormElement | null;
   form?.addEventListener("submit", async (e) => {
@@ -2587,7 +3498,57 @@ async function openProjectKeysDialog(projectId: number): Promise<void> {
   openDialog(dlg);
 }
 
-function openCreateDialog(kind: "project" | "monitor" | "alert" | "member"): void {
+function roleDefaultScopes(role: string): string[] {
+  if (role === "owner") return ALL_TOKEN_SCOPES;
+  if (role === "manager") {
+    return [
+      "org:read",
+      "org:write",
+      "member:read",
+      "member:write",
+      "member:admin",
+      "project:read",
+      "project:write",
+      "project:admin",
+      "project:releases",
+      "event:read",
+      "event:write",
+      "event:admin",
+      "shield:read",
+      "shield:write"
+    ];
+  }
+  if (role === "admin") {
+    return [
+      "org:read",
+      "member:read",
+      "project:read",
+      "project:write",
+      "project:admin",
+      "project:releases",
+      "event:read",
+      "event:write",
+      "event:admin",
+      "shield:read",
+      "shield:write"
+    ];
+  }
+  if (role === "member") {
+    return [
+      "org:read",
+      "member:read",
+      "project:read",
+      "project:releases",
+      "event:read",
+      "event:write",
+      "event:admin",
+      "shield:read"
+    ];
+  }
+  return ["org:read", "project:read", "event:read", "shield:read"];
+}
+
+function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "invite" | "token"): void {
   const dlg = document.getElementById("dlg-create") as HTMLDialogElement | null;
   const title = document.getElementById("dlg-create-title");
   const body = document.getElementById("dlg-create-body");
@@ -2639,19 +3600,83 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member"): voi
         <label for="cr-mem-name">Name
           <input id="cr-mem-name" name="name" type="text" required autocomplete="name" placeholder="Developer Name">
         </label>
-        <label for="cr-mem-pw">Temporary Password (min 8 chars)
-          <input id="cr-mem-pw" name="password" type="password" required minlength="8" autocomplete="new-password">
+        <label for="cr-mem-pw">Temporary Password (min 10 chars)
+          <input id="cr-mem-pw" name="password" type="password" required minlength="10" autocomplete="new-password">
         </label>
         <label for="cr-mem-role">Role
           <select id="cr-mem-role" name="role">
             <option value="member" selected>member</option>
             <option value="admin">admin</option>
+            <option value="manager">manager</option>
             <option value="viewer">viewer</option>
             <option value="owner">owner</option>
           </select>
         </label>
         <button type="submit">Add Member</button>
       </form>`;
+  } else if (kind === "invite") {
+    title.textContent = "Gerar Link de Convite Expirável (72h)";
+    body.innerHTML = `
+      <form id="create-res-form" class="stack-col">
+        <label for="cr-inv-email">Email do Convidado
+          <input id="cr-inv-email" name="email" type="email" required autocomplete="email" spellcheck="false" placeholder="novo.dev@empresa.com" autofocus>
+        </label>
+        <label for="cr-inv-role">Permissão (Role)
+          <select id="cr-inv-role" name="role">
+            <option value="member" selected>member</option>
+            <option value="admin">admin</option>
+            <option value="manager">manager</option>
+            <option value="viewer">viewer</option>
+            <option value="owner">owner</option>
+          </select>
+        </label>
+        <button type="submit">Gerar Link de 72h</button>
+      </form>`;
+  } else if (kind === "token") {
+    title.textContent = "Gerar API Token com Escopos & Expiração";
+    const defScopes = roleDefaultScopes("member");
+    const scopeCheckboxes = ALL_TOKEN_SCOPES.map(
+      (sc) => `
+      <label class="check-row" for="tok-sc-${sc}">
+        <input id="tok-sc-${sc}" type="checkbox" name="tok_scope" value="${sc}" ${defScopes.includes(sc) ? "checked" : ""}>
+        <span class="mono">${sc}</span>
+      </label>`
+    ).join("");
+    body.innerHTML = `
+      <form id="create-res-form" class="stack-col">
+        <label for="cr-tok-name">Nome do Token
+          <input id="cr-tok-name" name="name" type="text" required autocomplete="off" placeholder="CI SourceMaps / MCP Read" value="CI Token" autofocus>
+        </label>
+        <label for="cr-tok-role">Nível de Acesso (Role)
+          <select id="cr-tok-role" name="role">
+            <option value="member" selected>member</option>
+            <option value="viewer">viewer</option>
+            <option value="admin">admin</option>
+            <option value="manager">manager</option>
+            <option value="owner">owner</option>
+          </select>
+        </label>
+        <label for="cr-tok-exp">Expiração
+          <select id="cr-tok-exp" name="expires_in_days">
+            <option value="30">30 dias</option>
+            <option value="90" selected>90 dias</option>
+            <option value="365">365 dias</option>
+            <option value="0">Sem expiração</option>
+          </select>
+        </label>
+        <div class="stack-col">
+          <strong>Escopos permitidos</strong>
+          <div class="scope-grid">${scopeCheckboxes}</div>
+        </div>
+        <button type="submit">Gerar API Token</button>
+      </form>`;
+    const tokRoleSel = document.getElementById("cr-tok-role") as HTMLSelectElement | null;
+    tokRoleSel?.addEventListener("change", () => {
+      const allowed = roleDefaultScopes(tokRoleSel.value);
+      body.querySelectorAll<HTMLInputElement>('input[name="tok_scope"]').forEach((cb) => {
+        cb.checked = allowed.includes(cb.value);
+      });
+    });
   } else {
     title.textContent = "New Alert Rule";
     body.innerHTML = `
@@ -2745,6 +3770,15 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member"): voi
         delete raw.email_to;
       }
     }
+    if (kind === "token") {
+      const checkedScopes = Array.from(
+        form.querySelectorAll<HTMLInputElement>('input[name="tok_scope"]:checked')
+      ).map((el) => el.value);
+      const expDays = Number(raw.expires_in_days || 0);
+      delete raw.tok_scope;
+      raw.scopes = checkedScopes;
+      raw.expires_in_days = expDays > 0 ? expDays : null;
+    }
 
     const url =
       kind === "project"
@@ -2753,25 +3787,47 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member"): voi
         ? `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/monitors/`
         : kind === "member"
         ? `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`
+        : kind === "invite"
+        ? `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/`
+        : kind === "token"
+        ? `/api/0/api-tokens/`
         : `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/`;
 
-    const res = await apiFetch(url, { method: "POST", body: raw });
-    if (!res.ok) {
-      showToast(res.error || "Failed creating item");
-      return;
-    }
-    dlg.close();
-    await loadCurrentTabData();
-    renderMainPane();
-    showToast(
-      kind === "project"
-        ? "Project created"
-        : kind === "monitor"
-        ? "Monitor created"
-        : kind === "member"
-        ? "Member added"
-        : "Alert rule saved"
-    );
+    const submitCreate = async () => {
+      const res = await apiFetch<any>(url, { method: "POST", body: raw });
+      if (res.reauth_required) {
+        dlg.close();
+        openReauthDialog(submitCreate);
+        return;
+      }
+      if (!res.ok) {
+        showToast(res.error || "Failed creating item");
+        return;
+      }
+      if (kind === "token" && res.data?.token) {
+        state.lastCreatedToken = res.data.token;
+      }
+      if (kind === "invite" && res.data?.invite_url) {
+        state.lastInviteUrl = `${location.origin}${res.data.invite_url}`;
+      }
+      dlg.close();
+      await loadCurrentTabData();
+      renderMainPane();
+      showToast(
+        kind === "project"
+          ? "Project created"
+          : kind === "monitor"
+          ? "Monitor created"
+          : kind === "member"
+          ? "Member added"
+          : kind === "invite"
+          ? "Link de convite (72h) gerado"
+          : kind === "token"
+          ? "API Token gerado com escopos"
+          : "Alert rule saved"
+      );
+    };
+    await submitCreate();
   });
 
   openDialog(dlg);

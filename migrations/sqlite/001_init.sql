@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
+    settings_json TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL
 );
 
@@ -23,7 +24,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS organization_members (
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member', 'viewer')),
+    role TEXT NOT NULL CHECK(role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
     PRIMARY KEY (organization_id, user_id)
 );
 
@@ -32,6 +33,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     csrf_token TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    ip_hmac TEXT NOT NULL DEFAULT '',
+    last_seen_at INTEGER NOT NULL DEFAULT 0,
+    reauth_at INTEGER,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
@@ -44,8 +49,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     name TEXT NOT NULL,
     token_sha256 TEXT NOT NULL UNIQUE,
     token_prefix TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member', 'viewer')),
+    role TEXT NOT NULL CHECK(role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
     scopes TEXT NOT NULL DEFAULT 'project:read project:write event:read',
+    expires_at INTEGER,
     last_used_at INTEGER,
     created_at INTEGER NOT NULL
 );
@@ -297,11 +303,80 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     actor_user_id INTEGER,
+    actor_email TEXT NOT NULL DEFAULT '',
     action TEXT NOT NULL,
     target_type TEXT NOT NULL,
     target_id TEXT NOT NULL,
+    ip_hmac TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    prev_hash TEXT NOT NULL DEFAULT 'GENESIS',
+    entry_hash TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_audit_logs_org_id ON audit_logs(organization_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS user_mfa (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    totp_secret_enc TEXT NOT NULL DEFAULT '',
+    is_enabled INTEGER NOT NULL DEFAULT 0,
+    last_used_step INTEGER,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until INTEGER,
+    enabled_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_mfa_recovery_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    used_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mfa_recovery_user ON user_mfa_recovery_codes(user_id);
+
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    token_sha256 TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_org_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    ip_hmac TEXT NOT NULL DEFAULT '',
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    credential_id_b64 TEXT NOT NULL UNIQUE,
+    cose_alg INTEGER NOT NULL,
+    public_key_b64 TEXT NOT NULL,
+    sign_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_creds_user ON webauthn_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS webauthn_challenges (
+    challenge_b64 TEXT PRIMARY KEY,
+    user_id INTEGER,
+    flow_kind TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS org_invitations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'manager', 'admin', 'member', 'viewer')),
+    token_sha256 TEXT NOT NULL UNIQUE,
+    invited_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    expires_at INTEGER NOT NULL,
+    accepted_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_org_invitations_org ON org_invitations(organization_id, created_at DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
     title,

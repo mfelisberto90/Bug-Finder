@@ -50,12 +50,14 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
     } else {
         false
     };
+    let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
     ip.is_loopback()                  // ::1
         || ip.is_unspecified()        // ::
         || ip.is_multicast()
         || is_nat64
         || is_ipv4_compat
         || is_6to4_blocked
+        || is_teredo
         || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         || (seg[0] == 0x2001 && seg[1] == 0x0db8)
@@ -176,6 +178,7 @@ mod tests {
         assert!(validate_webhook_url("https://[::127.0.0.1]/hook", false).is_err());
         assert!(validate_webhook_url("https://[64:ff9b::127.0.0.1]/hook", false).is_err());
         assert!(validate_webhook_url("https://[2002:7f00:0001::1]/hook", false).is_err());
+        assert!(validate_webhook_url("https://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/hook", false).is_err());
         assert!(validate_webhook_url("https://127.0.0.1?foo=bar", false).is_err());
         assert!(validate_webhook_url("https://127.0.0.1#frag", false).is_err());
         assert!(validate_webhook_url("https://user:pass@93.184.216.34/hook", false).is_err());

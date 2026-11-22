@@ -3,6 +3,10 @@ export interface UserInfo {
   email: string;
   name: string;
   role: string;
+  totp_enabled?: boolean;
+  passkey_count?: number;
+  mfa_enabled?: boolean;
+  reauth_fresh?: boolean;
 }
 
 export interface Organization {
@@ -10,6 +14,75 @@ export interface Organization {
   slug: string;
   name: string;
   role: string;
+}
+
+export interface OrgSecuritySettings {
+  scrub_ip_addresses: boolean;
+  event_throttle_rate: number;
+  require_mfa_for_admins: boolean;
+}
+
+export interface AuditLogItem {
+  id: number;
+  actor_user_id: number | null;
+  actor_email: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  ip_hmac: string;
+  metadata: Record<string, unknown>;
+  entry_hash: string;
+  created_at: string;
+}
+
+export interface AuditVerifyResult {
+  valid: boolean;
+  checked_entries: number;
+  broken_at_id: number | null;
+  detail: string;
+}
+
+export interface ActiveSessionItem {
+  id: number;
+  user_agent: string;
+  ip_hmac_short: string;
+  last_seen_at: string;
+  created_at: string;
+  is_current: boolean;
+}
+
+export interface PasskeyItem {
+  id: number;
+  name: string;
+  cose_alg: number;
+  sign_count: number;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+export interface MfaStatus {
+  totp_enabled: boolean;
+  recovery_codes_remaining: number;
+  passkeys: PasskeyItem[];
+}
+
+export interface InvitationItem {
+  id: number;
+  email: string;
+  role: string;
+  invited_by_email: string;
+  expires_at: string;
+  accepted_at: string | null;
+  created_at: string;
+}
+
+export interface PublicInvitationInfo {
+  valid: boolean;
+  organization_slug: string;
+  organization_name: string;
+  email: string;
+  role: string;
+  expires_at: string;
 }
 
 export interface ShieldPolicy {
@@ -31,9 +104,11 @@ export interface ProjectFilters {
   ignore_messages: string[];
   storm_sample_threshold: number;
   storm_sample_every: number;
+  event_throttle_rate?: number;
   auto_promote_log_level: string | null;
   scrub_ip_addresses: boolean;
   scrub_emails: boolean;
+  aggressive_key_match?: boolean;
   safe_keys: string[];
   sensitive_keys: string[];
   shield?: ShieldPolicy;
@@ -203,6 +278,9 @@ export interface ApiTokenItem {
   name: string;
   token_prefix: string;
   role: string;
+  scopes?: string;
+  last_used_at?: string | null;
+  expires_at?: string | null;
   created_at: string;
 }
 
@@ -284,10 +362,34 @@ function notifyTransportError(path: string, status: number, message: string): vo
   } catch {}
 }
 
+export function b64uToBuf(b64u: string): ArrayBuffer {
+  const clean = b64u.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = clean.length % 4 === 0 ? "" : "=".repeat(4 - (clean.length % 4));
+  const bin = atob(clean + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
+export function bufToB64u(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 export async function apiFetch<T>(
   path: string,
   options: { method?: string; body?: unknown } = {}
-): Promise<{ ok: boolean; status: number; data: T | null; error?: string; hits?: number }> {
+): Promise<{
+  ok: boolean;
+  status: number;
+  data: T | null;
+  error?: string;
+  reauth_required?: boolean;
+  retry_after?: number;
+  hits?: number;
+}> {
   const headers: Record<string, string> = {};
   const method = options.method || "GET";
   if (options.body !== undefined) {
@@ -337,6 +439,8 @@ export async function apiFetch<T>(
       status: resp.status,
       data: null,
       error: errMsg,
+      reauth_required: Boolean(parsed && parsed.reauth_required),
+      retry_after: parsed && typeof parsed.retry_after === "number" ? parsed.retry_after : undefined,
       hits
     };
   }

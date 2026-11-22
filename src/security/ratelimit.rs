@@ -197,6 +197,46 @@ pub fn sentry_rate_limit_header(retry_after_sec: u64, category: &str) -> String 
     format!("{retry_after_sec}:{category}:project")
 }
 
+/// Negative cache for invalid DSN lookups (30s TTL) preventing flood amplification against SQLite/PG.
+pub struct InvalidDsnCache {
+    ttl: Duration,
+    inner: Mutex<BoundedMap<(i64, String), Instant>>,
+}
+
+impl InvalidDsnCache {
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Mutex::new(BoundedMap::new(capacity)),
+        }
+    }
+
+    pub fn is_blocked(&self, project_id: i64, key_sha256: &str) -> bool {
+        let key = (project_id, key_sha256.to_string());
+        let now = Instant::now();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = guard.get_mut(&key) {
+            if now < *exp {
+                return true;
+            }
+            guard.remove(&key);
+        }
+        false
+    }
+
+    pub fn mark_invalid(&self, project_id: i64, key_sha256: &str) {
+        let key = (project_id, key_sha256.to_string());
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(key, Instant::now() + self.ttl);
+    }
+
+    pub fn invalidate(&self, project_id: i64, key_sha256: &str) {
+        let key = (project_id, key_sha256.to_string());
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
