@@ -158,6 +158,7 @@ pub struct TenantCtx {
     pub is_session_auth: bool,
     pub reauth_at: Option<i64>,
     pub session_id: Option<i64>,
+    pub token_expires_at: Option<i64>,
 }
 
 impl TenantCtx {
@@ -178,6 +179,7 @@ impl TenantCtx {
             is_session_auth: true,
             reauth_at,
             session_id,
+            token_expires_at: None,
         }
     }
 
@@ -197,7 +199,13 @@ impl TenantCtx {
             is_session_auth: false,
             reauth_at: None,
             session_id: None,
+            token_expires_at: None,
         }
+    }
+
+    pub fn with_token_expires_at(mut self, exp: Option<i64>) -> Self {
+        self.token_expires_at = exp;
+        self
     }
 
     pub fn has_scope(&self, scope: &str) -> bool {

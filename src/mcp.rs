@@ -157,7 +157,7 @@ pub async fn handle_mcp_request(
                         limit: args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 50),
                         offset: 0,
                     };
-                    let (issues, total) = storage
+                    let (issues, total, _) = storage
                         .list_issues(ctx, &iq)
                         .await
                         .map_err(|e| (-32000, e))?;

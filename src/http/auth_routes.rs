@@ -10,10 +10,11 @@ use crate::security::mfa::{
     build_otpauth_uri, decode_base32, generate_recovery_codes, generate_totp_secret_b32,
     render_qr_svg, verify_recovery_code, verify_totp_window,
 };
+use crate::security::oidc::{open_oidc_tx_cookie, seal_oidc_tx_cookie, OidcTxState};
 use crate::security::webauthn::{b64url_decode, verify_assertion, verify_registration};
 use crate::storage::{AuthenticatedSession, NewAuditLog};
 use crate::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -21,6 +22,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -296,9 +298,307 @@ async fn mint_session_response(
 
 pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
     match state.storage.needs_setup().await {
-        Ok(needs_setup) => Json(json!({ "needs_setup": needs_setup })).into_response(),
+        Ok(needs_setup) => {
+            let (oidc_enabled, oidc_name) = match state.oidc_client.as_ref() {
+                Some(c) => (true, c.config().display_name.clone()),
+                None => (false, String::new()),
+            };
+            Json(json!({
+                "needs_setup": needs_setup,
+                "oidc_enabled": oidc_enabled,
+                "oidc_name": oidc_name,
+            }))
+            .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
+}
+
+fn build_oidc_tx_cookie(val: &str, max_age_sec: i64, state: &AppState, headers: &HeaderMap) -> String {
+    let secure = !state.config.is_dev && is_https_request(headers, &state.config);
+    let mut cookie = format!(
+        "bf_oidc_tx={val}; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age={max_age_sec}"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn oidc_error_clearing_tx(
+    status: StatusCode,
+    msg: &str,
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Response {
+    let clear_tx = build_oidc_tx_cookie("", 0, state, headers);
+    let mut resp = (status, Json(json!({ "error": msg }))).into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&clear_tx) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+pub async fn oidc_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let Some(oidc) = state.oidc_client.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "OIDC SSO is not configured" })),
+        )
+            .into_response();
+    };
+    let client_ip = request_client_ip(&ext);
+    let ip_dec = state
+        .rate_limiter
+        .check_and_record("oidc_ip", &client_ip, 30, Duration::from_secs(60));
+    if !ip_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many SSO login requests" })),
+        )
+            .into_response();
+    }
+
+    let state_tok = random_token_b64(24);
+    let nonce = random_token_b64(24);
+    let code_verifier = random_token_b64(32);
+    let now_sec = chrono::Utc::now().timestamp();
+    let tx_state = OidcTxState {
+        state: state_tok.clone(),
+        nonce: nonce.clone(),
+        code_verifier: code_verifier.clone(),
+        issued_at: now_sec,
+    };
+    let sealed = match seal_oidc_tx_cookie(&state.config.app_key, &tx_state) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let authorize_url = match tokio::task::spawn_blocking(move || {
+        oidc.build_authorize_url_blocking(&state_tok, &nonce, &code_verifier)
+    })
+    .await
+    {
+        Ok(Ok(u)) => u,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("OIDC worker failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let tx_cookie = build_oidc_tx_cookie(&sealed, 300, &state, &headers);
+    let mut resp = StatusCode::FOUND.into_response();
+    if let Ok(loc) = HeaderValue::from_str(&authorize_url) {
+        resp.headers_mut().insert(header::LOCATION, loc);
+    }
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&tx_cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+pub async fn oidc_callback(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let Some(oidc) = state.oidc_client.clone() else {
+        return oidc_error_clearing_tx(
+            StatusCode::NOT_FOUND,
+            "OIDC SSO is not configured",
+            &state,
+            &headers,
+        );
+    };
+    let client_ip = request_client_ip(&ext);
+    let ip_dec = state
+        .rate_limiter
+        .check_and_record("oidc_ip", &client_ip, 30, Duration::from_secs(60));
+    if !ip_dec.allowed {
+        return oidc_error_clearing_tx(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many SSO callback attempts",
+            &state,
+            &headers,
+        );
+    }
+
+    if let Some(idp_err) = q.get("error").map(String::as_str).filter(|s| !s.is_empty()) {
+        return oidc_error_clearing_tx(
+            StatusCode::BAD_REQUEST,
+            &format!("OIDC provider rejected login: {idp_err}"),
+            &state,
+            &headers,
+        );
+    }
+
+    let Some(sealed) = extract_cookie(&headers, "bf_oidc_tx") else {
+        return oidc_error_clearing_tx(
+            StatusCode::BAD_REQUEST,
+            "Missing OIDC login transaction cookie",
+            &state,
+            &headers,
+        );
+    };
+
+    let now_sec = chrono::Utc::now().timestamp();
+    let tx = match open_oidc_tx_cookie(&state.config.app_key, &sealed, now_sec) {
+        Ok(t) => t,
+        Err(msg) => {
+            return oidc_error_clearing_tx(StatusCode::BAD_REQUEST, &msg, &state, &headers);
+        }
+    };
+
+    let got_state = q.get("state").map(String::as_str).unwrap_or("");
+    if got_state.is_empty() || !constant_time_eq(got_state.as_bytes(), tx.state.as_bytes()) {
+        return oidc_error_clearing_tx(
+            StatusCode::BAD_REQUEST,
+            "Invalid OIDC state parameter",
+            &state,
+            &headers,
+        );
+    }
+    let Some(code) = q.get("code").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return oidc_error_clearing_tx(
+            StatusCode::BAD_REQUEST,
+            "Missing OIDC authorization code",
+            &state,
+            &headers,
+        );
+    };
+
+    let tx_nonce = tx.nonce.clone();
+    let tx_verifier = tx.code_verifier.clone();
+    let claims = match tokio::task::spawn_blocking(move || {
+        oidc.exchange_and_verify_blocking(&code, &tx_nonce, &tx_verifier, now_sec)
+    })
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(msg)) => {
+            return oidc_error_clearing_tx(StatusCode::UNAUTHORIZED, &msg, &state, &headers);
+        }
+        Err(e) => {
+            return oidc_error_clearing_tx(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("OIDC worker failed: {e}"),
+                &state,
+                &headers,
+            );
+        }
+    };
+
+    // Fail-closed: only pre-provisioned active Bug-Finder users may sign in via OIDC SSO
+    let user = match state.storage.find_user_for_login(&claims.email).await {
+        Ok(Some(u)) if u.is_active => u,
+        Ok(_) => {
+            return oidc_error_clearing_tx(
+                StatusCode::FORBIDDEN,
+                "No active Bug-Finder account exists for this SSO email; ask an administrator to invite you first",
+                &state,
+                &headers,
+            );
+        }
+        Err(e) => {
+            return oidc_error_clearing_tx(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e,
+                &state,
+                &headers,
+            );
+        }
+    };
+
+    let ttl_sec = state.config.session_ttl_sec;
+    let sess_raw = random_token_b64(32);
+    let sess_sha = sha256_hex(sess_raw.as_bytes());
+    let csrf = random_token_b64(24);
+    let expires_at = now_sec + ttl_sec;
+    let ua = request_user_agent(&headers);
+    let ip_hmac = state.rate_limiter.hash_key("session_ip", &client_ip);
+
+    if state
+        .storage
+        .create_session(
+            &sess_sha,
+            user.user_id,
+            user.organization_id,
+            &csrf,
+            &ua,
+            &ip_hmac,
+            now_sec,
+            expires_at,
+        )
+        .await
+        .is_err()
+    {
+        return oidc_error_clearing_tx(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Session creation failed",
+            &state,
+            &headers,
+        );
+    }
+
+    let _ = state
+        .storage
+        .append_audit_log(&NewAuditLog {
+            organization_id: user.organization_id,
+            actor_user_id: Some(user.user_id),
+            actor_email: user.email.clone(),
+            action: "auth.oidc_login".into(),
+            target_type: "session".into(),
+            target_id: user.user_id.to_string(),
+            ip_hmac,
+            metadata: json!({
+                "org": user.organization_slug,
+                "issuer": claims.iss,
+                "sub": claims.sub,
+            }),
+        })
+        .await;
+
+    let sess_cookie = build_session_cookie(&sess_raw, ttl_sec, &state, &headers);
+    let clear_tx = build_oidc_tx_cookie("", 0, &state, &headers);
+    let mut resp = StatusCode::FOUND.into_response();
+    resp.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&sess_cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&clear_tx) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    resp
 }
 
 pub async fn auth_setup(

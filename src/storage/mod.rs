@@ -9,6 +9,22 @@ use crate::domain::models::*;
 use async_trait::async_trait;
 use serde_json::Value;
 
+pub fn compute_issues_watermark_sig(
+    max_last_seen: i64,
+    sum_events: i64,
+    resolved_cnt: i64,
+    ignored_cnt: i64,
+) -> i64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for v in [max_last_seen, sum_events, resolved_cnt, ignored_cnt] {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    (h & 0x7fff_ffff_ffff_ffff) as i64
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSession {
     pub session_id: i64,
@@ -339,7 +355,7 @@ pub trait StorageBackend: Send + Sync {
         tunnel_slug: &str,
     ) -> Result<Option<String>, String>;
 
-    async fn list_issues(&self, ctx: &TenantCtx, params: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64), String>;
+    async fn list_issues(&self, ctx: &TenantCtx, params: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64, i64), String>;
     async fn get_issue(&self, ctx: &TenantCtx, issue_id: i64) -> Result<Option<IssueSummaryDto>, String>;
     async fn update_issue_status(
         &self,
@@ -499,6 +515,11 @@ pub trait StorageBackend: Send + Sync {
 
     async fn flush_ingest_batch(&self, items: Vec<IngestWriteItem>) -> Result<Vec<AlertDispatchJob>, String>;
     async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String>;
+    async fn shutdown_checkpoint(&self) {}
+    async fn issues_etag_watermark(&self, ctx: &TenantCtx, project_id: Option<i64>) -> Result<(i64, i64), String> {
+        let _ = (ctx, project_id);
+        Ok((0, 0))
+    }
     async fn db_size_bytes(&self) -> u64;
     async fn check_health(&self) -> Result<StorageHealthInfo, String>;
 

@@ -8,7 +8,9 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
+use flate2::read::GzDecoder;
 use serde_json::json;
+use std::io::Read;
 use std::sync::Arc;
 
 mod embedded_ui {
@@ -46,28 +48,105 @@ async fn robots_txt() -> Response {
         .into_response()
 }
 
-async fn mini_sdk_js() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=300"),
-        ],
-        embedded_ui::MINI_SDK_JS,
-    )
-        .into_response()
+fn client_accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').any(|part| {
+        let mut it = part.trim().split(';');
+        let enc = it.next().unwrap_or("").trim();
+        if !enc.eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        !it.any(|p| p.trim().eq_ignore_ascii_case("q=0"))
+    })
 }
 
-async fn shield_sdk_js() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=300"),
-        ],
-        embedded_ui::SHIELD_SDK_JS,
+fn serve_precompressed_bytes(
+    headers: &HeaderMap,
+    bytes: &'static [u8],
+    gzipped: bool,
+    content_type: &'static str,
+    etag: &'static str,
+    cache_control: Option<&'static str>,
+) -> Response {
+    let quoted_etag = format!("\"{etag}\"");
+    if let Some(if_none_match) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if if_none_match
+            .split(',')
+            .any(|tag| tag.trim() == quoted_etag || tag.trim() == "*")
+        {
+            let mut resp = StatusCode::NOT_MODIFIED.into_response();
+            if let Ok(v) = HeaderValue::from_str(&quoted_etag) {
+                resp.headers_mut().insert(header::ETAG, v);
+            }
+            resp.headers_mut()
+                .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+            if let Some(cc) = cache_control {
+                resp.headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static(cc));
+            }
+            return resp;
+        }
+    }
+
+    let mut resp = if gzipped && client_accepts_gzip(headers) {
+        let mut r = (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], bytes).into_response();
+        r.headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        r.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        r
+    } else if gzipped {
+        let mut dec = GzDecoder::new(bytes);
+        let mut raw = Vec::with_capacity(bytes.len() * 3);
+        if dec.read_to_end(&mut raw).is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Asset decode error").into_response();
+        }
+        let mut r = (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], raw).into_response();
+        r.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        r
+    } else {
+        (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], bytes).into_response()
+    };
+
+    if let Ok(v) = HeaderValue::from_str(&quoted_etag) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    if let Some(cc) = cache_control {
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(cc));
+    }
+    resp
+}
+
+async fn mini_sdk_js(headers: HeaderMap) -> Response {
+    serve_precompressed_bytes(
+        &headers,
+        embedded_ui::MINI_SDK_JS_GZ,
+        true,
+        "application/javascript; charset=utf-8",
+        embedded_ui::MINI_SDK_ETAG,
+        Some("public, max-age=300"),
     )
-        .into_response()
+}
+
+async fn shield_sdk_js(headers: HeaderMap) -> Response {
+    serve_precompressed_bytes(
+        &headers,
+        embedded_ui::SHIELD_SDK_JS_GZ,
+        true,
+        "application/javascript; charset=utf-8",
+        embedded_ui::SHIELD_SDK_ETAG,
+        Some("public, max-age=300"),
+    )
 }
 
 async fn prometheus_metrics(
@@ -120,44 +199,29 @@ async fn serve_spa(uri: Uri, ext: axum::http::Extensions, headers: HeaderMap) ->
     };
 
     if !lookup.contains("..") {
-        if let Some((bytes, ct, etag)) = embedded_ui::get_asset(lookup) {
+        if let Some(asset) = embedded_ui::get_asset(lookup) {
             if lookup == "index.html" {
-                return render_index_with_nonce(bytes, ext);
+                return render_index_with_nonce(asset.bytes, ext);
             }
-            let quoted_etag = format!("\"{etag}\"");
-            if lookup.starts_with("assets/") {
-                if let Some(if_none_match) =
-                    headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
-                {
-                    if if_none_match.split(',').any(|tag| tag.trim() == quoted_etag) {
-                        return (
-                            StatusCode::NOT_MODIFIED,
-                            [
-                                (header::ETAG, quoted_etag.as_str()),
-                                (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
-                            ],
-                        )
-                            .into_response();
-                    }
-                }
-            }
-            let mut resp = (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response();
-            if let Ok(v) = HeaderValue::from_str(&quoted_etag) {
-                resp.headers_mut().insert(header::ETAG, v);
-            }
-            if lookup.starts_with("assets/") {
-                resp.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=0, must-revalidate"),
-                );
-            }
-            return resp;
+            let cache_control = if lookup.starts_with("assets/") {
+                Some("public, max-age=0, must-revalidate")
+            } else {
+                None
+            };
+            return serve_precompressed_bytes(
+                &headers,
+                asset.bytes,
+                asset.gzipped,
+                asset.content_type,
+                asset.etag,
+                cache_control,
+            );
         }
     }
 
-    // SPA client-side route fallback -> index.html with fresh per-request CSP nonce
-    if let Some((bytes, _, _)) = embedded_ui::get_asset("index.html") {
-        return render_index_with_nonce(bytes, ext);
+    // SPA client-side route fallback -> index.html with fresh per-request CSP nonce (NEVER gzip HTML — BREACH defense)
+    if let Some(asset) = embedded_ui::get_asset("index.html") {
+        return render_index_with_nonce(asset.bytes, ext);
     }
 
     (StatusCode::NOT_FOUND, "Not found").into_response()
@@ -222,6 +286,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sdk/bugfinder-mini.js", get(mini_sdk_js))
         .route("/sdk/bugfinder-shield.js", get(shield_sdk_js))
         .route("/api/auth/status", get(auth_routes::auth_status))
+        .route("/api/auth/oidc/login", get(auth_routes::oidc_login))
+        .route("/api/auth/oidc/callback", get(auth_routes::oidc_callback))
         .route("/api/auth/setup", post(auth_routes::auth_setup))
         .route("/api/auth/login", post(auth_routes::auth_login))
         .route("/api/auth/logout", post(auth_routes::auth_logout))

@@ -163,7 +163,7 @@ impl SqliteStorage {
             )
             .optional()
         {
-            if !sql_def.contains("security_threat") {
+            if !sql_def.contains("security_threat") || !sql_def.contains("telegram") {
                 writer
                     .execute_batch(
                         "BEGIN IMMEDIATE;
@@ -176,7 +176,7 @@ impl SqliteStorage {
                              threshold_count INTEGER NOT NULL DEFAULT 1,
                              window_sec INTEGER NOT NULL DEFAULT 60,
                              cooldown_sec INTEGER NOT NULL DEFAULT 300,
-                             channel_type TEXT NOT NULL CHECK(channel_type IN ('webhook', 'slack', 'discord', 'email')),
+                             channel_type TEXT NOT NULL CHECK(channel_type IN ('webhook', 'slack', 'discord', 'telegram', 'email')),
                              target_url TEXT NOT NULL DEFAULT '',
                              webhook_secret TEXT NOT NULL DEFAULT '',
                              email_to TEXT NOT NULL DEFAULT '',
@@ -193,6 +193,8 @@ impl SqliteStorage {
             }
         }
 
+        let _ = writer.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA cache_size = -4000;");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -206,7 +208,9 @@ impl SqliteStorage {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(|e| format!("Open SQLite reader: {e}"))?;
-            let _ = r.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;");
+            let _ = r.execute_batch(
+                "PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -2000;",
+            );
             readers.push(Mutex::new(r));
         }
 
@@ -248,6 +252,92 @@ impl SqliteStorage {
         })
         .await
         .map_err(|e| format!("SQLite write task join: {e}"))?
+    }
+
+    pub fn backup_to_file(src_path: &Path, dst_path: &Path) -> Result<u64, String> {
+        if !src_path.is_file() {
+            return Err(format!("Source SQLite database not found: {}", src_path.display()));
+        }
+        if dst_path.as_os_str().is_empty() {
+            return Err("Backup destination path cannot be empty".into());
+        }
+        if let Some(parent) = dst_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed creating backup directory: {e}"))?;
+            }
+        }
+        let canon_src = std::fs::canonicalize(src_path).map_err(|e| e.to_string())?;
+        if let Ok(canon_dst) = std::fs::canonicalize(dst_path) {
+            if canon_dst == canon_src {
+                return Err("Backup destination cannot match active database file".into());
+            }
+        } else if let (Some(dst_parent), Some(dst_name), Some(src_parent), Some(src_name)) = (
+            dst_path.parent().and_then(|p| {
+                let eff = if p.as_os_str().is_empty() { Path::new(".") } else { p };
+                std::fs::canonicalize(eff).ok()
+            }),
+            dst_path.file_name(),
+            canon_src.parent(),
+            canon_src.file_name(),
+        ) {
+            if dst_parent == src_parent && dst_name == src_name {
+                return Err("Backup destination cannot match active database file".into());
+            }
+        }
+
+        let tmp_name = format!(
+            ".{}.tmp.{}",
+            dst_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("bugfinder_backup"),
+            std::process::id()
+        );
+        let tmp_path = match dst_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.join(tmp_name),
+            _ => PathBuf::from(tmp_name),
+        };
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let src_conn = Connection::open_with_flags(
+            &canon_src,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("Open source SQLite for backup: {e}"))?;
+        let _ = src_conn.execute_batch("PRAGMA busy_timeout = 5000;");
+
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .map_err(|e| format!("Pre-create backup temp file: {e}"))?;
+            }
+            let mut dst_conn = Connection::open(&tmp_path)
+                .map_err(|e| format!("Open destination backup DB: {e}"))?;
+            let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+                .map_err(|e| format!("Init SQLite backup: {e}"))?;
+            backup
+                .run_to_completion(128, std::time::Duration::from_millis(10), None)
+                .map_err(|e| format!("Execute SQLite online backup: {e}"))?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        std::fs::rename(&tmp_path, dst_path)
+            .map_err(|e| format!("Atomic rename backup failed: {e}"))?;
+        let bytes = std::fs::metadata(dst_path).map(|m| m.len()).unwrap_or(0);
+        Ok(bytes)
     }
 
     fn should_sample_storm(
@@ -395,46 +485,53 @@ fn insert_event_in_txn(
     payload_json: &[u8],
     received_ms: i64,
     store_full_blob: bool,
+    coalesce_aggregates: bool,
 ) -> Result<(i64, String, bool, bool), String> {
-    if auth.first_event_at.is_none() {
-        tx.execute(
-            "UPDATE projects SET first_event_at = ?1 WHERE id = ?2 AND organization_id = ?3 AND first_event_at IS NULL",
-            params![received_ms, auth.project_id, auth.organization_id],
-        )
-        .map_err(map_sqlite_err)?;
-    }
+    if !coalesce_aggregates {
+        if auth.first_event_at.is_none() {
+            let mut st = tx
+                .prepare_cached("UPDATE projects SET first_event_at = ?1 WHERE id = ?2 AND organization_id = ?3 AND first_event_at IS NULL")
+                .map_err(map_sqlite_err)?;
+            st.execute(params![received_ms, auth.project_id, auth.organization_id])
+                .map_err(map_sqlite_err)?;
+        }
 
-    if let Some(rel) = &meta.release {
-        tx.execute(
-            "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(project_id, version) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
-            params![auth.organization_id, auth.project_id, rel, received_ms],
-        )
-        .map_err(map_sqlite_err)?;
+        if let Some(rel) = &meta.release {
+            let mut st = tx
+                .prepare_cached(
+                    "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?4)
+                     ON CONFLICT(project_id, version) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
+                )
+                .map_err(map_sqlite_err)?;
+            st.execute(params![auth.organization_id, auth.project_id, rel, received_ms])
+                .map_err(map_sqlite_err)?;
+        }
     }
 
     // Deduplicate event_id safely
-    let dup: Option<String> = tx
-        .query_row(
-            "SELECT id FROM issue_events WHERE project_id = ?1 AND event_id = ?2",
-            params![auth.project_id, meta.event_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(map_sqlite_err)?;
+    let dup: Option<String> = {
+        let mut st = tx
+            .prepare_cached("SELECT id FROM issue_events WHERE project_id = ?1 AND event_id = ?2")
+            .map_err(map_sqlite_err)?;
+        st.query_row(params![auth.project_id, meta.event_id], |r| r.get(0))
+            .optional()
+            .map_err(map_sqlite_err)?
+    };
     if dup.is_some() {
         return Ok((0, String::new(), false, false));
     }
 
-    let existing: Option<(i64, String, String, Option<String>)> = tx
-        .query_row(
-            "SELECT id, short_id, status, resolved_in_release FROM issues WHERE project_id = ?1 AND fingerprint = ?2",
-            params![auth.project_id, meta.fingerprint],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
+    let existing: Option<(i64, String, String, Option<String>)> = {
+        let mut st = tx
+            .prepare_cached("SELECT id, short_id, status, resolved_in_release FROM issues WHERE project_id = ?1 AND fingerprint = ?2")
+            .map_err(map_sqlite_err)?;
+        st.query_row(params![auth.project_id, meta.fingerprint], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .optional()
-        .map_err(map_sqlite_err)?;
+        .map_err(map_sqlite_err)?
+    };
 
     let (issue_id, short_id, is_new, is_regression) = match existing {
         Some((id, short_id, status_str, resolved_in_release)) => {
@@ -447,35 +544,37 @@ fn insert_event_in_txn(
             let new_status = if reopen { "unresolved" } else { status.as_str() };
             let reg_flag = if reopen { 1 } else { 0 };
 
-            tx.execute(
-                "UPDATE issues
-                 SET event_count = event_count + 1,
-                     last_seen = MAX(last_seen, ?1),
-                     last_release = COALESCE(?2, last_release),
-                     status = ?3,
-                     is_regression = CASE WHEN ?4 = 1 THEN 1 ELSE is_regression END
-                 WHERE id = ?5 AND organization_id = ?6",
-                params![
-                    received_ms,
-                    meta.release,
-                    new_status,
-                    reg_flag,
-                    id,
-                    auth.organization_id
-                ],
-            )
+            let mut st = tx
+                .prepare_cached(
+                    "UPDATE issues
+                     SET event_count = event_count + 1,
+                         last_seen = MAX(last_seen, ?1),
+                         last_release = COALESCE(?2, last_release),
+                         status = ?3,
+                         is_regression = CASE WHEN ?4 = 1 THEN 1 ELSE is_regression END
+                     WHERE id = ?5 AND organization_id = ?6",
+                )
+                .map_err(map_sqlite_err)?;
+            st.execute(params![
+                received_ms,
+                meta.release,
+                new_status,
+                reg_flag,
+                id,
+                auth.organization_id
+            ])
             .map_err(map_sqlite_err)?;
 
             (id, short_id, false, reopen)
         }
         None => {
-            let short_num: i64 = tx
-                .query_row(
-                    "UPDATE projects SET next_short_num = next_short_num + 1 WHERE id = ?1 AND organization_id = ?2 RETURNING next_short_num - 1",
-                    params![auth.project_id, auth.organization_id],
-                    |r| r.get(0),
-                )
-                .map_err(map_sqlite_err)?;
+            let short_num: i64 = {
+                let mut st = tx
+                    .prepare_cached("UPDATE projects SET next_short_num = next_short_num + 1 WHERE id = ?1 AND organization_id = ?2 RETURNING next_short_num - 1")
+                    .map_err(map_sqlite_err)?;
+                st.query_row(params![auth.project_id, auth.organization_id], |r| r.get(0))
+                    .map_err(map_sqlite_err)?
+            };
             let short_id = format_short_id(&auth.project_slug, short_num.max(1) as u64);
             let metadata_json = serde_json::to_string(&json!({
                 "title": meta.title,
@@ -483,14 +582,18 @@ fn insert_event_in_txn(
             }))
             .unwrap_or_else(|_| "{}".into());
 
-            tx.execute(
-                "INSERT INTO issues (
-                    organization_id, project_id, short_id, short_num, fingerprint,
-                    title, culprit, level, issue_type, status, is_regression,
-                    first_seen, last_seen, event_count, user_count,
-                    first_release, last_release, environment, metadata_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unresolved', 0, ?10, ?10, 1, 0, ?11, ?11, ?12, ?13)",
-                params![
+            {
+                let mut st = tx
+                    .prepare_cached(
+                        "INSERT INTO issues (
+                            organization_id, project_id, short_id, short_num, fingerprint,
+                            title, culprit, level, issue_type, status, is_regression,
+                            first_seen, last_seen, event_count, user_count,
+                            first_release, last_release, environment, metadata_json
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unresolved', 0, ?10, ?10, 1, 0, ?11, ?11, ?12, ?13)",
+                    )
+                    .map_err(map_sqlite_err)?;
+                st.execute(params![
                     auth.organization_id,
                     auth.project_id,
                     short_id,
@@ -504,40 +607,42 @@ fn insert_event_in_txn(
                     meta.release,
                     meta.environment,
                     metadata_json
-                ],
-            )
-            .map_err(map_sqlite_err)?;
+                ])
+                .map_err(map_sqlite_err)?;
+            }
             let id = tx.last_insert_rowid();
 
-            tx.execute(
-                "INSERT INTO issues_fts (title, culprit, search_text, issue_id, organization_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            {
+                let mut st = tx
+                    .prepare_cached("INSERT INTO issues_fts (title, culprit, search_text, issue_id, organization_id) VALUES (?1, ?2, ?3, ?4, ?5)")
+                    .map_err(map_sqlite_err)?;
+                st.execute(params![
                     meta.title,
                     meta.culprit,
                     meta.search_text,
                     id,
                     auth.organization_id
-                ],
-            )
-            .map_err(map_sqlite_err)?;
+                ])
+                .map_err(map_sqlite_err)?;
+            }
 
             (id, short_id, true, false)
         }
     };
 
     if let Some(uh) = &meta.user_hash {
-        let changed = tx
-            .execute(
-                "INSERT OR IGNORE INTO issue_users (issue_id, user_hash) VALUES (?1, ?2)",
-                params![issue_id, uh],
-            )
-            .map_err(map_sqlite_err)?;
+        let changed = {
+            let mut st = tx
+                .prepare_cached("INSERT OR IGNORE INTO issue_users (issue_id, user_hash) VALUES (?1, ?2)")
+                .map_err(map_sqlite_err)?;
+            st.execute(params![issue_id, uh]).map_err(map_sqlite_err)?
+        };
         if changed > 0 {
-            tx.execute(
-                "UPDATE issues SET user_count = user_count + 1 WHERE id = ?1 AND organization_id = ?2",
-                params![issue_id, auth.organization_id],
-            )
-            .map_err(map_sqlite_err)?;
+            let mut st = tx
+                .prepare_cached("UPDATE issues SET user_count = user_count + 1 WHERE id = ?1 AND organization_id = ?2")
+                .map_err(map_sqlite_err)?;
+            st.execute(params![issue_id, auth.organization_id])
+                .map_err(map_sqlite_err)?;
         }
     }
 
@@ -545,41 +650,47 @@ fn insert_event_in_txn(
         let row_uuid = new_uuid_v7_from_ms(received_ms);
         let tags_str = serde_json::to_string(&meta.tags).unwrap_or_else(|_| "{}".into());
         let (blob, compressed) = compress_payload_if_large(payload_json);
-        tx.execute(
-            "INSERT OR IGNORE INTO issue_events (
-                id, organization_id, project_id, issue_id, event_id, timestamp_ms,
-                level, environment, release, trace_id, span_id, user_hash, tags_json,
-                payload_blob, payload_compressed
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                row_uuid,
-                auth.organization_id,
-                auth.project_id,
-                issue_id,
-                meta.event_id,
-                received_ms,
-                meta.level,
-                meta.environment,
-                meta.release,
-                meta.trace_id,
-                meta.span_id,
-                meta.user_hash,
-                tags_str,
-                blob,
-                if compressed { 1 } else { 0 }
-            ],
-        )
+        let mut st = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO issue_events (
+                    id, organization_id, project_id, issue_id, event_id, timestamp_ms,
+                    level, environment, release, trace_id, span_id, user_hash, tags_json,
+                    payload_blob, payload_compressed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            )
+            .map_err(map_sqlite_err)?;
+        st.execute(params![
+            row_uuid,
+            auth.organization_id,
+            auth.project_id,
+            issue_id,
+            meta.event_id,
+            received_ms,
+            meta.level,
+            meta.environment,
+            meta.release,
+            meta.trace_id,
+            meta.span_id,
+            meta.user_hash,
+            tags_str,
+            blob,
+            if compressed { 1 } else { 0 }
+        ])
         .map_err(map_sqlite_err)?;
     }
 
-    let bucket_hour = (received_ms / 3_600_000) * 3_600_000;
-    tx.execute(
-        "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
-         VALUES (?1, ?2, ?3, 'error', 1)
-         ON CONFLICT(project_id, bucket_hour, category) DO UPDATE SET quantity = quantity + 1",
-        params![auth.organization_id, auth.project_id, bucket_hour],
-    )
-    .map_err(map_sqlite_err)?;
+    if !coalesce_aggregates {
+        let bucket_hour = (received_ms / 3_600_000) * 3_600_000;
+        let mut st = tx
+            .prepare_cached(
+                "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
+                 VALUES (?1, ?2, ?3, 'error', 1)
+                 ON CONFLICT(project_id, bucket_hour, category) DO UPDATE SET quantity = quantity + 1",
+            )
+            .map_err(map_sqlite_err)?;
+        st.execute(params![auth.organization_id, auth.project_id, bucket_hour])
+            .map_err(map_sqlite_err)?;
+    }
 
     Ok((issue_id, short_id, is_new, is_regression))
 }
@@ -904,9 +1015,9 @@ impl StorageBackend for SqliteStorage {
         let slug_filter = org_slug.map(ToString::to_string);
         let found: Option<(TenantCtx, Option<i64>)> = self
             .read(move |conn| {
-                let row = conn
-                    .query_row(
-                        "SELECT t.organization_id, o.slug, t.user_id, t.role, m.role, t.scopes, t.last_used_at
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT t.organization_id, o.slug, t.user_id, t.role, m.role, t.scopes, t.last_used_at, t.expires_at
                          FROM api_tokens t
                          JOIN organizations o ON o.id = t.organization_id
                          JOIN users u ON u.id = t.user_id
@@ -914,25 +1025,28 @@ impl StorageBackend for SqliteStorage {
                          WHERE t.token_sha256 = ?1
                            AND u.is_active = 1
                            AND (t.expires_at IS NULL OR t.expires_at > ?2)",
-                        params![sha, now_sec],
-                        |r| {
-                            let tok_role = UserRole::from_db(&r.get::<_, String>(3)?).unwrap_or(UserRole::Viewer);
-                            let mem_role = UserRole::from_db(&r.get::<_, String>(4)?).unwrap_or(UserRole::Viewer);
-                            let eff_role = mem_role.min_role(tok_role);
-                            let raw_scopes: String = r.get(5)?;
-                            let lu: Option<i64> = r.get(6)?;
-                            Ok((
-                                TenantCtx::from_token(
-                                    r.get(0)?,
-                                    r.get(1)?,
-                                    r.get(2)?,
-                                    eff_role,
-                                    &raw_scopes,
-                                ),
-                                lu,
-                            ))
-                        },
                     )
+                    .map_err(map_sqlite_err)?;
+                let row = stmt
+                    .query_row(params![sha, now_sec], |r| {
+                        let tok_role = UserRole::from_db(&r.get::<_, String>(3)?).unwrap_or(UserRole::Viewer);
+                        let mem_role = UserRole::from_db(&r.get::<_, String>(4)?).unwrap_or(UserRole::Viewer);
+                        let eff_role = mem_role.min_role(tok_role);
+                        let raw_scopes: String = r.get(5)?;
+                        let lu: Option<i64> = r.get(6)?;
+                        let exp: Option<i64> = r.get(7)?;
+                        Ok((
+                            TenantCtx::from_token(
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                eff_role,
+                                &raw_scopes,
+                            )
+                            .with_token_expires_at(exp),
+                            lu,
+                        ))
+                    })
                     .optional()
                     .map_err(map_sqlite_err)?;
                 if let (Some((ref ctx, _)), Some(ref want_slug)) = (&row, &slug_filter) {
@@ -965,14 +1079,16 @@ impl StorageBackend for SqliteStorage {
     async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
         let sha = key_sha256.to_string();
         self.read(move |conn| {
-            conn.query_row(
-                "SELECT p.id, p.organization_id, o.slug, p.slug, p.first_event_at, k.rate_limit_per_min, p.filters_json, o.settings_json
-                 FROM project_keys k
-                 JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id
-                 JOIN organizations o ON o.id = p.organization_id
-                 WHERE k.project_id = ?1 AND k.key_sha256 = ?2 AND k.is_active = 1",
-                params![project_id, sha],
-                |r| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT p.id, p.organization_id, o.slug, p.slug, p.first_event_at, k.rate_limit_per_min, p.filters_json, o.settings_json
+                     FROM project_keys k
+                     JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id
+                     JOIN organizations o ON o.id = p.organization_id
+                     WHERE k.project_id = ?1 AND k.key_sha256 = ?2 AND k.is_active = 1",
+                )
+                .map_err(map_sqlite_err)?;
+            stmt.query_row(params![project_id, sha], |r| {
                     let fjson: String = r.get(6)?;
                     let sjson: String = r.get(7)?;
                     let filters = serde_json::from_str(&fjson).unwrap_or_default();
@@ -1388,7 +1504,39 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_issues(&self, ctx: &TenantCtx, params_in: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64), String> {
+    async fn issues_etag_watermark(&self, ctx: &TenantCtx, project_id: Option<i64>) -> Result<(i64, i64), String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT COUNT(*),
+                            COALESCE(MAX(last_seen), 0),
+                            COALESCE(SUM(event_count), 0),
+                            COALESCE(SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END), 0),
+                            COALESCE(SUM(CASE WHEN status = 'ignored' THEN 1 ELSE 0 END), 0)
+                     FROM issues
+                     WHERE organization_id = ?1 AND (?2 IS NULL OR project_id = ?2)",
+                )
+                .map_err(map_sqlite_err)?;
+            stmt.query_row(params![org_id, project_id], |r| {
+                let cnt: i64 = r.get(0)?;
+                let max_ls: i64 = r.get(1)?;
+                let sum_ev: i64 = r.get(2)?;
+                let res_cnt: i64 = r.get(3)?;
+                let ign_cnt: i64 = r.get(4)?;
+                let sig = if cnt == 0 {
+                    0
+                } else {
+                    crate::storage::compute_issues_watermark_sig(max_ls, sum_ev, res_cnt, ign_cnt)
+                };
+                Ok((cnt, sig))
+            })
+            .map_err(map_sqlite_err)
+        })
+        .await
+    }
+
+    async fn list_issues(&self, ctx: &TenantCtx, params_in: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64, i64), String> {
         let org_id = ctx.organization_id;
         let org_slug = ctx.organization_slug.clone();
         let p = params_in.clone();
@@ -1398,7 +1546,12 @@ impl StorageBackend for SqliteStorage {
                 "SELECT i.id, i.short_id, i.project_id, pr.slug, i.title, i.culprit, i.level,
                         i.issue_type, i.status, i.is_regression, i.resolved_in_release,
                         i.first_seen, i.last_seen, i.event_count, i.user_count,
-                        i.first_release, i.last_release, i.environment, i.metadata_json
+                        i.first_release, i.last_release, i.environment, i.metadata_json,
+                        COUNT(*) OVER(),
+                        COALESCE(MAX(i.last_seen) OVER(), 0),
+                        COALESCE(SUM(i.event_count) OVER(), 0),
+                        COALESCE(SUM(CASE WHEN i.status = 'resolved' THEN 1 ELSE 0 END) OVER(), 0),
+                        COALESCE(SUM(CASE WHEN i.status = 'ignored' THEN 1 ELSE 0 END) OVER(), 0)
                  FROM issues i
                  JOIN projects pr ON pr.id = i.project_id
                  WHERE i.organization_id = ?1",
@@ -1462,45 +1615,72 @@ impl StorageBackend for SqliteStorage {
             let offset = p.offset.clamp(0, 100_000);
             sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
 
-            let total: i64 = conn
-                .query_row(&count_sql, rusqlite::params_from_iter(bind_vals.iter()), |r| r.get(0))
-                .map_err(map_sqlite_err)?;
-
-            let mut stmt = conn.prepare(&sql).map_err(map_sqlite_err)?;
+            let mut stmt = conn.prepare_cached(&sql).map_err(map_sqlite_err)?;
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
                     let id: i64 = r.get(0)?;
                     let meta_str: String = r.get(18)?;
-                    Ok(IssueSummaryDto {
-                        id,
-                        short_id: r.get(1)?,
-                        project_id: r.get(2)?,
-                        project_slug: r.get(3)?,
-                        title: r.get(4)?,
-                        culprit: r.get(5)?,
-                        level: r.get(6)?,
-                        issue_type: r.get(7)?,
-                        status: r.get(8)?,
-                        is_regression: r.get::<_, i64>(9)? != 0,
-                        resolved_in_release: r.get(10)?,
-                        first_seen: iso_from_ms(r.get(11)?),
-                        last_seen: iso_from_ms(r.get(12)?),
-                        count: r.get(13)?,
-                        user_count: r.get(14)?,
-                        first_release: r.get(15)?,
-                        last_release: r.get(16)?,
-                        environment: r.get(17)?,
-                        permalink: format!("/{org_slug}/issues/{id}"),
-                        metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                    })
+                    let total_hits: i64 = r.get(19)?;
+                    let max_ls: i64 = r.get(20)?;
+                    let sum_ev: i64 = r.get(21)?;
+                    let res_cnt: i64 = r.get(22)?;
+                    let ign_cnt: i64 = r.get(23)?;
+                    let sig = if total_hits == 0 {
+                        0
+                    } else {
+                        crate::storage::compute_issues_watermark_sig(max_ls, sum_ev, res_cnt, ign_cnt)
+                    };
+                    Ok((
+                        IssueSummaryDto {
+                            id,
+                            short_id: r.get(1)?,
+                            project_id: r.get(2)?,
+                            project_slug: r.get(3)?,
+                            title: r.get(4)?,
+                            culprit: r.get(5)?,
+                            level: r.get(6)?,
+                            issue_type: r.get(7)?,
+                            status: r.get(8)?,
+                            is_regression: r.get::<_, i64>(9)? != 0,
+                            resolved_in_release: r.get(10)?,
+                            first_seen: iso_from_ms(r.get(11)?),
+                            last_seen: iso_from_ms(r.get(12)?),
+                            count: r.get(13)?,
+                            user_count: r.get(14)?,
+                            first_release: r.get(15)?,
+                            last_release: r.get(16)?,
+                            environment: r.get(17)?,
+                            permalink: format!("/{org_slug}/issues/{id}"),
+                            metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+                        },
+                        total_hits,
+                        sig,
+                    ))
                 })
                 .map_err(map_sqlite_err)?;
 
             let mut out = Vec::new();
+            let mut total_opt: Option<i64> = None;
+            let mut sig: i64 = 0;
             for row in rows {
-                out.push(row.map_err(map_sqlite_err)?);
+                let (dto, tot, s) = row.map_err(map_sqlite_err)?;
+                if total_opt.is_none() {
+                    total_opt = Some(tot);
+                    sig = s;
+                }
+                out.push(dto);
             }
-            Ok((out, total))
+            let total = match total_opt {
+                Some(t) => t,
+                None if offset > 0 => {
+                    let mut cnt_stmt = conn.prepare_cached(&count_sql).map_err(map_sqlite_err)?;
+                    cnt_stmt
+                        .query_row(rusqlite::params_from_iter(bind_vals.iter()), |r| r.get(0))
+                        .map_err(map_sqlite_err)?
+                }
+                None => 0,
+            };
+            Ok((out, total, sig))
         })
         .await
     }
@@ -2924,6 +3104,10 @@ impl StorageBackend for SqliteStorage {
             let tx = guard.transaction().map_err(map_sqlite_err)?;
             let now_sec = chrono::Utc::now().timestamp();
             let mut alert_jobs = Vec::new();
+            let mut first_event_proj: HashMap<(i64, i64), i64> = HashMap::new(); // (org_id, proj_id) -> min ts
+            let mut releases_map: HashMap<(i64, i64, String), i64> = HashMap::new();
+            let mut hourly_map: HashMap<(i64, i64, i64, &'static str), i64> = HashMap::new();
+            let mut log_res_map: HashMap<(i64, &'static str, String), i64> = HashMap::new();
 
             for item in items {
                 match item {
@@ -2942,8 +3126,26 @@ impl StorageBackend for SqliteStorage {
                             &payload_json,
                             received_ms,
                             store_blob,
+                            true,
                         )?;
                         if issue_id > 0 {
+                            if auth.first_event_at.is_none() {
+                                first_event_proj
+                                    .entry((auth.organization_id, auth.project_id))
+                                    .and_modify(|ts| *ts = (*ts).min(received_ms))
+                                    .or_insert(received_ms);
+                            }
+                            if let Some(ref rel) = meta.release {
+                                releases_map
+                                    .entry((auth.organization_id, auth.project_id, rel.clone()))
+                                    .and_modify(|ts| *ts = (*ts).max(received_ms))
+                                    .or_insert(received_ms);
+                            }
+                            let bh = (received_ms / 3_600_000) * 3_600_000;
+                            *hourly_map
+                                .entry((auth.organization_id, auth.project_id, bh, "error"))
+                                .or_insert(0) += 1;
+
                             let jobs = build_alert_jobs_for_event(
                                 &tx,
                                 &app_key,
@@ -2964,12 +3166,16 @@ impl StorageBackend for SqliteStorage {
                         for l in logs {
                             let row_id = new_uuid_v7_from_ms(l.timestamp_ms);
                             let attr_str = serde_json::to_string(&l.attributes).unwrap_or_else(|_| "{}".into());
-                            tx.execute(
-                                "INSERT INTO log_events (
-                                    id, organization_id, project_id, timestamp_ms, level_num, severity_number,
-                                    body, service, environment, host, trace_id, span_id, attributes_json
-                                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                                params![
+                            {
+                                let mut st = tx
+                                    .prepare_cached(
+                                        "INSERT INTO log_events (
+                                            id, organization_id, project_id, timestamp_ms, level_num, severity_number,
+                                            body, service, environment, host, trace_id, span_id, attributes_json
+                                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                    )
+                                    .map_err(map_sqlite_err)?;
+                                st.execute(params![
                                     row_id,
                                     organization_id,
                                     project_id,
@@ -2983,36 +3189,33 @@ impl StorageBackend for SqliteStorage {
                                     l.trace_id,
                                     l.span_id,
                                     attr_str,
-                                ],
-                            )
-                            .map_err(map_sqlite_err)?;
+                                ])
+                                .map_err(map_sqlite_err)?;
+                            }
 
-                            tx.execute(
-                                "INSERT INTO logs_fts (body, service, host, log_id, organization_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                params![l.body, l.service, l.host, row_id, organization_id],
-                            )
-                            .map_err(map_sqlite_err)?;
+                            {
+                                let mut st = tx
+                                    .prepare_cached(
+                                        "INSERT INTO logs_fts (body, service, host, log_id, organization_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                    )
+                                    .map_err(map_sqlite_err)?;
+                                st.execute(params![l.body, l.service, l.host, row_id, organization_id])
+                                    .map_err(map_sqlite_err)?;
+                            }
 
                             for (rtype, val) in [("service", &l.service), ("environment", &l.environment), ("host", &l.host)] {
                                 if !val.is_empty() {
-                                    tx.execute(
-                                        "INSERT INTO log_resources (organization_id, resource_type, name, last_seen)
-                                         VALUES (?1, ?2, ?3, ?4)
-                                         ON CONFLICT(organization_id, resource_type, name) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
-                                        params![organization_id, rtype, val, l.timestamp_ms],
-                                    )
-                                    .map_err(map_sqlite_err)?;
+                                    log_res_map
+                                        .entry((organization_id, rtype, val.clone()))
+                                        .and_modify(|ts| *ts = (*ts).max(l.timestamp_ms))
+                                        .or_insert(l.timestamp_ms);
                                 }
                             }
 
                             let bucket_hour = (l.timestamp_ms / 3_600_000) * 3_600_000;
-                            tx.execute(
-                                "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
-                                 VALUES (?1, ?2, ?3, 'log', 1)
-                                 ON CONFLICT(project_id, bucket_hour, category) DO UPDATE SET quantity = quantity + 1",
-                                params![organization_id, project_id, bucket_hour],
-                            )
-                            .map_err(map_sqlite_err)?;
+                            *hourly_map
+                                .entry((organization_id, project_id, bucket_hour, "log"))
+                                .or_insert(0) += 1;
 
                             // Auto-promote fatal/error logs into trackable Issues if enabled on project
                             let mut fatal_alert_checked = false;
@@ -3047,8 +3250,13 @@ impl StorageBackend for SqliteStorage {
                                         &bytes,
                                         l.timestamp_ms,
                                         true,
+                                        true,
                                     )?;
                                     if issue_id > 0 {
+                                        let bh_err = (l.timestamp_ms / 3_600_000) * 3_600_000;
+                                        *hourly_map
+                                            .entry((organization_id, project_id, bh_err, "error"))
+                                            .or_insert(0) += 1;
                                         let jobs = build_alert_jobs_for_event(
                                             &tx,
                                             &app_key,
@@ -3088,35 +3296,32 @@ impl StorageBackend for SqliteStorage {
                     IngestWriteItem::Transaction { organization_id, project_id, tx: tr } => {
                         let id = new_uuid_v7_from_ms(tr.timestamp_ms);
                         let spans_s = serde_json::to_string(&tr.spans).unwrap_or_else(|_| "[]".into());
-                        tx.execute(
-                            "INSERT INTO transaction_events (
-                                id, organization_id, project_id, name, op, status, duration_ms,
-                                trace_id, span_id, environment, release, spans_json, timestamp_ms
-                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                            params![
+                        {
+                            let mut st = tx
+                                .prepare_cached(
+                                    "INSERT INTO transaction_events (
+                                        id, organization_id, project_id, name, op, status, duration_ms,
+                                        trace_id, span_id, environment, release, spans_json, timestamp_ms
+                                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                )
+                                .map_err(map_sqlite_err)?;
+                            st.execute(params![
                                 id, organization_id, project_id, tr.name, tr.op, tr.status, tr.duration_ms,
                                 tr.trace_id, tr.span_id, tr.environment, tr.release, spans_s, tr.timestamp_ms
-                            ],
-                        )
-                        .map_err(map_sqlite_err)?;
+                            ])
+                            .map_err(map_sqlite_err)?;
+                        }
                         let bucket_hour = (tr.timestamp_ms / 3_600_000) * 3_600_000;
-                        tx.execute(
-                            "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
-                             VALUES (?1, ?2, ?3, 'transaction', 1)
-                             ON CONFLICT(project_id, bucket_hour, category) DO UPDATE SET quantity = quantity + 1",
-                            params![organization_id, project_id, bucket_hour],
-                        )
-                        .map_err(map_sqlite_err)?;
+                        *hourly_map
+                            .entry((organization_id, project_id, bucket_hour, "transaction"))
+                            .or_insert(0) += 1;
                     }
                     IngestWriteItem::Session { organization_id, project_id, session, received_ms } => {
                         let bucket_hour = (received_ms / 3_600_000) * 3_600_000;
-                        tx.execute(
-                            "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
-                             VALUES (?1, ?2, ?3, ?4, ?4)
-                             ON CONFLICT(project_id, version) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
-                            params![organization_id, project_id, session.release, received_ms],
-                        )
-                        .map_err(map_sqlite_err)?;
+                        releases_map
+                            .entry((organization_id, project_id, session.release.clone()))
+                            .and_modify(|ts| *ts = (*ts).max(received_ms))
+                            .or_insert(received_ms);
 
                         let (h, e, c, a) = match session.status.as_str() {
                             "crashed" => (0, 0, 1, 0),
@@ -3162,6 +3367,55 @@ impl StorageBackend for SqliteStorage {
                             .map_err(map_sqlite_err)?;
                         }
                     }
+                }
+            }
+
+            if !first_event_proj.is_empty() {
+                let mut st = tx
+                    .prepare_cached("UPDATE projects SET first_event_at = ?1 WHERE id = ?2 AND organization_id = ?3 AND first_event_at IS NULL")
+                    .map_err(map_sqlite_err)?;
+                for ((org_id, proj_id), first_ms) in first_event_proj {
+                    st.execute(params![first_ms, proj_id, org_id])
+                        .map_err(map_sqlite_err)?;
+                }
+            }
+            if !releases_map.is_empty() {
+                let mut st = tx
+                    .prepare_cached(
+                        "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
+                         VALUES (?1, ?2, ?3, ?4, ?4)
+                         ON CONFLICT(project_id, version) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
+                    )
+                    .map_err(map_sqlite_err)?;
+                for ((org_id, proj_id, ver), ts_ms) in releases_map {
+                    st.execute(params![org_id, proj_id, ver, ts_ms])
+                        .map_err(map_sqlite_err)?;
+                }
+            }
+            if !log_res_map.is_empty() {
+                let mut st = tx
+                    .prepare_cached(
+                        "INSERT INTO log_resources (organization_id, resource_type, name, last_seen)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(organization_id, resource_type, name) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
+                    )
+                    .map_err(map_sqlite_err)?;
+                for ((org_id, rtype, name), ts_ms) in log_res_map {
+                    st.execute(params![org_id, rtype, name, ts_ms])
+                        .map_err(map_sqlite_err)?;
+                }
+            }
+            if !hourly_map.is_empty() {
+                let mut st = tx
+                    .prepare_cached(
+                        "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(project_id, bucket_hour, category) DO UPDATE SET quantity = quantity + ?5",
+                    )
+                    .map_err(map_sqlite_err)?;
+                for ((org_id, proj_id, bh, cat), qty) in hourly_map {
+                    st.execute(params![org_id, proj_id, bh, cat, qty])
+                        .map_err(map_sqlite_err)?;
                 }
             }
 
@@ -3334,6 +3588,15 @@ impl StorageBackend for SqliteStorage {
             Ok(alerts)
         })
         .await
+    }
+
+    async fn shutdown_checkpoint(&self) {
+        let _ = self
+            .write(|conn| {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                Ok(())
+            })
+            .await;
     }
 
     async fn db_size_bytes(&self) -> u64 {

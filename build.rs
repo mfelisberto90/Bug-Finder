@@ -1,3 +1,5 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -10,6 +12,12 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn gzip_best(bytes: &[u8]) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::with_capacity(bytes.len() / 2), Compression::best());
+    enc.write_all(bytes).expect("gzip write");
+    enc.finish().expect("gzip finish")
 }
 
 fn collect_files(root: &Path, current: &Path, out: &mut Vec<(String, PathBuf)>) {
@@ -72,6 +80,12 @@ fn main() {
 
     let mut file = fs::File::create(&dest).expect("create embedded_ui.rs");
 
+    writeln!(
+        file,
+        "pub struct EmbeddedAsset {{\n    pub bytes: &'static [u8],\n    pub gzipped: bool,\n    pub content_type: &'static str,\n    pub etag: &'static str,\n}}"
+    )
+    .unwrap();
+
     if files.is_empty() {
         let fallback_html = br#"<!doctype html>
 <html lang="en">
@@ -86,29 +100,45 @@ fn main() {
 </body>
 </html>"#;
         let etag = fnv1a_hex(fallback_html);
-        writeln!(file, "pub fn get_asset(path: &str) -> Option<(&'static [u8], &'static str, &'static str)> {{").unwrap();
+        writeln!(file, "pub fn get_asset(path: &str) -> Option<EmbeddedAsset> {{").unwrap();
         writeln!(file, "    match path {{").unwrap();
         writeln!(
             file,
-            "        \"index.html\" => Some((&{:?}, \"text/html; charset=utf-8\", \"{}\")),",
+            "        \"index.html\" => Some(EmbeddedAsset {{ bytes: &{:?}, gzipped: false, content_type: \"text/html; charset=utf-8\", etag: \"{}\" }}),",
             fallback_html, etag
-        ).unwrap();
+        )
+        .unwrap();
         writeln!(file, "        _ => None,").unwrap();
         writeln!(file, "    }}").unwrap();
         writeln!(file, "}}").unwrap();
     } else {
-        writeln!(file, "pub fn get_asset(path: &str) -> Option<(&'static [u8], &'static str, &'static str)> {{").unwrap();
+        writeln!(file, "pub fn get_asset(path: &str) -> Option<EmbeddedAsset> {{").unwrap();
         writeln!(file, "    match path {{").unwrap();
-        for (rel, abs) in &files {
+        for (idx, (rel, abs)) in files.iter().enumerate() {
             let bytes = fs::read(abs).expect("read ui dist asset");
             let etag = fnv1a_hex(&bytes);
             let ct = content_type_for(rel);
-            let abs_str = abs.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+            let should_gzip = rel != "index.html"
+                && (rel.ends_with(".js")
+                    || rel.ends_with(".mjs")
+                    || rel.ends_with(".css")
+                    || rel.ends_with(".svg")
+                    || rel.ends_with(".json"));
+            let embed_path = if should_gzip {
+                let gz_bytes = gzip_best(&bytes);
+                let gz_file = out_dir.join(format!("embedded_asset_{idx}.gz"));
+                fs::write(&gz_file, gz_bytes).expect("write compressed asset");
+                gz_file
+            } else {
+                abs.clone()
+            };
+            let abs_str = embed_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
             writeln!(
                 file,
-                "        {:?} => Some((include_bytes!(\"{}\"), {:?}, {:?})),",
-                rel, abs_str, ct, etag
-            ).unwrap();
+                "        {:?} => Some(EmbeddedAsset {{ bytes: include_bytes!(\"{}\"), gzipped: {}, content_type: {:?}, etag: {:?} }}),",
+                rel, abs_str, should_gzip, ct, etag
+            )
+            .unwrap();
         }
         writeln!(file, "        _ => None,").unwrap();
         writeln!(file, "    }}").unwrap();
@@ -116,18 +146,28 @@ fn main() {
     }
 
     let mini_sdk_path = manifest_dir.join("sdks").join("browser").join("bugfinder-mini.js");
-    if mini_sdk_path.is_file() {
-        let abs_str = mini_sdk_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-        writeln!(file, "pub const MINI_SDK_JS: &[u8] = include_bytes!(\"{}\");", abs_str).unwrap();
+    let mini_raw = if mini_sdk_path.is_file() {
+        fs::read(&mini_sdk_path).expect("read bugfinder-mini.js")
     } else {
-        writeln!(file, "pub const MINI_SDK_JS: &[u8] = b\"/* BugFinder Mini SDK placeholder */\";").unwrap();
-    }
+        b"/* BugFinder Mini SDK placeholder */".to_vec()
+    };
+    let mini_etag = fnv1a_hex(&mini_raw);
+    let mini_gz_file = out_dir.join("mini_sdk.js.gz");
+    fs::write(&mini_gz_file, gzip_best(&mini_raw)).expect("write mini_sdk.js.gz");
+    let mini_gz_str = mini_gz_file.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    writeln!(file, "pub const MINI_SDK_JS_GZ: &[u8] = include_bytes!(\"{}\");", mini_gz_str).unwrap();
+    writeln!(file, "pub const MINI_SDK_ETAG: &str = {:?};", mini_etag).unwrap();
 
     let shield_sdk_path = manifest_dir.join("sdks").join("browser").join("bugfinder-shield.js");
-    if shield_sdk_path.is_file() {
-        let abs_str = shield_sdk_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-        writeln!(file, "pub const SHIELD_SDK_JS: &[u8] = include_bytes!(\"{}\");", abs_str).unwrap();
+    let shield_raw = if shield_sdk_path.is_file() {
+        fs::read(&shield_sdk_path).expect("read bugfinder-shield.js")
     } else {
-        writeln!(file, "pub const SHIELD_SDK_JS: &[u8] = b\"/* BugFinder Shield SDK placeholder */\";").unwrap();
-    }
+        b"/* BugFinder Shield SDK placeholder */".to_vec()
+    };
+    let shield_etag = fnv1a_hex(&shield_raw);
+    let shield_gz_file = out_dir.join("shield_sdk.js.gz");
+    fs::write(&shield_gz_file, gzip_best(&shield_raw)).expect("write shield_sdk.js.gz");
+    let shield_gz_str = shield_gz_file.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    writeln!(file, "pub const SHIELD_SDK_JS_GZ: &[u8] = include_bytes!(\"{}\");", shield_gz_str).unwrap();
+    writeln!(file, "pub const SHIELD_SDK_ETAG: &str = {:?};", shield_etag).unwrap();
 }

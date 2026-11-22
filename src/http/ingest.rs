@@ -125,8 +125,14 @@ async fn authenticate_project(
     if state.invalid_dsn_cache.is_blocked(project_id, &key_sha) {
         return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid DSN"));
     }
+    if let Some(info) = state.dsn_auth_cache.get(project_id, &key_sha) {
+        return Ok(info);
+    }
     match state.storage.resolve_dsn(project_id, &key_sha).await {
-        Ok(Some(info)) => Ok(info),
+        Ok(Some(info)) => {
+            state.dsn_auth_cache.insert(project_id, &key_sha, info.clone());
+            Ok(info)
+        }
         Ok(None) => {
             state.invalid_dsn_cache.mark_invalid(project_id, &key_sha);
             Err(error_response(StatusCode::UNAUTHORIZED, "Invalid DSN"))

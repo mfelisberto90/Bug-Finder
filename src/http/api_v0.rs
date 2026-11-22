@@ -18,11 +18,14 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use futures_util::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +42,96 @@ fn require_scope(ctx: &TenantCtx, scope: &str) -> Result<(), Response> {
         )
             .into_response())
     }
+}
+
+fn client_accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').any(|part| {
+        let mut it = part.trim().split(';');
+        let enc = it.next().unwrap_or("").trim();
+        if !enc.eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        !it.any(|p| p.trim().eq_ignore_ascii_case("q=0"))
+    })
+}
+
+fn fnv1a_u64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(raw) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',')
+        .map(str::trim)
+        .any(|tag| tag == etag || tag == "*")
+}
+
+fn json_bytes_response_maybe_gzip(headers: &HeaderMap, bytes: Vec<u8>) -> Response {
+    if bytes.len() > 2048 && client_accepts_gzip(headers) {
+        let mut enc = GzEncoder::new(Vec::with_capacity(bytes.len() / 3), Compression::fast());
+        if enc.write_all(&bytes).is_ok() {
+            if let Ok(gz) = enc.finish() {
+                let mut resp = (StatusCode::OK, gz).into_response();
+                resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                resp.headers_mut()
+                    .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                resp.headers_mut()
+                    .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+                return resp;
+            }
+        }
+    }
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    resp
+}
+
+fn json_response_maybe_gzip<T: serde::Serialize>(headers: &HeaderMap, value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => json_bytes_response_maybe_gzip(headers, bytes),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn is_valid_telegram_chat_id(raw: &str) -> bool {
+    if let Some(username) = raw.strip_prefix('@') {
+        let len = username.len();
+        return (5..=32).contains(&len)
+            && username.as_bytes()[0].is_ascii_alphabetic()
+            && username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    }
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    (5..=20).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn require_session_only(ctx: &TenantCtx) -> Result<(), Response> {
@@ -127,13 +220,18 @@ async fn authenticate_api_tenant(
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
     {
         let sha = sha256_hex(tok.trim().as_bytes());
-        let Some(c) = state
+        let c = if let Some(cached) = state.api_token_cache.get(&sha, org_slug_opt, now_sec) {
+            cached
+        } else if let Some(fresh) = state
             .storage
             .resolve_api_token(&sha, org_slug_opt, now_sec)
             .await
             .ok()
             .flatten()
-        else {
+        {
+            state.api_token_cache.insert(&sha, org_slug_opt, fresh.clone());
+            fresh
+        } else {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "Invalid or expired API token" })),
@@ -387,6 +485,7 @@ pub async fn update_project_settings(
     filters.event_throttle_rate = filters.event_throttle_rate.min(100);
     match state.storage.update_project_filters(&ctx, &proj, &filters).await {
         Ok(Some(dto)) => {
+            state.dsn_auth_cache.invalidate_project(dto.id);
             record_audit(
                 &state,
                 &ctx,
@@ -508,6 +607,7 @@ pub async fn update_project_key(
         Ok(Some(dto)) => {
             let key_sha = sha256_hex(dto.public_key.as_bytes());
             state.invalid_dsn_cache.invalidate(dto.project_id, &key_sha);
+            state.dsn_auth_cache.invalidate_project(dto.project_id);
             record_audit(
                 &state,
                 &ctx,
@@ -543,6 +643,7 @@ pub async fn delete_project_key(
     }
     match state.storage.delete_project_key(&ctx, &proj, key_id).await {
         Ok(true) => {
+            state.dsn_auth_cache.invalidate_org(ctx.organization_id);
             record_audit(
                 &state,
                 &ctx,
@@ -578,7 +679,10 @@ pub async fn enable_project_tunnel(
     }
     let slug = random_token_b64(10).to_ascii_lowercase();
     match state.storage.enable_project_tunnel(&ctx, &proj, &slug).await {
-        Ok(Some(s)) => Json(json!({ "tunnel_slug": s, "path": format!("/t/{s}") })).into_response(),
+        Ok(Some(s)) => {
+            state.dsn_auth_cache.invalidate_org(ctx.organization_id);
+            Json(json!({ "tunnel_slug": s, "path": format!("/t/{s}") })).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Project not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -661,9 +765,69 @@ pub async fn list_issues(
         return r;
     }
     let params = parse_issue_query(&query);
+    let unfiltered_first_page = params.status.is_none()
+        && params.level.is_none()
+        && params.environment.is_none()
+        && params.release.is_none()
+        && params.search_query.is_none()
+        && params.since_ms.is_none()
+        && params.offset == 0;
+
+    if unfiltered_first_page && headers.contains_key(header::IF_NONE_MATCH) {
+        if let Ok(wm) = state
+            .storage
+            .issues_etag_watermark(&ctx, params.project_id)
+            .await
+        {
+            let wm_etag = format!("W/\"u-{}-{}-{}-{}\"", wm.0, wm.1, params.sort, params.limit);
+            if etag_matches(&headers, &wm_etag) {
+                let mut resp = StatusCode::NOT_MODIFIED.into_response();
+                if let Ok(v) = HeaderValue::from_str(&wm_etag) {
+                    resp.headers_mut().insert(header::ETAG, v);
+                }
+                resp.headers_mut()
+                    .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+                if let Ok(v) = HeaderValue::from_str(&wm.0.to_string()) {
+                    resp.headers_mut().insert("x-hits", v);
+                }
+                return resp;
+            }
+        }
+    }
+
     match state.storage.list_issues(&ctx, &params).await {
-        Ok((items, total_hits)) => {
-            let mut resp = Json(items).into_response();
+        Ok((items, total_hits, wm_sig)) => {
+            let body_bytes = match serde_json::to_vec(&items) {
+                Ok(b) => b,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            let etag = if unfiltered_first_page {
+                format!("W/\"u-{total_hits}-{wm_sig}-{}-{}\"", params.sort, params.limit)
+            } else {
+                format!("W/\"f-{:016x}\"", fnv1a_u64(&body_bytes))
+            };
+            if etag_matches(&headers, &etag) {
+                let mut resp = StatusCode::NOT_MODIFIED.into_response();
+                if let Ok(v) = HeaderValue::from_str(&etag) {
+                    resp.headers_mut().insert(header::ETAG, v);
+                }
+                resp.headers_mut()
+                    .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+                if let Ok(v) = HeaderValue::from_str(&total_hits.to_string()) {
+                    resp.headers_mut().insert("x-hits", v);
+                }
+                return resp;
+            }
+            let mut resp = json_bytes_response_maybe_gzip(&headers, body_bytes);
+            if let Ok(v) = HeaderValue::from_str(&etag) {
+                resp.headers_mut().insert(header::ETAG, v);
+            }
             if let Ok(v) = HeaderValue::from_str(&total_hits.to_string()) {
                 resp.headers_mut().insert("x-hits", v);
             }
@@ -830,7 +994,7 @@ pub async fn export_issues_csv(
     }
     let mut params = parse_issue_query(&query);
     params.limit = 200;
-    let (items, _) = match state.storage.list_issues(&ctx, &params).await {
+    let (items, _, _) = match state.storage.list_issues(&ctx, &params).await {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     };
@@ -947,7 +1111,7 @@ pub async fn list_logs(
             .unwrap_or(100),
     };
     match state.storage.query_logs(&ctx, &params).await {
-        Ok(logs) => Json(logs).into_response(),
+        Ok(logs) => json_response_maybe_gzip(&headers, &logs),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -1070,7 +1234,7 @@ pub async fn list_transactions(
     let since = parse_stats_period_ms(query.get("statsPeriod").map(String::as_str))
         .unwrap_or_else(|| now_ms() - 86_400_000);
     match state.storage.list_transactions(&ctx, since).await {
-        Ok(list) => Json(list).into_response(),
+        Ok(list) => json_response_maybe_gzip(&headers, &list),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -1408,11 +1572,12 @@ pub async fn create_alert(
     }
     if !matches!(
         req.channel_type.as_str(),
-        "webhook" | "slack" | "discord" | "email"
+        "webhook" | "slack" | "discord" | "telegram" | "email"
     ) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid channel_type" }))).into_response();
     }
-    let target_url = req.target_url.unwrap_or_default();
+    let mut target_url = req.target_url.unwrap_or_default();
+    let webhook_secret = req.webhook_secret.unwrap_or_default().trim().to_string();
     let email_to = req.email_to.unwrap_or_default().trim().to_string();
     if req.channel_type == "email" {
         if email_to.is_empty()
@@ -1425,6 +1590,46 @@ pub async fn create_alert(
                 Json(json!({ "error": "Valid email_to address is required for email alerts" })),
             )
                 .into_response();
+        }
+    } else if req.channel_type == "telegram" {
+        if webhook_secret.is_empty()
+            || webhook_secret.len() > 256
+            || !webhook_secret.contains(':')
+            || !webhook_secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Valid Telegram Bot Token (webhook_secret) is required" })),
+            )
+                .into_response();
+        }
+        let trimmed_target = target_url.trim().to_string();
+        if trimmed_target.starts_with("https://") || trimmed_target.starts_with("http://") {
+            let allow_http = state.config.dev_allow_http_webhooks;
+            let t_copy = trimmed_target.clone();
+            let check_res = tokio::task::spawn_blocking(move || validate_webhook_url(&t_copy, allow_http))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| e.0));
+            if let Err(msg) = check_res {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+            }
+            target_url = trimmed_target;
+        } else {
+            let cid = trimmed_target
+                .strip_prefix("telegram:")
+                .unwrap_or(&trimmed_target)
+                .trim();
+            if !is_valid_telegram_chat_id(cid) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Telegram target_url must be a numeric Chat ID (e.g. -1001234567890), @channel username, or HTTPS proxy URL" })),
+                )
+                    .into_response();
+            }
+            target_url = format!("telegram:{cid}");
         }
     } else {
         let target_copy = target_url.clone();
@@ -1447,7 +1652,7 @@ pub async fn create_alert(
         cooldown_sec: req.cooldown_sec.unwrap_or(300).clamp(10, 86400),
         channel_type: req.channel_type,
         target_url,
-        webhook_secret: req.webhook_secret.unwrap_or_default(),
+        webhook_secret,
         email_to,
     };
     match state.storage.create_alert_rule(&ctx, &rule).await {
@@ -1702,6 +1907,7 @@ pub async fn delete_api_token(
     }
     match state.storage.delete_api_token(&ctx, token_id).await {
         Ok(true) => {
+            state.api_token_cache.invalidate_org(ctx.organization_id);
             record_audit(
                 &state,
                 &ctx,
@@ -1841,6 +2047,7 @@ pub async fn update_member_role(
     }
     match state.storage.update_member_role(&ctx, target_uid, target_role).await {
         Ok(Ok(dto)) => {
+            state.api_token_cache.invalidate_user(target_uid);
             record_audit(
                 &state,
                 &ctx,
@@ -1890,6 +2097,7 @@ pub async fn remove_member(
     }
     match state.storage.remove_member(&ctx, target_uid).await {
         Ok(Ok(true)) => {
+            state.api_token_cache.invalidate_user(target_uid);
             record_audit(
                 &state,
                 &ctx,
@@ -2370,6 +2578,7 @@ pub async fn update_org_security_settings(
         .await
     {
         Ok(updated) => {
+            state.dsn_auth_cache.invalidate_org(ctx.organization_id);
             record_audit(
                 &state,
                 &ctx,

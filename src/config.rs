@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     Serve { desktop_app: bool },
+    Migrate,
+    Backup { out_path: PathBuf },
     Doctor {
         url: Option<String>,
         json: bool,
@@ -150,6 +152,15 @@ pub struct SmtpConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub display_name: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_addr: String,
     pub data_dir: PathBuf,
@@ -169,7 +180,9 @@ pub struct AppConfig {
     pub desktop_app_mode: bool,
     pub dev_allow_http_webhooks: bool,
     pub anti_ptrace: bool,
+    pub skip_migrations: bool,
     pub smtp: Option<SmtpConfig>,
+    pub oidc: Option<OidcConfig>,
 }
 
 impl AppConfig {
@@ -298,6 +311,47 @@ impl AppConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let skip_migrations = env::var("BUGFINDER_SKIP_MIGRATIONS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let oidc_issuer = env::var("BUGFINDER_OIDC_ISSUER")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        let oidc_client_id = env::var("BUGFINDER_OIDC_CLIENT_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let oidc_client_secret = env::var("BUGFINDER_OIDC_CLIENT_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let oidc_display_name = env::var("BUGFINDER_OIDC_DISPLAY_NAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "SSO / OIDC".to_string());
+
+        let oidc = match (oidc_issuer, oidc_client_id, oidc_client_secret, &public_url) {
+            (Some(issuer), Some(client_id), Some(client_secret), Some(pub_url)) => {
+                if !is_dev && (!issuer.starts_with("https://") || !pub_url.starts_with("https://")) {
+                    return Err("BUGFINDER_OIDC_ISSUER and BUGFINDER_PUBLIC_URL must use https:// outside dev mode".into());
+                }
+                if !(issuer.starts_with("https://") || issuer.starts_with("http://")) {
+                    return Err("Invalid BUGFINDER_OIDC_ISSUER URL scheme".into());
+                }
+                Some(OidcConfig {
+                    issuer,
+                    client_id,
+                    client_secret,
+                    display_name: oidc_display_name,
+                    redirect_uri: format!("{}/api/auth/oidc/callback", pub_url.trim_end_matches('/')),
+                })
+            }
+            _ => None,
+        };
+
         let smtp = env::var("BUGFINDER_SMTP_HOST")
             .ok()
             .map(|h| h.trim().to_string())
@@ -340,7 +394,9 @@ impl AppConfig {
             desktop_app_mode,
             dev_allow_http_webhooks,
             anti_ptrace,
+            skip_migrations,
             smtp,
+            oidc,
         })
     }
 
@@ -462,6 +518,58 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
 
     if let Some(sub) = args.get(1).map(|s| s.as_str()) {
         match sub {
+            "migrate" => {
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--data" => {
+                            j += 1;
+                            data_override = Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
+                        }
+                        "--db" => {
+                            j += 1;
+                            db_override = Some(args.get(j).cloned().ok_or("--db requires a value")?);
+                        }
+                        other => return Err(format!("Unknown migrate option: {other}")),
+                    }
+                    j += 1;
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Migrate,
+                    bind_override: None,
+                    data_override,
+                    db_override,
+                });
+            }
+            "backup" => {
+                let mut out_path: Option<PathBuf> = None;
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--out" => {
+                            j += 1;
+                            out_path = Some(PathBuf::from(args.get(j).ok_or("--out requires a path")?));
+                        }
+                        "--data" => {
+                            j += 1;
+                            data_override = Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
+                        }
+                        "--db" => {
+                            j += 1;
+                            db_override = Some(args.get(j).cloned().ok_or("--db requires a value")?);
+                        }
+                        other => return Err(format!("Unknown backup option: {other}")),
+                    }
+                    j += 1;
+                }
+                let out_path = out_path.ok_or("backup requires --out <path>")?;
+                return Ok(ParsedArgs {
+                    command: CliCommand::Backup { out_path },
+                    bind_override: None,
+                    data_override,
+                    db_override,
+                });
+            }
             "doctor" => {
                 let mut url = None;
                 let mut json = false;

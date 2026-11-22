@@ -290,7 +290,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     threshold_count BIGINT NOT NULL DEFAULT 1,
     window_sec BIGINT NOT NULL DEFAULT 60,
     cooldown_sec BIGINT NOT NULL DEFAULT 300,
-    channel_type TEXT NOT NULL CHECK (channel_type IN ('webhook', 'slack', 'discord', 'email')),
+    channel_type TEXT NOT NULL CHECK (channel_type IN ('webhook', 'slack', 'discord', 'telegram', 'email')),
     target_url TEXT NOT NULL DEFAULT '',
     webhook_secret TEXT NOT NULL DEFAULT '',
     email_to TEXT NOT NULL DEFAULT '',
@@ -302,6 +302,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_trigger_type_check;
 ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_trigger_type_check
     CHECK (trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down', 'security_threat', 'secret_leak'));
+ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_channel_type_check;
+ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_channel_type_check
+    CHECK (channel_type IN ('webhook', 'slack', 'discord', 'telegram', 'email'));
 
 CREATE TABLE IF NOT EXISTS security_events (
     id BIGSERIAL PRIMARY KEY,
@@ -630,8 +633,16 @@ CREATE POLICY cap_invite ON invitation_lookup
     )
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
 
+CREATE TABLE IF NOT EXISTS bugfinder_schema_meta (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    schema_sha256 TEXT NOT NULL,
+    applied_at BIGINT NOT NULL
+);
+
 GRANT USAGE ON SCHEMA public TO bugfinder_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO bugfinder_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bugfinder_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO bugfinder_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO bugfinder_app;
+REVOKE INSERT, UPDATE, DELETE ON bugfinder_schema_meta FROM bugfinder_app;
+GRANT SELECT ON bugfinder_schema_meta TO bugfinder_app;

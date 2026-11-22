@@ -290,7 +290,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     threshold_count INTEGER NOT NULL DEFAULT 1,
     window_sec INTEGER NOT NULL DEFAULT 60,
     cooldown_sec INTEGER NOT NULL DEFAULT 300,
-    channel_type TEXT NOT NULL CHECK(channel_type IN ('webhook', 'slack', 'discord', 'email')),
+    channel_type TEXT NOT NULL CHECK(channel_type IN ('webhook', 'slack', 'discord', 'telegram', 'email')),
     target_url TEXT NOT NULL DEFAULT '',
     webhook_secret TEXT NOT NULL DEFAULT '',
     email_to TEXT NOT NULL DEFAULT '',

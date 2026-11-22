@@ -1,6 +1,7 @@
 use crate::domain::models::ProjectFilters;
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -285,22 +286,51 @@ impl Scrubber {
 
     pub fn scrub_string(&self, input: &str) -> String {
         let mut report = ScrubReport::default();
-        self.scrub_string_with_report(input, &mut report)
+        self.scrub_string_with_report(input, &mut report).into_owned()
     }
 
-    pub fn scrub_string_with_report(&self, input: &str, report: &mut ScrubReport) -> String {
-        let mut s = if input.contains('\0') {
-            input.replace('\0', "")
+    pub fn scrub_string_with_report<'a>(
+        &self,
+        input: &'a str,
+        report: &mut ScrubReport,
+    ) -> Cow<'a, str> {
+        let has_nul = input.contains('\0');
+        let has_pem = input.contains("PRIVATE KEY");
+        let has_auth_hdr = contains_ascii_ci(input.as_bytes(), b"bearer")
+            || contains_ascii_ci(input.as_bytes(), b"basic");
+        let has_jwt = input.contains("eyJ");
+        let has_prefixed = has_prefixed_secret_hint(input);
+        let has_url_creds = input.contains("://") && input.contains('@');
+        let has_query = input.contains('=') && (input.contains('?') || input.contains('&'));
+        let has_card_digits = input.bytes().filter(|b| b.is_ascii_digit()).count() >= 13;
+        let has_email = self.scrub_emails && input.contains('@');
+
+        if !(has_nul
+            || has_pem
+            || has_auth_hdr
+            || has_jwt
+            || has_prefixed
+            || has_url_creds
+            || has_query
+            || has_card_digits
+            || has_email)
+        {
+            return Cow::Borrowed(input);
+        }
+
+        let mut s: Cow<'a, str> = if has_nul {
+            Cow::Owned(input.replace('\0', ""))
         } else {
-            input.to_string()
+            Cow::Borrowed(input)
         };
 
         let rx = regexes();
         if s.contains("PRIVATE KEY") && rx.pem_block.is_match(&s) {
             report.push_unique("pem_private_key");
-            s = rx.pem_block.replace_all(&s, PLACEHOLDER).into_owned();
+            s = Cow::Owned(rx.pem_block.replace_all(&s, PLACEHOLDER).into_owned());
         }
-        if s.contains("Bearer ") || s.contains("bearer ") || s.contains("Basic ") || s.contains("basic ") {
+        if contains_ascii_ci(s.as_bytes(), b"bearer") || contains_ascii_ci(s.as_bytes(), b"basic")
+        {
             if rx.auth_header.is_match(&s) {
                 for cap in rx.auth_header.captures_iter(&s) {
                     if let Some(tok) = cap.get(2).map(|m| m.as_str()) {
@@ -310,14 +340,14 @@ impl Scrubber {
                         }
                     }
                 }
-                s = rx.auth_header.replace_all(&s, "$1 [Filtered]").into_owned();
+                s = Cow::Owned(rx.auth_header.replace_all(&s, "$1 [Filtered]").into_owned());
             }
         }
         if s.contains("eyJ") && rx.jwt.is_match(&s) {
             report.push_unique("jwt");
-            s = rx.jwt.replace_all(&s, PLACEHOLDER).into_owned();
+            s = Cow::Owned(rx.jwt.replace_all(&s, PLACEHOLDER).into_owned());
         }
-        if (s.contains('_') || s.contains('-')) && rx.prefixed_secret.is_match(&s) {
+        if has_prefixed_secret_hint(&s) && rx.prefixed_secret.is_match(&s) {
             for m in rx.prefixed_secret.find_iter(&s) {
                 let raw = m.as_str();
                 if !raw.starts_with("sk_test_") && !raw.starts_with("rk_test_") {
@@ -325,31 +355,45 @@ impl Scrubber {
                     break;
                 }
             }
-            s = rx.prefixed_secret.replace_all(&s, PLACEHOLDER).into_owned();
+            s = Cow::Owned(rx.prefixed_secret.replace_all(&s, PLACEHOLDER).into_owned());
         }
         if s.contains("://") && s.contains('@') && rx.url_credentials.is_match(&s) {
             report.push_unique("url_credentials");
-            s = rx.url_credentials.replace_all(&s, "$1[Filtered]:[Filtered]@").into_owned();
+            s = Cow::Owned(
+                rx.url_credentials
+                    .replace_all(&s, "$1[Filtered]:[Filtered]@")
+                    .into_owned(),
+            );
         }
-        if s.contains('=') && (s.contains('?') || s.contains('&')) {
-            s = rx.query_secret.replace_all(&s, "$1[Filtered]").into_owned();
+        if s.contains('=') && (s.contains('?') || s.contains('&')) && rx.query_secret.is_match(&s)
+        {
+            s = Cow::Owned(rx.query_secret.replace_all(&s, "$1[Filtered]").into_owned());
         }
         if s.bytes().filter(|b| b.is_ascii_digit()).count() >= 13 {
-            s = rx
+            let has_luhn = rx
                 .card_candidate
-                .replace_all(&s, |caps: &regex::Captures| {
-                    let m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                    if is_luhn_valid(m) {
-                        report.push_unique("luhn_card_pan");
-                        PLACEHOLDER.to_string()
-                    } else {
-                        m.to_string()
-                    }
-                })
-                .into_owned();
+                .find_iter(&s)
+                .any(|m| is_luhn_valid(m.as_str()));
+            if has_luhn {
+                let mut tmp = String::new();
+                std::mem::swap(&mut tmp, &mut s.to_mut());
+                let replaced = rx
+                    .card_candidate
+                    .replace_all(&tmp, |caps: &regex::Captures| {
+                        let m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                        if is_luhn_valid(m) {
+                            report.push_unique("luhn_card_pan");
+                            PLACEHOLDER.to_string()
+                        } else {
+                            m.to_string()
+                        }
+                    })
+                    .into_owned();
+                s = Cow::Owned(replaced);
+            }
         }
-        if self.scrub_emails && s.contains('@') {
-            s = rx.email.replace_all(&s, PLACEHOLDER).into_owned();
+        if self.scrub_emails && s.contains('@') && rx.email.is_match(&s) {
+            s = Cow::Owned(rx.email.replace_all(&s, PLACEHOLDER).into_owned());
         }
         s
     }
@@ -360,7 +404,9 @@ impl Scrubber {
         }
         match val {
             Value::String(s) => {
-                *s = self.scrub_string_with_report(s, report);
+                if let Cow::Owned(clean) = self.scrub_string_with_report(s, report) {
+                    *s = clean;
+                }
             }
             Value::Array(arr) => {
                 for item in arr.iter_mut() {
@@ -409,10 +455,14 @@ impl Scrubber {
             }
         }
         if let Some(Value::String(rel)) = obj.get_mut("release") {
-            *rel = rel.replace('\0', "");
+            if rel.contains('\0') {
+                *rel = rel.replace('\0', "");
+            }
         }
         if let Some(Value::String(env)) = obj.get_mut("environment") {
-            *env = env.replace('\0', "");
+            if env.contains('\0') {
+                *env = env.replace('\0', "");
+            }
         }
         report
     }
@@ -423,10 +473,37 @@ impl Scrubber {
 
     pub fn scrub_log_with_report(&self, body: &mut String, attrs: &mut Value) -> ScrubReport {
         let mut report = ScrubReport::default();
-        *body = self.scrub_string_with_report(body, &mut report);
+        if let Cow::Owned(clean) = self.scrub_string_with_report(body, &mut report) {
+            *body = clean;
+        }
         self.scrub_value(attrs, 0, &mut report);
         report
     }
+}
+
+fn contains_ascii_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
+    if hay.len() < needle_lower.len() {
+        return false;
+    }
+    hay.windows(needle_lower.len())
+        .any(|w| w.eq_ignore_ascii_case(needle_lower))
+}
+
+fn has_prefixed_secret_hint(s: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_",
+        "whsec_",
+        "ghp_",
+        "gho_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "bf_",
+    ];
+    (s.contains('_') || s.contains('-')) && PREFIXES.iter().any(|p| s.contains(p))
 }
 
 pub fn anonymize_ip(raw: &str) -> String {
@@ -520,5 +597,14 @@ mod tests {
         // ANSI + bidi terminal injection stripped while preserving valid text
         let raw = "\x1b[31mFAKE\x1b[0m \u{202E}txt\r\nok";
         assert_eq!(strip_ansi_and_bidi(raw), "FAKE txt\nok");
+
+        // Zero-allocation fast-path returns Cow::Borrowed for clean telemetry text
+        let mut clean_rep = ScrubReport::default();
+        let clean = scrubber.scrub_string_with_report(
+            "Simulated failure #12 at /app/src/mod_1.ts:52 orderId=12345678901234",
+            &mut clean_rep,
+        );
+        assert!(matches!(clean, Cow::Borrowed(_)));
+        assert!(clean_rep.categories.is_empty());
     }
 }
