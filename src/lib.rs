@@ -16,7 +16,7 @@ use crate::domain::sourcemap::SourceMapCache;
 use crate::security::anti_rea::ShieldEngine;
 use crate::security::headers::ScannerGuard;
 use crate::security::metrics::AppMetrics;
-use crate::security::ratelimit::{EventDedupeCache, HmacRateLimiter};
+use crate::security::ratelimit::{EventDedupeCache, HmacRateLimiter, InvalidDsnCache};
 use crate::selfcheck::SelfMonitor;
 use crate::storage::batch_writer::BatchWriter;
 use crate::storage::postgres::PostgresStorage;
@@ -32,6 +32,7 @@ pub struct AppState {
     pub batch_writer: BatchWriter,
     pub rate_limiter: HmacRateLimiter,
     pub event_dedupe: EventDedupeCache,
+    pub invalid_dsn_cache: InvalidDsnCache,
     pub scanner_guard: ScannerGuard,
     pub sourcemap_cache: SourceMapCache,
     pub metrics: Arc<AppMetrics>,
@@ -43,10 +44,10 @@ pub struct AppState {
 pub async fn build_storage(config: &AppConfig) -> Result<Arc<dyn StorageBackend>, String> {
     if config.is_postgres() {
         let url = config.database_url.as_deref().unwrap_or("");
-        let pg = PostgresStorage::connect(url, true).await?;
+        let pg = PostgresStorage::connect_with_key(url, true, config.app_key).await?;
         Ok(pg)
     } else {
-        let sqlite = SqliteStorage::open(&config.sqlite_path())?;
+        let sqlite = SqliteStorage::open_with_key(&config.sqlite_path(), config.app_key)?;
         Ok(sqlite)
     }
 }
@@ -66,6 +67,7 @@ pub fn build_app_state(
     );
     let rate_limiter = HmacRateLimiter::new(config.app_key, 16_384);
     let event_dedupe = EventDedupeCache::new(32_768, Duration::from_secs(600));
+    let invalid_dsn_cache = InvalidDsnCache::new(8_192, Duration::from_secs(30));
     let scanner_guard = ScannerGuard::new();
     let sourcemap_cache = SourceMapCache::new(2 * 1024 * 1024, 8);
     let (live_tx, _) = broadcast::channel::<LiveStreamEvent>(512);
@@ -76,6 +78,7 @@ pub fn build_app_state(
         batch_writer,
         rate_limiter,
         event_dedupe,
+        invalid_dsn_cache,
         scanner_guard,
         sourcemap_cache,
         metrics,

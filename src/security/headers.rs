@@ -72,8 +72,8 @@ pub fn resolve_client_ip(
         }
     }
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        // Rightmost untrusted IP if multi-hop; or first valid client IP behind single trusted edge
-        for raw in xff.split(',').rev() {
+        // Rightmost untrusted IP if multi-hop (bounded to 16 hops matching GlitchTip proxy_headers.py)
+        for raw in xff.split(',').rev().take(16) {
             if let Ok(ip) = raw.trim().parse::<IpAddr>() {
                 if !config.is_trusted_proxy(ip) {
                     return ip;
@@ -82,6 +82,45 @@ pub fn resolve_client_ip(
         }
     }
     peer_ip
+}
+
+pub fn normalize_host_header(host_header: &str) -> String {
+    let trimmed = host_header.trim();
+    if trimmed.starts_with('[') {
+        trimmed
+            .split(']')
+            .next()
+            .map(|s| format!("{}]", s.to_ascii_lowercase()))
+            .unwrap_or_default()
+    } else {
+        trimmed
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+}
+
+pub fn is_allowed_desktop_host(host_header: &str) -> bool {
+    let host_no_port = normalize_host_header(host_header);
+    matches!(host_no_port.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+}
+
+pub fn is_allowed_host(host_header: &str, config: &AppConfig) -> bool {
+    if config.desktop_app_mode {
+        return !host_header.is_empty() && is_allowed_desktop_host(host_header);
+    }
+    if config.allowed_hosts.is_empty() {
+        return true;
+    }
+    if host_header.trim().is_empty() {
+        return false;
+    }
+    let host = normalize_host_header(host_header);
+    if config.is_dev && matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]") {
+        return true;
+    }
+    config.allowed_hosts.iter().any(|h| h == &host)
 }
 
 pub fn is_https_request(headers: &HeaderMap, config: &AppConfig) -> bool {
@@ -95,21 +134,49 @@ pub fn is_https_request(headers: &HeaderMap, config: &AppConfig) -> bool {
         .unwrap_or(false)
 }
 
-pub fn is_allowed_desktop_host(host_header: &str) -> bool {
-    let host_no_port = if host_header.starts_with('[') {
-        host_header
-            .split(']')
-            .next()
-            .map(|s| format!("{s}]"))
-            .unwrap_or_default()
-    } else {
-        host_header
-            .split(':')
-            .next()
+/// Validates browser Origin / Sec-Fetch-Site on state-mutating cookie-authenticated requests.
+pub fn validate_same_origin(headers: &HeaderMap, config: &AppConfig) -> bool {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let orig = origin.trim().trim_end_matches('/');
+        if orig.is_empty() {
+            return false;
+        }
+        let orig_lower = orig.to_ascii_lowercase();
+        let orig_host_port = orig_lower
+            .strip_prefix("https://")
+            .or_else(|| orig_lower.strip_prefix("http://"))
             .unwrap_or("")
-            .to_ascii_lowercase()
-    };
-    matches!(host_no_port.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        if orig_host_port.is_empty() {
+            return false;
+        }
+        if let Some(ref pub_url) = config.public_url {
+            if pub_url.trim_end_matches('/').eq_ignore_ascii_case(orig) {
+                return true;
+            }
+        }
+        if let Some(req_host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+            if orig_host_port.eq_ignore_ascii_case(req_host.trim()) {
+                return true;
+            }
+            let req_norm = normalize_host_header(req_host);
+            let orig_norm = normalize_host_header(orig_host_port);
+            if !req_norm.is_empty() && req_norm == orig_norm {
+                return true;
+            }
+        }
+        if config.is_dev && is_allowed_desktop_host(orig_host_port) {
+            return true;
+        }
+        return false;
+    }
+    if let Some(sfs) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        let v = sfs.trim().to_ascii_lowercase();
+        return v == "same-origin" || v == "none";
+    }
+    true
 }
 
 pub fn inject_csp_nonce_into_html(html: &str, nonce: &str) -> String {
@@ -173,14 +240,12 @@ pub async fn security_headers_middleware(
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
 
-    if state.config.desktop_app_mode {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !is_allowed_desktop_host(host) {
-            return (StatusCode::FORBIDDEN, "Forbidden host").into_response();
-        }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !is_allowed_host(host, &state.config) {
+        return (StatusCode::FORBIDDEN, "Forbidden host").into_response();
     }
 
     let peer_ip = req
@@ -293,6 +358,12 @@ pub async fn security_headers_middleware(
         h.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, private"),
+        );
+    }
+    if path != "/robots.txt" && !path.starts_with("/sdk/") {
+        h.insert(
+            "x-robots-tag",
+            HeaderValue::from_static("noindex, nofollow, noarchive"),
         );
     }
 

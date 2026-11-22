@@ -51,6 +51,32 @@ html, body {
 .mono {
   font-family: var(--mono);
   font-size: 13px;
+  text-transform: none;
+  overflow-wrap: anywhere;
+}
+
+.secret-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: none;
+  overflow-wrap: anywhere;
+}
+
+.secret-banner-info {
+  background: var(--info-bg);
+  color: var(--text);
+}
+
+.secret-banner-ok {
+  background: var(--ok-bg);
+  color: var(--text);
 }
 
 .table-wrapper .mono {
@@ -706,4 +732,103 @@ dialog.bf-dialog::backdrop {
     min-height: 52px;
     box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
   }
+  button,
+  select,
+  input {
+    min-height: 44px;
+  }
+  .subtabs button,
+  .data-table button {
+    min-height: 48px;
+  }
+}
+
+.subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.subtab-btn[aria-selected="true"] {
+  background: var(--brand);
+  color: var(--brand-ink);
+  border-color: var(--brand);
+}
+
+.qr-box {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-alt);
+}
+
+.qr-svg {
+  width: 184px;
+  height: 184px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+}
+
+.qr-bg {
+  fill: #ffffff;
+}
+
+.qr-fg {
+  fill: #111827;
+}
+
+.code-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 8px;
+}
+
+.code-pill {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  font-family: var(--mono);
+  font-size: 13px;
+  text-align: center;
+}
+
+.scope-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 8px;
+}
+
+.compact-input {
+  width: 96px;
+}
+
+.divider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.divider-row::before,
+.divider-row::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.card,
+.stack-col,
+.table-wrapper {
+  min-width: 0;
 }

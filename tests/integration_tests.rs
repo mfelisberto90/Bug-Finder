@@ -26,7 +26,8 @@ async fn setup_test_app() -> (TempDir, Arc<AppState>, axum::Router, String, i64)
         )
         .unwrap(),
     );
-    let storage: Arc<dyn StorageBackend> = SqliteStorage::open(&cfg.sqlite_path()).unwrap();
+    let storage: Arc<dyn StorageBackend> =
+        SqliteStorage::open_with_key(&cfg.sqlite_path(), cfg.app_key).unwrap();
     let state = build_app_state(cfg, storage.clone());
     let router = build_router(state.clone());
 
@@ -335,12 +336,14 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
     assert_eq!(tpost_st, StatusCode::OK);
 
     // Verify MCP stdio read-only tool call
-    let ctx = bugfinder::domain::models::TenantCtx {
-        organization_id: 1,
-        organization_slug: "alpha".into(),
-        user_id: Some(1),
-        role: bugfinder::domain::models::UserRole::Admin,
-    };
+    let ctx = bugfinder::domain::models::TenantCtx::from_session(
+        1,
+        "alpha".into(),
+        1,
+        bugfinder::domain::models::UserRole::Admin,
+        None,
+        None,
+    );
     let mcp_res = handle_mcp_request(
         &state.storage,
         &ctx,
@@ -370,13 +373,13 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
         json!({
             "email": "viewer@alpha.test",
             "name": "Bob Viewer",
-            "password": "ViewerPassword123!",
+            "password": "BobPassPhrase!987",
             "role": "viewer"
         }),
     )
     .await;
     assert_eq!(inv_st, StatusCode::CREATED);
-    let (v_cookie, v_csrf) = login_cookie_and_csrf(&router, "viewer@alpha.test", "ViewerPassword123!").await;
+    let (v_cookie, v_csrf) = login_cookie_and_csrf(&router, "viewer@alpha.test", "BobPassPhrase!987").await;
 
     let (bfla_st, _, _) = send_json(
         &router,
@@ -573,12 +576,14 @@ async fn postgres_rls_live_isolation_test() {
     tx.commit().await.unwrap();
 
     // Querying as Org 1 must see ONLY Proj1 (never secret-proj-2)
-    let ctx1 = bugfinder::domain::models::TenantCtx {
-        organization_id: org1.id,
-        organization_slug: org1.slug,
-        user_id: Some(1),
-        role: bugfinder::domain::models::UserRole::Owner,
-    };
+    let ctx1 = bugfinder::domain::models::TenantCtx::from_session(
+        org1.id,
+        org1.slug,
+        1,
+        bugfinder::domain::models::UserRole::Owner,
+        None,
+        None,
+    );
     let visible = app_backend.list_projects(&ctx1).await.unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id, proj1.id);
@@ -722,7 +727,7 @@ async fn postgres_rls_live_isolation_test() {
     mtx.commit().await.unwrap();
 
     assert!(
-        app_backend.resolve_session(&expired_sha, 0).await.unwrap().is_some(),
+        app_backend.resolve_session(&expired_sha, 0, 86400).await.unwrap().is_some(),
         "Pre-maintenance expired row should still exist in session_lookup"
     );
 
@@ -787,13 +792,122 @@ async fn postgres_rls_live_isolation_test() {
     };
     app_backend.record_security_event(&exp_sec).await.unwrap();
 
+    // Enterprise parity PG 17 FORCE RLS checks: Invitations, JSONB Audit Hash Chain, AEAD secret & Cascade Revocation
+    let inv_leak: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM org_invitations")
+        .fetch_one(app_pg.pool())
+        .await
+        .unwrap();
+    assert_eq!(inv_leak, 0, "FORCE RLS fail-closed failed on org_invitations");
+    let invl_leak: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invitation_lookup")
+        .fetch_one(app_pg.pool())
+        .await
+        .unwrap();
+    assert_eq!(invl_leak, 0, "FORCE RLS fail-closed failed on invitation_lookup");
+
+    let pg_inv_tok_sha = sha256_hex(b"pg-live-invite-token-72h");
+    let now_s = chrono::Utc::now().timestamp();
+    let created_inv = app_backend
+        .create_invitation(
+            &ctx1,
+            "pg-invitee@org1.test",
+            bugfinder::domain::models::UserRole::Member,
+            &pg_inv_tok_sha,
+            now_s + 72 * 3600,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_inv.email, "pg-invitee@org1.test");
+    let inv_lookup = app_backend
+        .lookup_invitation(&pg_inv_tok_sha)
+        .await
+        .unwrap()
+        .expect("lookup_invitation should resolve via capability GUC");
+    assert_eq!(inv_lookup.organization_id, org1.id);
+    let pg_pw = bugfinder::security::auth::hash_password("PgInviteeStrongPass!22".into())
+        .await
+        .unwrap();
+    let (inv_uid, inv_oid, _, _, inv_role) = app_backend
+        .accept_invitation(&pg_inv_tok_sha, "PG Invitee", &pg_pw, now_s)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inv_oid, org1.id);
+    assert_eq!(inv_role, bugfinder::domain::models::UserRole::Member);
+
+    // PG JSONB key-reordering must NOT break SHA-256 audit hash chain
+    for (idx, meta) in [
+        json!({ "z": 1, "a": { "y": 2, "x": "pg-chain" }, "arr": [3, 2, 1] }),
+        json!({ "role": "member", "invite_id": created_inv.id, "actor": "owner" }),
+        json!({ "nested": { "k2": true, "k1": "ok" }, "step": 3 }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        app_backend
+            .append_audit_log(&bugfinder::storage::NewAuditLog {
+                organization_id: org1.id,
+                actor_user_id: Some(owner_uid),
+                actor_email: "owner1@pg.test".into(),
+                action: format!("pg.audit.step_{idx}"),
+                target_type: "test".into(),
+                target_id: idx.to_string(),
+                ip_hmac: "pg_hmac".into(),
+                metadata: meta,
+            })
+            .await
+            .unwrap();
+    }
+    let pg_aud_ver = app_backend.verify_audit_chain(&ctx1).await.unwrap();
+    assert!(pg_aud_ver.valid, "PG JSONB audit chain failed: {:?}", pg_aud_ver);
+    assert!(pg_aud_ver.checked_entries >= 3);
+
+    // AEAD check on alert_rules.webhook_secret inside raw PG row
+    let mut aead_tx = app_pg.pool().begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+        .bind(org1.id.to_string())
+        .execute(&mut *aead_tx)
+        .await
+        .unwrap();
+    let raw_wh: String = sqlx::query_scalar("SELECT webhook_secret FROM alert_rules WHERE id = $1")
+        .bind(new_rule.id)
+        .fetch_one(&mut *aead_tx)
+        .await
+        .unwrap();
+    aead_tx.commit().await.unwrap();
+    assert!(raw_wh.starts_with("enc:v1:"), "PG webhook secret not AEAD sealed: {raw_wh}");
+
+    // Cascade revocation on remove_member under NOBYPASSRLS
+    let inv_sess_sha = sha256_hex(b"pg_member_live_sess");
+    app_backend
+        .create_session(&inv_sess_sha, inv_uid, org1.id, "csrf_m", "ua", "iph", now_s, now_s + 3600)
+        .await
+        .unwrap();
+    let inv_tok_sha = sha256_hex(b"bf_pg_member_tok"); // gitleaks:allow
+    let inv_ctx = bugfinder::domain::models::TenantCtx::from_session(
+        org1.id,
+        ctx1.organization_slug.clone(),
+        inv_uid,
+        bugfinder::domain::models::UserRole::Member,
+        Some(now_s),
+        None,
+    );
+    app_backend
+        .create_api_token(&inv_ctx, "PG Mem Tok", &inv_tok_sha, "bf_pg_", bugfinder::domain::models::UserRole::Member, "event:read", Some(now_s + 3600))
+        .await
+        .unwrap();
+    assert!(app_backend.resolve_session(&inv_sess_sha, now_s, 3600).await.unwrap().is_some());
+    assert!(app_backend.resolve_api_token(&inv_tok_sha, None, now_s).await.unwrap().is_some());
+    assert!(app_backend.remove_member(&ctx1, inv_uid).await.unwrap().unwrap());
+    assert!(app_backend.resolve_session(&inv_sess_sha, now_s, 3600).await.unwrap().is_none());
+    assert!(app_backend.resolve_api_token(&inv_tok_sha, None, now_s).await.unwrap().is_none());
+
     let maint_jobs = app_backend.run_maintenance(30, 512).await.unwrap();
     assert!(
         maint_jobs.iter().any(|j| j.title.contains("PG Overdue Cron")),
         "PG run_maintenance must emit uptime_down alert job, got {maint_jobs:?}"
     );
     assert!(
-        app_backend.resolve_session(&expired_sha, 0).await.unwrap().is_none(),
+        app_backend.resolve_session(&expired_sha, 0, 86400).await.unwrap().is_none(),
         "Expired session must be deleted from sessions/session_lookup by run_maintenance"
     );
     assert!(
@@ -1608,4 +1722,1030 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     assert!(has_sig("idor_or_enum_burst"));
     assert!(has_sig("csp_script_tamper"));
     assert!(ev2_body["summary"]["secret_leaks_24h"].as_i64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn security_rbac_scopes_revocation_and_session_only_test() {
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+    ];
+
+    // Seed 1 issue so PUT /issues/:id can be exercised by scoped token
+    let sentry_auth = format!("Sentry sentry_version=7, sentry_key={dsn_key}");
+    let (st_ev, _, ev_res) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/"),
+        &[("x-sentry-auth", &sentry_auth)],
+        json!({ "level": "error", "message": "Scoped token test issue" }),
+    )
+    .await;
+    assert_eq!(st_ev, StatusCode::OK, "seed event failed: {ev_res}");
+    state.batch_writer.flush_now().await;
+
+    let (_, _, issues_list) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    let issue_id = issues_list[0]["id"].as_i64().unwrap();
+
+    // 1. Mint narrow `event:read` token with 30-day expiry
+    let (tk_st, _, tk_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &owner_hdrs,
+        json!({
+            "name": "Read-Only CI",
+            "role": "member",
+            "scopes": ["event:read"],
+            "expires_in_days": 30
+        }),
+    )
+    .await;
+    assert_eq!(tk_st, StatusCode::CREATED, "token create: {tk_body}");
+    let read_tok = tk_body["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {read_tok}");
+    assert!(tk_body["meta"]["expires_at"].as_str().is_some());
+
+    // Read works, writes return 403, /api-tokens/ is Session-Only (403)
+    let (r_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::AUTHORIZATION.as_str(), &bearer)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(r_st, StatusCode::OK);
+
+    let (w_proj, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/projects/",
+        &[(header::AUTHORIZATION.as_str(), &bearer)],
+        json!({ "name": "Blocked" }),
+    )
+    .await;
+    assert_eq!(w_proj, StatusCode::FORBIDDEN);
+
+    let (w_iss, _, _) = send_json(
+        &router,
+        "PUT",
+        &format!("/api/0/organizations/alpha/issues/{issue_id}/"),
+        &[(header::AUTHORIZATION.as_str(), &bearer)],
+        json!({ "status": "resolved" }),
+    )
+    .await;
+    assert_eq!(w_iss, StatusCode::FORBIDDEN);
+
+    let (tok_list_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/api-tokens/",
+        &[(header::AUTHORIZATION.as_str(), &bearer)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(tok_list_st, StatusCode::FORBIDDEN);
+
+    // 2. MCP with project:read-only token (missing event:read) rejected
+    let (ptk_st, _, ptk_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &owner_hdrs,
+        json!({ "name": "ProjReadOnly", "role": "viewer", "scopes": ["project:read"] }),
+    )
+    .await;
+    assert_eq!(ptk_st, StatusCode::CREATED);
+    let proj_tok = ptk_body["token"].as_str().unwrap();
+    let now_s = chrono::Utc::now().timestamp();
+    let proj_ctx = state
+        .storage
+        .resolve_api_token(&sha256_hex(proj_tok.as_bytes()), Some("alpha"), now_s)
+        .await
+        .unwrap()
+        .unwrap();
+    let mcp_err = handle_mcp_request(
+        &state.storage,
+        &proj_ctx,
+        "tools/call",
+        &json!({ "name": "list_issues", "arguments": {} }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(mcp_err.0, -32001);
+
+    // 3. Expired API token rejected with 401
+    let db_path = state.config.sqlite_path();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE api_tokens SET expires_at = 1 WHERE name = 'Read-Only CI'",
+            [],
+        )
+        .unwrap();
+    }
+    let (exp_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::AUTHORIZATION.as_str(), &bearer)],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(exp_st, StatusCode::UNAUTHORIZED);
+
+    // 4. Manager role + 72h Expirable Invite Link lifecycle
+    let (mgr_inv, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/members/",
+        &owner_hdrs,
+        json!({
+            "email": "mgr@alpha.test",
+            "name": "Morgan Manager",
+            "password": "ManagerPass!9876", // gitleaks:allow
+            "role": "manager"
+        }),
+    )
+    .await;
+    assert_eq!(mgr_inv, StatusCode::CREATED);
+    let (mgr_cookie, mgr_csrf) =
+        login_cookie_and_csrf(&router, "mgr@alpha.test", "ManagerPass!9876").await;
+    let mgr_hdrs = [
+        (header::COOKIE.as_str(), mgr_cookie.as_str()),
+        ("x-csrf-token", mgr_csrf.as_str()),
+    ];
+
+    // Manager cannot invite owner (403)
+    let (mgr_esc, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/invitations/",
+        &mgr_hdrs,
+        json!({ "email": "boss@alpha.test", "role": "owner" }),
+    )
+    .await;
+    assert_eq!(mgr_esc, StatusCode::FORBIDDEN);
+
+    // Manager creates 72h invite for member
+    let (inv_c, _, inv_b) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/invitations/",
+        &mgr_hdrs,
+        json!({ "email": "joiner@alpha.test", "role": "admin" }),
+    )
+    .await;
+    assert_eq!(inv_c, StatusCode::CREATED, "create invite: {inv_b}");
+    let inv_tok = inv_b["token"].as_str().unwrap().to_string();
+
+    let (lk_st, _, lk_b) = send_json(
+        &router,
+        "GET",
+        &format!("/api/auth/invites/{inv_tok}"),
+        &[],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(lk_st, StatusCode::OK);
+    assert_eq!(lk_b["email"], "joiner@alpha.test");
+
+    let (acc_st, acc_hdrs, acc_b) = send_json(
+        &router,
+        "POST",
+        &format!("/api/auth/invites/{inv_tok}/accept"),
+        &[],
+        json!({ "name": "Jane Joiner", "password": "JaneSecretVault!99" }), // gitleaks:allow
+    )
+    .await;
+    assert_eq!(acc_st, StatusCode::CREATED, "accept invite: {acc_b}");
+    let joiner_uid = acc_b["user"]["id"].as_i64().unwrap();
+    let joiner_cookie = acc_hdrs
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let joiner_csrf = acc_b["csrf_token"].as_str().unwrap().to_string();
+
+    // Reuse of consumed invite -> 410 Gone
+    let (reuse_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/auth/invites/{inv_tok}/accept"),
+        &[],
+        json!({ "name": "Replay", "password": "ReplayPassPhrase!99" }), // gitleaks:allow
+    )
+    .await;
+    assert_eq!(reuse_st, StatusCode::GONE);
+
+    // 5. Bug #1 Fix: Instant cascade revocation on update_member_role AND remove_member
+    let (jtk_st, _, jtk_b) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &[
+            (header::COOKIE.as_str(), joiner_cookie.as_str()),
+            ("x-csrf-token", joiner_csrf.as_str()),
+        ],
+        json!({ "name": "Joiner Admin Tok", "role": "admin" }),
+    )
+    .await;
+    assert_eq!(jtk_st, StatusCode::CREATED);
+    let joiner_tok = jtk_b["token"].as_str().unwrap().to_string();
+    let joiner_bearer = format!("Bearer {joiner_tok}");
+
+    let (ok_s, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::COOKIE.as_str(), joiner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(ok_s, StatusCode::OK);
+    let (ok_t, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::AUTHORIZATION.as_str(), joiner_bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(ok_t, StatusCode::OK);
+
+    // Downgrade joiner to viewer -> BOTH previous session & previous API token instantly 401
+    let (down_st, _, _) = send_json(
+        &router,
+        "PUT",
+        &format!("/api/0/organizations/alpha/members/{joiner_uid}/"),
+        &owner_hdrs,
+        json!({ "role": "viewer" }),
+    )
+    .await;
+    assert_eq!(down_st, StatusCode::OK);
+
+    let (rev_s, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/me",
+        &[(header::COOKIE.as_str(), joiner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(rev_s, StatusCode::UNAUTHORIZED);
+    let (rev_t, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::AUTHORIZATION.as_str(), joiner_bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(rev_t, StatusCode::UNAUTHORIZED);
+
+    // Re-login then remove_member -> immediate 401
+    let (j2_cookie, _) =
+        login_cookie_and_csrf(&router, "joiner@alpha.test", "JaneSecretVault!99").await;
+    let (rem_st, _, _) = send_raw(
+        &router,
+        "DELETE",
+        &format!("/api/0/organizations/alpha/members/{joiner_uid}/"),
+        &owner_hdrs,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(rem_st, StatusCode::NO_CONTENT);
+    let (gone_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/me",
+        &[(header::COOKIE.as_str(), j2_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(gone_st, StatusCode::UNAUTHORIZED);
+
+    // 6. Step-Up Re-Authentication check
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE sessions SET reauth_at = 1", []).unwrap();
+    }
+    let (su_fail, _, su_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &owner_hdrs,
+        json!({ "name": "Needs StepUp", "role": "member" }),
+    )
+    .await;
+    assert_eq!(su_fail, StatusCode::FORBIDDEN);
+    assert_eq!(su_body["reauth_required"], true);
+
+    let (reauth_ok, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/reauth",
+        &owner_hdrs,
+        json!({ "password": "StrongPassword123!" }),
+    )
+    .await;
+    assert_eq!(reauth_ok, StatusCode::OK);
+
+    let (su_ok, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &owner_hdrs,
+        json!({ "name": "After StepUp", "role": "member" }),
+    )
+    .await;
+    assert_eq!(su_ok, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    use sha2::{Digest, Sha256};
+
+    let (_dir, state, router, _, _) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+        (header::HOST.as_str(), "127.0.0.1:8090"),
+    ];
+
+    // 1. TOTP enroll & CSP-clean QR SVG check
+    let (en_st, _, en_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/enroll",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
+    assert_eq!(en_st, StatusCode::OK, "enroll: {en_b}");
+    let qr_svg = en_b["qr_svg"].as_str().unwrap();
+    assert!(qr_svg.starts_with("<svg class=\"qr-svg\""));
+    assert!(!qr_svg.contains("style="));
+    let secret_b32 = en_b["secret_b32"].as_str().unwrap();
+    let secret_bytes = bugfinder::security::mfa::decode_base32(secret_b32).unwrap();
+
+    // Confirm TOTP
+    let now_s = chrono::Utc::now().timestamp();
+    let totp_code = bugfinder::security::mfa::totp_code_at(&secret_bytes, now_s);
+    let (cf_st, _, cf_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/confirm",
+        &owner_hdrs,
+        json!({ "code": totp_code }),
+    )
+    .await;
+    assert_eq!(cf_st, StatusCode::OK, "confirm: {cf_b}");
+    let rec_codes: Vec<String> = cf_b["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(rec_codes.len(), 10);
+
+    // 2. Password login now yields 2-step mfa_required without cookie
+    let (lg_st, lg_hdrs, lg_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/login",
+        &[],
+        json!({ "email": "owner@alpha.test", "password": "StrongPassword123!" }),
+    )
+    .await;
+    assert_eq!(lg_st, StatusCode::OK);
+    assert_eq!(lg_b["mfa_required"], true);
+    assert!(lg_hdrs.get(header::SET_COOKIE).is_none());
+    let chall = lg_b["challenge_token"].as_str().unwrap().to_string();
+
+    // 3. 5 bad MFA attempts trigger persistent lockout (429)
+    let mut locked = false;
+    for _ in 0..6 {
+        let (bad_st, _, bad_b) = send_json(
+            &router,
+            "POST",
+            "/api/auth/mfa/verify",
+            &[],
+            json!({ "challenge_token": chall, "code": "000000" }),
+        )
+        .await;
+        if bad_st == StatusCode::TOO_MANY_REQUESTS {
+            assert!(bad_b["retry_after"].as_i64().unwrap() > 0);
+            locked = true;
+            break;
+        }
+    }
+    assert!(locked, "MFA brute-force lockout did not trigger");
+
+    // Clear lockout so we can test valid code (same TOTP step used at confirm -> rejected until cleared or next step; use +30s? Even cleaner: test replay directly against confirm step first!)
+    let db_path = state.config.sqlite_path();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE user_mfa SET failed_attempts = 0, locked_until = NULL", [])
+            .unwrap();
+    }
+    // Replay of SAME code used at confirm must fail 401
+    let (rep_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/verify",
+        &[],
+        json!({ "challenge_token": chall, "code": totp_code }),
+    )
+    .await;
+    assert_eq!(rep_st, StatusCode::UNAUTHORIZED);
+
+    // Move last_used_step back by 2 so current step is accepted cleanly, then test replay
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE user_mfa SET last_used_step = last_used_step - 2, failed_attempts = 0, locked_until = NULL",
+            [],
+        )
+        .unwrap();
+    }
+    let fresh_code = bugfinder::security::mfa::totp_code_at(&secret_bytes, chrono::Utc::now().timestamp());
+    let (ok_mfa, ok_hdrs, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/verify",
+        &[],
+        json!({ "challenge_token": chall, "code": fresh_code }),
+    )
+    .await;
+    assert_eq!(ok_mfa, StatusCode::OK);
+    assert!(ok_hdrs.get(header::SET_COOKIE).is_some());
+
+    // 4. Recovery code single-use verification
+    let (_, _, lg2_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/login",
+        &[],
+        json!({ "email": "owner@alpha.test", "password": "StrongPassword123!" }),
+    )
+    .await;
+    let chall2 = lg2_b["challenge_token"].as_str().unwrap().to_string();
+    let (rc_ok, rc_hdrs, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/verify",
+        &[],
+        json!({ "challenge_token": chall2, "recovery_code": rec_codes[0] }),
+    )
+    .await;
+    assert_eq!(rc_ok, StatusCode::OK);
+    assert!(rc_hdrs.get(header::SET_COOKIE).is_some());
+
+    // Reusing same recovery code must fail
+    let (_, _, lg3_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/login",
+        &[],
+        json!({ "email": "owner@alpha.test", "password": "StrongPassword123!" }),
+    )
+    .await;
+    let chall3 = lg3_b["challenge_token"].as_str().unwrap().to_string();
+    let (rc_reuse, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/verify",
+        &[],
+        json!({ "challenge_token": chall3, "recovery_code": rec_codes[0] }),
+    )
+    .await;
+    assert_eq!(rc_reuse, StatusCode::UNAUTHORIZED);
+
+    // 5. Real ES256 WebAuthn Passkey registration + assertion + counter rollback rejection
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let pub_uncompressed = kp.public_key().as_ref();
+    let cred_id = b"integ-passkey-id-001";
+
+    let (pb_st, _, pb_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/register/begin",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
+    assert_eq!(pb_st, StatusCode::OK);
+    let reg_chall = pb_b["challenge"].as_str().unwrap();
+    let reg_cdj = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "type": "webauthn.create",
+            "challenge": reg_chall,
+            "origin": "http://127.0.0.1:8090"
+        }))
+        .unwrap(),
+    );
+
+    // Build minimal CBOR attestationObject with authData (rpHash(32)|flags=0x41|signCount=0|aaguid(16)|len|credId|COSE_P256)
+    fn enc_bytes(b: &[u8]) -> Vec<u8> {
+        let mut o = if b.len() < 24 { vec![0x40 | (b.len() as u8)] } else { vec![0x58, b.len() as u8] };
+        o.extend_from_slice(b);
+        o
+    }
+    let mut cose = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21];
+    cose.extend_from_slice(&enc_bytes(&pub_uncompressed[1..33]));
+    cose.push(0x22);
+    cose.extend_from_slice(&enc_bytes(&pub_uncompressed[33..65]));
+
+    let mut reg_auth_data = Vec::new();
+    reg_auth_data.extend_from_slice(&Sha256::digest(b"127.0.0.1"));
+    reg_auth_data.push(0x41);
+    reg_auth_data.extend_from_slice(&0u32.to_be_bytes());
+    reg_auth_data.extend_from_slice(&[0u8; 16]);
+    reg_auth_data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+    reg_auth_data.extend_from_slice(cred_id);
+    reg_auth_data.extend_from_slice(&cose);
+
+    let mut att_obj = vec![0xA2, 0x63, b'f', b'm', b't', 0x64, b'n', b'o', b'n', b'e', 0x68, b'a', b'u', b't', b'h', b'D', b'a', b't', b'a'];
+    if reg_auth_data.len() < 256 {
+        att_obj.push(0x58);
+        att_obj.push(reg_auth_data.len() as u8);
+    } else {
+        att_obj.push(0x59);
+        att_obj.extend_from_slice(&(reg_auth_data.len() as u16).to_be_bytes());
+    }
+    att_obj.extend_from_slice(&reg_auth_data);
+
+    let (pf_st, _, pf_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/register/finish",
+        &owner_hdrs,
+        json!({
+            "name": "CI ES256 Passkey",
+            "clientDataJSON": reg_cdj,
+            "attestationObject": URL_SAFE_NO_PAD.encode(&att_obj),
+        }),
+    )
+    .await;
+    assert_eq!(pf_st, StatusCode::CREATED, "passkey reg finish: {pf_b}");
+
+    // Passkey login assertion with sign_count = 1
+    let sign_assertion = |chal: &str, count: u32| -> (String, String, String) {
+        let cdj = serde_json::to_vec(&json!({
+            "type": "webauthn.get",
+            "challenge": chal,
+            "origin": "http://127.0.0.1:8090"
+        }))
+        .unwrap();
+        let mut ad = Vec::new();
+        ad.extend_from_slice(&Sha256::digest(b"127.0.0.1"));
+        ad.push(0x01);
+        ad.extend_from_slice(&count.to_be_bytes());
+        let mut msg = ad.clone();
+        msg.extend_from_slice(&Sha256::digest(&cdj));
+        let sig = kp.sign(&rng, &msg).unwrap();
+        (
+            URL_SAFE_NO_PAD.encode(&cdj),
+            URL_SAFE_NO_PAD.encode(&ad),
+            URL_SAFE_NO_PAD.encode(sig.as_ref()),
+        )
+    };
+
+    let (lb_st, _, lb_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/login/begin",
+        &[(header::HOST.as_str(), "127.0.0.1:8090")],
+        json!({ "email": "owner@alpha.test" }),
+    )
+    .await;
+    assert_eq!(lb_st, StatusCode::OK);
+    let (l_cdj, l_ad, l_sig) = sign_assertion(lb_b["challenge"].as_str().unwrap(), 1);
+    let (lf_st, lf_hdrs, lf_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/login/finish",
+        &[(header::HOST.as_str(), "127.0.0.1:8090")],
+        json!({
+            "credentialId": URL_SAFE_NO_PAD.encode(cred_id),
+            "clientDataJSON": l_cdj,
+            "authenticatorData": l_ad,
+            "signature": l_sig,
+        }),
+    )
+    .await;
+    assert_eq!(lf_st, StatusCode::OK, "passkey login finish: {lf_b}");
+    let sess_from_pk = lf_hdrs
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let pk_csrf = lf_b["csrf_token"].as_str().unwrap().to_string();
+
+    // Counter rollback (sign_count = 1 <= stored 1) rejected -> 401
+    let (_, _, lb2_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/login/begin",
+        &[(header::HOST.as_str(), "127.0.0.1:8090")],
+        json!({ "email": "owner@alpha.test" }),
+    )
+    .await;
+    let (rb_cdj, rb_ad, rb_sig) = sign_assertion(lb2_b["challenge"].as_str().unwrap(), 1);
+    let (rb_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/login/finish",
+        &[(header::HOST.as_str(), "127.0.0.1:8090")],
+        json!({
+            "credentialId": URL_SAFE_NO_PAD.encode(cred_id),
+            "clientDataJSON": rb_cdj,
+            "authenticatorData": rb_ad,
+            "signature": rb_sig,
+        }),
+    )
+    .await;
+    assert_eq!(rb_st, StatusCode::UNAUTHORIZED);
+
+    // 6. Password change rotates current session and revokes concurrent session
+    let (pwc_st, pwc_hdrs, pwc_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/password/change",
+        &[
+            (header::COOKIE.as_str(), sess_from_pk.as_str()),
+            ("x-csrf-token", pk_csrf.as_str()),
+        ],
+        json!({
+            "current_password": "StrongPassword123!",
+            "new_password": "MasterVaultRotate!999" // gitleaks:allow
+        }),
+    )
+    .await;
+    assert_eq!(pwc_st, StatusCode::OK, "pw change: {pwc_b}");
+    let rotated_cookie = pwc_hdrs
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let (old_me, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/me",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(old_me, StatusCode::UNAUTHORIZED);
+    let (new_me, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/me",
+        &[(header::COOKIE.as_str(), rotated_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(new_me, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn security_aead_audit_chain_and_network_hardening_test() {
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+    ];
+
+    // 1. AEAD sealing verification in raw SQLite for both MFA TOTP secret and Webhook HMAC secret
+    let (_, _, _) = send_json(&router, "POST", "/api/auth/mfa/totp/enroll", &owner_hdrs, json!({})).await;
+    let plain_wh = "whsec_raw_plaintext_test_only_12345"; // gitleaks:allow
+    let (al_st, _, al_b) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/alerts/",
+        &owner_hdrs,
+        json!({
+            "project_id": project_id,
+            "name": "AEAD Hook",
+            "trigger_type": "new_issue",
+            "channel_type": "webhook",
+            "target_url": "https://93.184.216.34/bf",
+            "webhook_secret": plain_wh
+        }),
+    )
+    .await;
+    assert_eq!(al_st, StatusCode::CREATED, "alert create: {al_b}");
+
+    let db_path = state.config.sqlite_path();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mfa_enc: String = conn
+            .query_row("SELECT totp_secret_enc FROM user_mfa LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let wh_enc: String = conn
+            .query_row("SELECT webhook_secret FROM alert_rules WHERE name = 'AEAD Hook'", [], |r| r.get(0))
+            .unwrap();
+        assert!(mfa_enc.starts_with("enc:v1:"), "got {mfa_enc}");
+        assert!(wh_enc.starts_with("enc:v1:"), "got {wh_enc}");
+        assert!(!wh_enc.contains("whsec_raw_plaintext"));
+    }
+
+    // 2. Hash-chained audit log verification + tamper detection
+    let (aud_st, _, aud_b) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/audit-logs/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(aud_st, StatusCode::OK);
+    assert!(aud_b.as_array().unwrap().len() >= 3);
+
+    let (ver_st, _, ver_b) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/audit-logs/verify/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ver_st, StatusCode::OK);
+    assert_eq!(ver_b["valid"], true);
+
+    // 3. ALLOWED_HOSTS & X-Robots-Tag verification with production config
+    {
+        let prod_dir = TempDir::new().unwrap();
+        let mut prod_cfg = AppConfig::from_env_and_overrides(
+            Some("127.0.0.1:0".into()),
+            Some(prod_dir.path().to_path_buf()),
+            None,
+            false,
+        )
+        .unwrap();
+        prod_cfg.is_dev = false;
+        prod_cfg.allowed_hosts = vec!["bugs.example.com".into()];
+        let prod_storage: Arc<dyn StorageBackend> =
+            SqliteStorage::open_with_key(&prod_cfg.sqlite_path(), prod_cfg.app_key).unwrap();
+        let prod_router = build_router(build_app_state(Arc::new(prod_cfg), prod_storage));
+
+        let (bad_host, _, _) = send_raw(
+            &prod_router,
+            "GET",
+            "/api/health",
+            &[(header::HOST.as_str(), "evil.attacker")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(bad_host, StatusCode::FORBIDDEN);
+
+        let (good_host, good_hdrs, _) = send_raw(
+            &prod_router,
+            "GET",
+            "/api/health",
+            &[(header::HOST.as_str(), "bugs.example.com")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(good_host, StatusCode::OK);
+        assert_eq!(
+            good_hdrs.get("x-robots-tag").unwrap().to_str().unwrap(),
+            "noindex, nofollow, noarchive"
+        );
+    }
+
+    // 4. Cross-origin mutation rejected -> 403
+    let (xo_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/projects/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+            (header::HOST.as_str(), "127.0.0.1:8090"),
+            (header::ORIGIN.as_str(), "https://evil.test"),
+        ],
+        json!({ "name": "CrossOriginProj" }),
+    )
+    .await;
+    assert_eq!(xo_st, StatusCode::FORBIDDEN);
+
+    // 5. Strict CORS (Vary: Origin), event_throttle_rate=100 drop, org IP scrub override & aggressive_key_match
+    let (pset_st, _, _) = send_json(
+        &router,
+        "PUT",
+        "/api/0/projects/alpha/rolelane/settings/",
+        &owner_hdrs,
+        json!({
+            "allowed_domains": ["app.example.com"],
+            "scrub_ip_addresses": false,
+            "aggressive_key_match": true,
+            "event_throttle_rate": 0
+        }),
+    )
+    .await;
+    assert_eq!(pset_st, StatusCode::OK);
+
+    let sentry_auth = format!("Sentry sentry_version=7, sentry_key={dsn_key}");
+    let (_, bad_cors_hdrs, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/"),
+        &[
+            ("x-sentry-auth", &sentry_auth),
+            (header::ORIGIN.as_str(), "https://evil.test"),
+        ],
+        json!({ "event_id": "22222222222222222222222222222221", "message": "cors deny" }),
+    )
+    .await;
+    assert!(bad_cors_hdrs.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    assert_eq!(bad_cors_hdrs.get(header::VARY).unwrap(), "Origin");
+
+    let (_, ok_cors_hdrs, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/"),
+        &[
+            ("x-sentry-auth", &sentry_auth),
+            (header::ORIGIN.as_str(), "https://app.example.com"),
+        ],
+        json!({ "event_id": "22222222222222222222222222222222", "message": "cors allow" }),
+    )
+    .await;
+    assert_eq!(
+        ok_cors_hdrs.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(ok_cors_hdrs.get(header::VARY).unwrap(), "Origin");
+
+    // Org security settings: event_throttle_rate = 100 drops event
+    let (oset1, _, _) = send_json(
+        &router,
+        "PUT",
+        "/api/0/organizations/alpha/security-settings/",
+        &owner_hdrs,
+        json!({ "scrub_ip_addresses": true, "event_throttle_rate": 100, "require_mfa_for_admins": false }),
+    )
+    .await;
+    assert_eq!(oset1, StatusCode::OK);
+    let (drop_st, _, drop_b) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/"),
+        &[("x-sentry-auth", &sentry_auth)],
+        json!({ "event_id": "33333333333333333333333333333333", "message": "should drop" }),
+    )
+    .await;
+    assert_eq!(drop_st, StatusCode::OK);
+    assert_eq!(drop_b["filtered"], true);
+
+    // Lower org throttle to 0 while keeping org scrub_ip_addresses=true; test aggressive_key_match
+    let (oset2, _, _) = send_json(
+        &router,
+        "PUT",
+        "/api/0/organizations/alpha/security-settings/",
+        &owner_hdrs,
+        json!({ "scrub_ip_addresses": true, "event_throttle_rate": 0, "require_mfa_for_admins": false }),
+    )
+    .await;
+    assert_eq!(oset2, StatusCode::OK);
+
+    let (_, _, stored_res) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/"),
+        &[("x-sentry-auth", &sentry_auth)],
+        json!({
+            "event_id": "44444444444444444444444444444444",
+            "message": "scrub override",
+            "user": { "ip_address": "198.51.100.42" },
+            "extra": { "custom_auth_token": "tok_leak_999" } // gitleaks:allow
+        }),
+    )
+    .await;
+    let stored_eid = stored_res["id"].as_str().unwrap().to_string();
+    state.batch_writer.flush_now().await;
+
+    let (_, _, issues_b) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    let target_issue_id = issues_b
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title"].as_str().unwrap_or("").contains("scrub override"))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (_, _, ev_det) = send_json(
+        &router,
+        "GET",
+        &format!("/api/0/organizations/alpha/issues/{target_issue_id}/events/{stored_eid}/"),
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    let payload_txt = ev_det["payload"].to_string();
+    assert!(!payload_txt.contains("198.51.100.42"), "Org IP scrub failed: {payload_txt}");
+    assert!(!payload_txt.contains("tok_leak_999"), "aggressive_key_match failed: {payload_txt}");
+
+    // 6. Negative DSN cache hits 401 and blocks bad key in-memory
+    let (bad_dsn, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/?sentry_key=bad_dsn_key_999"),
+        &[],
+        json!({ "message": "x" }),
+    )
+    .await;
+    assert_eq!(bad_dsn, StatusCode::UNAUTHORIZED);
+    assert!(state
+        .invalid_dsn_cache
+        .is_blocked(project_id, &sha256_hex(b"bad_dsn_key_999")));
+
+    // 7. Self-check exposes all 5 new security checks + audit tamper triggers valid=false
+    let (sc_st, _, sc_b) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/self-check/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(sc_st, StatusCode::OK);
+    let chk_ids: Vec<&str> = sc_b["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    for want in [
+        "allowed_hosts_configured",
+        "mfa_owner_posture",
+        "audit_chain_integrity",
+        "api_token_hygiene",
+        "aead_secret_encryption",
+    ] {
+        assert!(chk_ids.contains(&want), "missing self-check item {want}");
+    }
+
+    // Tamper audit_logs metadata in SQLite -> verify_audit_chain returns valid == false
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE audit_logs SET metadata_json = '{\"tampered\":true}' WHERE id = (SELECT MIN(id) FROM audit_logs)",
+            [],
+        )
+        .unwrap();
+    }
+    let (_, _, tamp_b) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/audit-logs/verify/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(tamp_b["valid"], false);
+    assert!(tamp_b["broken_at_id"].as_i64().is_some());
 }

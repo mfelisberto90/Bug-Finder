@@ -4,12 +4,13 @@ use crate::http::auth_routes::{resolve_request_session, sanitize_slug, verify_cs
 use crate::security::anti_rea::derive_project_ip_hmac_key;
 use crate::security::auth::{
     canonical_json_sha256, generate_api_token, generate_dsn_public_key, hash_password,
-    random_token_b64, sha256_hex,
+    random_token_b64, sha256_hex, validate_password_strength,
 };
 use crate::security::csv::sanitize_csv_cell;
+use crate::security::headers::{resolve_client_ip, validate_same_origin};
 use crate::security::ssrf::validate_webhook_url;
 use crate::selfcheck::{evaluate_self_check, run_live_self_probe};
-use crate::storage::{IdempotencyCheck, IssueQueryParams, LogQueryParams, NewAlertRule};
+use crate::storage::{IdempotencyCheck, IssueQueryParams, LogQueryParams, NewAlertRule, NewAuditLog};
 use crate::AppState;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -22,10 +23,91 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+
+fn require_scope(ctx: &TenantCtx, scope: &str) -> Result<(), Response> {
+    if ctx.has_scope(scope) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": format!("Missing required scope: {scope}") })),
+        )
+            .into_response())
+    }
+}
+
+fn require_session_only(ctx: &TenantCtx) -> Result<(), Response> {
+    if ctx.is_session_auth {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Interactive session required; API tokens cannot access this endpoint" })),
+        )
+            .into_response())
+    }
+}
+
+fn require_step_up(ctx: &TenantCtx) -> Result<(), Response> {
+    let now_sec = chrono::Utc::now().timestamp();
+    if ctx.has_recent_reauth(now_sec) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Step-up re-authentication required",
+                "reauth_required": true
+            })),
+        )
+            .into_response())
+    }
+}
+
+async fn record_audit(
+    state: &AppState,
+    ctx: &TenantCtx,
+    headers: &HeaderMap,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    metadata: Value,
+) {
+    let actor_email = if let Some(uid) = ctx.user_id {
+        state
+            .storage
+            .find_user_password_hash(uid)
+            .await
+            .ok()
+            .flatten()
+            .map(|(email, _, _)| email)
+            .unwrap_or_else(|| format!("user:{uid}"))
+    } else {
+        "system".into()
+    };
+    let client_ip = resolve_client_ip(headers, IpAddr::V4(Ipv4Addr::LOCALHOST), &state.config);
+    let ip_hmac = state
+        .rate_limiter
+        .hash_key("audit_ip", &client_ip.to_string());
+    let _ = state
+        .storage
+        .append_audit_log(&NewAuditLog {
+            organization_id: ctx.organization_id,
+            actor_user_id: ctx.user_id,
+            actor_email,
+            action: action.to_string(),
+            target_type: target_type.to_string(),
+            target_id: target_id.to_string(),
+            ip_hmac,
+            metadata,
+        })
+        .await;
+}
 
 async fn authenticate_api_tenant(
     state: &AppState,
@@ -33,52 +115,114 @@ async fn authenticate_api_tenant(
     method: &Method,
     org_slug_opt: Option<&str>,
 ) -> Result<TenantCtx, Response> {
-    if let Some(auth_hdr) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(tok) = auth_hdr
-            .strip_prefix("Bearer ")
-            .or_else(|| auth_hdr.strip_prefix("bearer "))
-        {
-            let sha = sha256_hex(tok.trim().as_bytes());
-            if let Ok(Some(ctx)) = state.storage.resolve_api_token(&sha, org_slug_opt).await {
-                return Ok(ctx);
-            }
-            return Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid API token" }))).into_response());
-        }
-    }
-
-    let Some(sess) = resolve_request_session(state, headers).await else {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "Authentication required" }))).into_response());
-    };
-
-    if matches!(
+    let is_mutation = matches!(
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    ) && !verify_csrf_for_session(&sess, headers)
+    );
+    let now_sec = chrono::Utc::now().timestamp();
+
+    let ctx = if let Some(tok) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
     {
-        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "Invalid CSRF token" }))).into_response());
-    }
-
-    if let Some(want_slug) = org_slug_opt {
-        if sess.organization_slug == want_slug {
-            return Ok(TenantCtx {
-                organization_id: sess.organization_id,
-                organization_slug: sess.organization_slug,
-                user_id: Some(sess.user_id),
-                role: sess.role,
-            });
-        }
-        return match state.storage.resolve_tenant_for_user(sess.user_id, want_slug).await {
-            Ok(Some(ctx)) => Ok(ctx),
-            _ => Err((StatusCode::NOT_FOUND, Json(json!({ "error": "Organization not found" }))).into_response()),
+        let sha = sha256_hex(tok.trim().as_bytes());
+        let Some(c) = state
+            .storage
+            .resolve_api_token(&sha, org_slug_opt, now_sec)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid or expired API token" })),
+            )
+                .into_response());
         };
+        c
+    } else {
+        let Some(sess) = resolve_request_session(state, headers).await else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Authentication required" })),
+            )
+                .into_response());
+        };
+
+        if is_mutation {
+            if !validate_same_origin(headers, &state.config) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Cross-origin state-changing request rejected" })),
+                )
+                    .into_response());
+            }
+            if !verify_csrf_for_session(&sess, headers) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Invalid CSRF token" })),
+                )
+                    .into_response());
+            }
+        }
+
+        if let Some(want_slug) = org_slug_opt {
+            if sess.organization_slug == want_slug {
+                TenantCtx::from_session(
+                    sess.organization_id,
+                    sess.organization_slug,
+                    sess.user_id,
+                    sess.role,
+                    sess.reauth_at,
+                    Some(sess.session_id),
+                )
+            } else {
+                let mut resolved = match state.storage.resolve_tenant_for_user(sess.user_id, want_slug).await {
+                    Ok(Some(c)) => c,
+                    _ => {
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": "Organization not found" })),
+                        )
+                            .into_response());
+                    }
+                };
+                resolved.reauth_at = sess.reauth_at;
+                resolved.session_id = Some(sess.session_id);
+                resolved
+            }
+        } else {
+            TenantCtx::from_session(
+                sess.organization_id,
+                sess.organization_slug,
+                sess.user_id,
+                sess.role,
+                sess.reauth_at,
+                Some(sess.session_id),
+            )
+        }
+    };
+
+    if is_mutation {
+        let rate_key = format!("u:{}:o:{}", ctx.user_id.unwrap_or(0), ctx.organization_id);
+        let dec = state.rate_limiter.check_and_record(
+            "api_mutate_actor",
+            &rate_key,
+            120,
+            Duration::from_secs(60),
+        );
+        if !dec.allowed {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, dec.retry_after_sec.to_string())],
+                Json(json!({ "error": "Too many mutating API requests" })),
+            )
+                .into_response());
+        }
     }
 
-    Ok(TenantCtx {
-        organization_id: sess.organization_id,
-        organization_slug: sess.organization_slug,
-        user_id: Some(sess.user_id),
-        role: sess.role,
-    })
+    Ok(ctx)
 }
 
 async fn check_idempotency(
@@ -139,6 +283,9 @@ pub async fn list_organizations(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "org:read") {
+        return r;
+    }
     let Some(uid) = ctx.user_id else {
         return Json(json!([])).into_response();
     };
@@ -158,6 +305,9 @@ pub async fn list_projects(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:read") {
+        return r;
+    }
     match state.storage.list_projects(&ctx).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -182,6 +332,9 @@ pub async fn create_project(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires admin or owner role" }))).into_response();
     }
@@ -197,7 +350,19 @@ pub async fn create_project(
         .create_project(&ctx, req.name.trim(), &slug, &platform, &dsn_pub, &dsn_sha)
         .await
     {
-        Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
+        Ok(p) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "project.created",
+                "project",
+                &p.id.to_string(),
+                json!({ "slug": p.slug, "platform": p.platform }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(p)).into_response()
+        }
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -207,17 +372,38 @@ pub async fn update_project_settings(
     Path((org, proj)): Path<(String, String)>,
     headers: HeaderMap,
     method: Method,
-    Json(filters): Json<ProjectFilters>,
+    Json(mut filters): Json<ProjectFilters>,
 ) -> Response {
     let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires admin or owner role" }))).into_response();
     }
+    filters.event_throttle_rate = filters.event_throttle_rate.min(100);
     match state.storage.update_project_filters(&ctx, &proj, &filters).await {
-        Ok(Some(dto)) => Json(dto).into_response(),
+        Ok(Some(dto)) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "project.settings_updated",
+                "project",
+                &dto.id.to_string(),
+                json!({
+                    "slug": dto.slug,
+                    "event_throttle_rate": dto.filters.event_throttle_rate,
+                    "aggressive_key_match": dto.filters.aggressive_key_match,
+                    "shield_mode": dto.filters.shield.mode,
+                }),
+            )
+            .await;
+            Json(dto).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Project not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -233,6 +419,9 @@ pub async fn list_project_keys(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:read") {
+        return r;
+    }
     match state.storage.list_project_keys(&ctx, &proj).await {
         Ok(keys) => Json(keys).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -255,6 +444,9 @@ pub async fn create_project_key(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -266,8 +458,69 @@ pub async fn create_project_key(
         .create_project_key(&ctx, &proj, label.trim(), &pubk, &sha)
         .await
     {
-        Ok(Some(k)) => (StatusCode::CREATED, Json(k)).into_response(),
+        Ok(Some(k)) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "dsn_key.created",
+                "project_key",
+                &k.id.to_string(),
+                json!({ "project": proj, "label": k.label }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(k)).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Project not found" }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateKeyReq {
+    pub rate_limit_per_min: u32,
+    pub is_active: bool,
+}
+
+pub async fn update_project_key(
+    State(state): State<Arc<AppState>>,
+    Path((org, proj, key_id)): Path<(String, String, i64)>,
+    headers: HeaderMap,
+    method: Method,
+    Json(req): Json<UpdateKeyReq>,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
+    if !ctx.role.can_write_project() {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
+    }
+    let rate = req.rate_limit_per_min.clamp(1, 100_000);
+    match state
+        .storage
+        .update_project_key(&ctx, &proj, key_id, rate, req.is_active)
+        .await
+    {
+        Ok(Some(dto)) => {
+            let key_sha = sha256_hex(dto.public_key.as_bytes());
+            state.invalid_dsn_cache.invalidate(dto.project_id, &key_sha);
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "dsn_key.updated",
+                "project_key",
+                &dto.id.to_string(),
+                json!({ "project": proj, "rate_limit_per_min": dto.rate_limit_per_min, "is_active": dto.is_active }),
+            )
+            .await;
+            Json(dto).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Key not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -282,11 +535,26 @@ pub async fn delete_project_key(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:admin") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
     match state.storage.delete_project_key(&ctx, &proj, key_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "dsn_key.deleted",
+                "project_key",
+                &key_id.to_string(),
+                json!({ "project": proj }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Key not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -302,6 +570,9 @@ pub async fn enable_project_tunnel(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -386,6 +657,9 @@ pub async fn list_issues(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let params = parse_issue_query(&query);
     match state.storage.list_issues(&ctx, &params).await {
         Ok((items, total_hits)) => {
@@ -409,6 +683,9 @@ pub async fn get_issue(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     match state.storage.get_issue(&ctx, issue_id).await {
         Ok(Some(i)) => Json(i).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Issue not found" }))).into_response(),
@@ -433,6 +710,9 @@ pub async fn update_issue(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:write") {
+        return r;
+    }
     if !ctx.role.can_mutate_issues() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Viewers cannot mutate issues" }))).into_response();
     }
@@ -454,10 +734,22 @@ pub async fn update_issue(
         .update_issue_status(&ctx, issue_id, status, req.resolved_in_release.as_deref())
         .await
     {
-        Ok(Some(updated)) => (
-            StatusCode::OK,
-            serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()),
-        ),
+        Ok(Some(updated)) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "issue.updated",
+                "issue",
+                &issue_id.to_string(),
+                json!({ "status": req.status, "resolved_in_release": req.resolved_in_release }),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                serde_json::to_string(&updated).unwrap_or_else(|_| "{}".into()),
+            )
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             serde_json::to_string(&json!({ "error": "Issue not found" })).unwrap(),
@@ -493,6 +785,9 @@ pub async fn list_issue_events(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     match state.storage.list_issue_events(&ctx, issue_id, 25).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -509,6 +804,9 @@ pub async fn get_issue_event(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     match state.storage.get_issue_event(&ctx, issue_id, &ev_id).await {
         Ok(Some(ev)) => Json(ev).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Event not found" }))).into_response(),
@@ -527,12 +825,25 @@ pub async fn export_issues_csv(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let mut params = parse_issue_query(&query);
     params.limit = 200;
     let (items, _) = match state.storage.list_issues(&ctx, &params).await {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     };
+    record_audit(
+        &state,
+        &ctx,
+        &headers,
+        "issues.exported_csv",
+        "organization",
+        &ctx.organization_id.to_string(),
+        json!({ "count": items.len() }),
+    )
+    .await;
     let mut csv = String::from("short_id,project,level,status,count,title,culprit,last_seen\n");
     for it in items {
         csv.push_str(&format!(
@@ -569,6 +880,9 @@ pub async fn get_stats_v2(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let category = query.get("category").map(String::as_str).unwrap_or("error");
     let until_ms = now_ms();
     let since_ms = parse_stats_period_ms(query.get("statsPeriod").map(String::as_str))
@@ -594,6 +908,9 @@ pub async fn list_logs(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let project_ids = query
         .get("project")
         .map(|s| s.split(',').filter_map(|p| p.trim().parse::<i64>().ok()).collect())
@@ -646,6 +963,9 @@ pub async fn stream_logs_sse(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let rx = state.live_tx.subscribe();
     let org_id = ctx.organization_id;
     let project_filter = query.get("project").and_then(|s| s.parse::<i64>().ok());
@@ -697,6 +1017,9 @@ pub async fn list_log_resources(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     match state.storage.list_log_resources(&ctx).await {
         Ok(res) => Json(res).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -714,6 +1037,9 @@ pub async fn get_log_stats(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let until = now_ms();
     let since = parse_stats_period_ms(query.get("statsPeriod").map(String::as_str))
         .unwrap_or(until - 86_400_000);
@@ -738,6 +1064,9 @@ pub async fn list_transactions(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     let since = parse_stats_period_ms(query.get("statsPeriod").map(String::as_str))
         .unwrap_or_else(|| now_ms() - 86_400_000);
     match state.storage.list_transactions(&ctx, since).await {
@@ -756,6 +1085,9 @@ pub async fn get_trace_context(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     match state.storage.get_trace_context(&ctx, &trace_id).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -772,6 +1104,9 @@ pub async fn list_releases(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:read") {
+        return r;
+    }
     match state.storage.list_releases(&ctx).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -790,6 +1125,9 @@ pub async fn upload_sourcemap(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:releases") {
+        return r;
+    }
     if !ctx.role.can_mutate_issues() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -886,6 +1224,9 @@ pub async fn list_monitors(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:read") {
+        return r;
+    }
     match state.storage.list_monitors(&ctx).await {
         Ok(m) => Json(m).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -910,6 +1251,9 @@ pub async fn create_monitor(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -935,6 +1279,9 @@ pub async fn delete_monitor(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -956,6 +1303,9 @@ pub async fn get_heartbeat_check(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:read") {
+        return r;
+    }
     match state.storage.get_heartbeat(&ctx, &uuid).await {
         Ok(Some(m)) => Json(m).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Monitor not found" }))).into_response(),
@@ -973,6 +1323,9 @@ pub async fn post_heartbeat_check(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:write") {
+        return r;
+    }
     if !ctx.role.can_mutate_issues() {
         return (
             StatusCode::FORBIDDEN,
@@ -1001,6 +1354,9 @@ pub async fn list_alerts(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:read") {
+        return r;
+    }
     match state.storage.list_alert_rules(&ctx).await {
         Ok(rules) => Json(rules).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -1032,6 +1388,9 @@ pub async fn create_alert(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires admin or owner role" }))).into_response();
     }
@@ -1092,7 +1451,19 @@ pub async fn create_alert(
         email_to,
     };
     match state.storage.create_alert_rule(&ctx, &rule).await {
-        Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
+        Ok(created) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "alert.created",
+                "alert_rule",
+                &created.id.to_string(),
+                json!({ "name": created.name, "trigger": created.trigger_type, "channel": created.channel_type }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(created)).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -1107,11 +1478,26 @@ pub async fn delete_alert(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
     match state.storage.delete_alert_rule(&ctx, rule_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "alert.deleted",
+                "alert_rule",
+                &rule_id.to_string(),
+                json!({}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Rule not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -1127,6 +1513,9 @@ pub async fn test_alert(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "project:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -1163,6 +1552,9 @@ pub async fn list_api_tokens(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_session_only(&ctx) {
+        return r;
+    }
     match state.storage.list_api_tokens(&ctx).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -1173,6 +1565,8 @@ pub async fn list_api_tokens(
 pub struct CreateTokenReq {
     pub name: String,
     pub role: Option<String>,
+    pub scopes: Option<Vec<String>>,
+    pub expires_in_days: Option<i64>,
 }
 
 pub async fn create_api_token(
@@ -1185,20 +1579,56 @@ pub async fn create_api_token(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_session_only(&ctx) {
+        return r;
+    }
     if !ctx.role.can_manage_org() {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires owner/admin role" }))).into_response();
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires owner/manager/admin role" }))).into_response();
+    }
+    if let Err(r) = require_step_up(&ctx) {
+        return r;
     }
     let requested_role = req
         .role
         .as_deref()
         .and_then(UserRole::from_db)
         .unwrap_or(UserRole::Member);
-    // Prevent privilege escalation: non-owner cannot mint owner token
-    if requested_role == UserRole::Owner && ctx.role != UserRole::Owner {
+    // Prevent privilege escalation: cannot mint token with higher role than actor
+    if requested_role.rank() > ctx.role.rank() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Cannot mint token with higher privilege" }))).into_response();
     }
 
-    let payload_val = json!({ "name": req.name, "role": requested_role.as_str() });
+    let effective_scopes = if let Some(ref raw_list) = req.scopes {
+        let joined = raw_list.join(" ");
+        let filtered = intersect_scopes(requested_role, &joined);
+        if filtered.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "At least one valid scope permitted by the token role is required" })),
+            )
+                .into_response();
+        }
+        filtered
+    } else {
+        requested_role
+            .default_scopes()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    };
+    let scopes_str = effective_scopes.join(" ");
+    let now_sec = chrono::Utc::now().timestamp();
+    let expires_at = req
+        .expires_in_days
+        .filter(|&d| d > 0)
+        .map(|d| now_sec + d.clamp(1, 365) * 86400);
+
+    let payload_val = json!({
+        "name": req.name,
+        "role": requested_role.as_str(),
+        "scopes": scopes_str,
+        "expires_in_days": req.expires_in_days,
+    });
     let idem = match check_idempotency(&state, &ctx, &headers, "create_api_token", &payload_val).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -1207,14 +1637,34 @@ pub async fn create_api_token(
     let (plaintext, prefix, sha) = generate_api_token();
     let (status_code, body_str, replay_safe_str) = match state
         .storage
-        .create_api_token(&ctx, req.name.trim(), &sha, &prefix, requested_role)
+        .create_api_token(
+            &ctx,
+            req.name.trim(),
+            &sha,
+            &prefix,
+            requested_role,
+            &scopes_str,
+            expires_at,
+        )
         .await
     {
-        Ok(dto) => (
-            StatusCode::CREATED,
-            serde_json::to_string(&json!({ "token": plaintext, "meta": dto })).unwrap(),
-            serde_json::to_string(&json!({ "token": "[REDACTED_ON_REPLAY]", "meta": dto, "replayed": true })).unwrap(),
-        ),
+        Ok(dto) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "api_token.created",
+                "api_token",
+                &dto.id.to_string(),
+                json!({ "role": dto.role, "scopes": dto.scopes, "expires_at": dto.expires_at }),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                serde_json::to_string(&json!({ "token": plaintext, "meta": dto })).unwrap(),
+                serde_json::to_string(&json!({ "token": "[REDACTED_ON_REPLAY]", "meta": dto, "replayed": true })).unwrap(),
+            )
+        }
         Err(e) => {
             let err_s = serde_json::to_string(&json!({ "error": e })).unwrap();
             (StatusCode::BAD_REQUEST, err_s.clone(), err_s)
@@ -1244,11 +1694,26 @@ pub async fn delete_api_token(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_session_only(&ctx) {
+        return r;
+    }
     if !ctx.role.can_manage_org() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
     match state.storage.delete_api_token(&ctx, token_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "api_token.deleted",
+                "api_token",
+                &token_id.to_string(),
+                json!({}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Token not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -1264,6 +1729,9 @@ pub async fn list_members(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "member:read") {
+        return r;
+    }
     match state.storage.list_members(&ctx).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -1289,17 +1757,20 @@ pub async fn invite_member(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "member:write") {
+        return r;
+    }
     if !ctx.role.can_manage_org() {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires owner or admin role" }))).into_response();
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Requires owner, manager, or admin role" }))).into_response();
     }
     let Some(target_role) = UserRole::from_db(&req.role) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid role" }))).into_response();
     };
-    if target_role == UserRole::Owner && ctx.role != UserRole::Owner {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only owners can invite owners" }))).into_response();
+    if target_role.rank() > ctx.role.rank() || (target_role == UserRole::Owner && ctx.role != UserRole::Owner) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Cannot assign higher role than your own" }))).into_response();
     }
-    if req.password.len() < 8 {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Password must be at least 8 characters" }))).into_response();
+    if let Err(msg) = validate_password_strength(&req.password, &req.email, &req.name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
     let Ok(pw_hash) = hash_password(req.password).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Hash failed" }))).into_response();
@@ -1309,7 +1780,19 @@ pub async fn invite_member(
         .invite_member(&ctx, req.email.trim(), req.name.trim(), &pw_hash, target_role)
         .await
     {
-        Ok(m) => (StatusCode::CREATED, Json(m)).into_response(),
+        Ok(m) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "member.invited",
+                "user",
+                &m.user_id.to_string(),
+                json!({ "email": m.email, "role": m.role }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(m)).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -1330,6 +1813,9 @@ pub async fn update_member_role(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "member:admin") {
+        return r;
+    }
     if !ctx.role.can_manage_org() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
@@ -1339,11 +1825,34 @@ pub async fn update_member_role(
     let Some(target_role) = UserRole::from_db(&req.role) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid role" }))).into_response();
     };
-    if target_role == UserRole::Owner && ctx.role != UserRole::Owner {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only owners can promote to owner" }))).into_response();
+    let members = state.storage.list_members(&ctx).await.unwrap_or_default();
+    let target_is_owner = members
+        .iter()
+        .find(|m| m.user_id == target_uid)
+        .map(|m| m.role == "owner")
+        .unwrap_or(false);
+    if target_role == UserRole::Owner || target_is_owner || target_role.rank() > ctx.role.rank() {
+        if ctx.role != UserRole::Owner {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only owners can grant or modify owner/higher privilege roles" }))).into_response();
+        }
+        if let Err(r) = require_step_up(&ctx) {
+            return r;
+        }
     }
     match state.storage.update_member_role(&ctx, target_uid, target_role).await {
-        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Ok(dto)) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "member.role_updated",
+                "user",
+                &target_uid.to_string(),
+                json!({ "role": dto.role }),
+            )
+            .await;
+            Json(dto).into_response()
+        }
         Ok(Err(msg)) => (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -1359,11 +1868,40 @@ pub async fn remove_member(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "member:admin") {
+        return r;
+    }
     if !ctx.role.can_manage_org() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
+    let members = state.storage.list_members(&ctx).await.unwrap_or_default();
+    let target_is_owner = members
+        .iter()
+        .find(|m| m.user_id == target_uid)
+        .map(|m| m.role == "owner")
+        .unwrap_or(false);
+    if target_is_owner {
+        if ctx.role != UserRole::Owner {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only owners can remove another owner" }))).into_response();
+        }
+        if let Err(r) = require_step_up(&ctx) {
+            return r;
+        }
+    }
     match state.storage.remove_member(&ctx, target_uid).await {
-        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(true)) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "member.removed",
+                "user",
+                &target_uid.to_string(),
+                json!({ "sessions_tokens_revoked": true }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(Ok(false)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Member not found" }))).into_response(),
         Ok(Err(msg)) => (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -1411,6 +1949,9 @@ pub async fn get_self_check(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "org:read") {
+        return r;
+    }
     let report = evaluate_self_check(&state, &ctx).await;
     Json(report).into_response()
 }
@@ -1426,6 +1967,9 @@ pub async fn run_self_check_probe(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (
             StatusCode::FORBIDDEN,
@@ -1504,6 +2048,9 @@ pub async fn ack_self_check_errors(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "event:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (
             StatusCode::FORBIDDEN,
@@ -1536,6 +2083,9 @@ pub async fn list_shield_events(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "shield:read") {
+        return r;
+    }
     let project_id = query.get("project_id").and_then(|s| s.parse::<i64>().ok());
     let limit = query
         .get("limit")
@@ -1559,6 +2109,9 @@ pub async fn list_shield_quarantine(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "shield:read") {
+        return r;
+    }
     let project_id = query.get("project_id").and_then(|s| s.parse::<i64>().ok());
     match state.storage.list_quarantine(&ctx, project_id).await {
         Ok(entries) => Json(entries).into_response(),
@@ -1576,6 +2129,9 @@ pub async fn delete_shield_quarantine(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "shield:write") {
+        return r;
+    }
     if !ctx.role.can_write_project() {
         return (
             StatusCode::FORBIDDEN,
@@ -1584,7 +2140,19 @@ pub async fn delete_shield_quarantine(
             .into_response();
     }
     match state.storage.delete_quarantine(&ctx, entry_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "shield.quarantine_deleted",
+                "quarantine",
+                &entry_id.to_string(),
+                json!({}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Quarantine entry not found" }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
@@ -1600,6 +2168,9 @@ pub async fn get_shield_blocklist(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if let Err(r) = require_scope(&ctx, "shield:read") {
+        return r;
+    }
     let projects = match state.storage.list_projects(&ctx).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -1660,4 +2231,288 @@ pub async fn get_shield_blocklist(
         bytes,
     )
         .into_response()
+}
+
+// ----------------------------------------------------------------------------
+// Tamper-Evident Audit Logs, Org Security Settings & Expiring Invitations
+// ----------------------------------------------------------------------------
+
+pub async fn list_audit_logs(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "org:read") {
+        return r;
+    }
+    if !ctx.role.can_manage_org() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Requires owner, manager, or admin role" })),
+        )
+            .into_response();
+    }
+    let action_filter = query.get("action").map(String::as_str).filter(|s| !s.is_empty());
+    let limit = query
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let offset = query
+        .get("offset")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, 100_000);
+    match state
+        .storage
+        .list_audit_logs(&ctx, action_filter, limit, offset)
+        .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn verify_audit_logs(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "org:read") {
+        return r;
+    }
+    if !ctx.role.can_manage_org() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Requires owner, manager, or admin role" })),
+        )
+            .into_response();
+    }
+    match state.storage.verify_audit_chain(&ctx).await {
+        Ok(rep) => Json(rep).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn get_org_security_settings(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "org:read") {
+        return r;
+    }
+    match state.storage.get_org_security_settings(&ctx).await {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn update_org_security_settings(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    Json(mut settings): Json<OrgSecuritySettings>,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "org:write") {
+        return r;
+    }
+    if !ctx.role.can_manage_org() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Requires owner, manager, or admin role" })),
+        )
+            .into_response();
+    }
+    if let Err(r) = require_step_up(&ctx) {
+        return r;
+    }
+    settings.event_throttle_rate = settings.event_throttle_rate.min(100);
+    if settings.require_mfa_for_admins {
+        match state.storage.count_owners_without_mfa(&ctx).await {
+            Ok(0) => {}
+            Ok(n) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!("{n} owner account(s) have no MFA enabled; enable TOTP or Passkey on owner accounts first")
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        }
+    }
+    match state
+        .storage
+        .update_org_security_settings(&ctx, &settings)
+        .await
+    {
+        Ok(updated) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "org.security_settings_updated",
+                "organization",
+                &ctx.organization_id.to_string(),
+                json!({
+                    "scrub_ip_addresses": updated.scrub_ip_addresses,
+                    "event_throttle_rate": updated.event_throttle_rate,
+                    "require_mfa_for_admins": updated.require_mfa_for_admins,
+                }),
+            )
+            .await;
+            Json(updated).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn list_invitations(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "member:read") {
+        return r;
+    }
+    if !ctx.role.can_manage_org() {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
+    }
+    match state.storage.list_invitations(&ctx).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateInvitationReq {
+    pub email: String,
+    pub role: String,
+}
+
+pub async fn create_invitation(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    Json(req): Json<CreateInvitationReq>,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "member:write") {
+        return r;
+    }
+    if !ctx.role.can_manage_org() {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
+    }
+    let clean_email = req.email.trim().to_ascii_lowercase();
+    if clean_email.len() < 5 || !clean_email.contains('@') || clean_email.contains(['\r', '\n', ' ']) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Valid email required" }))).into_response();
+    }
+    let Some(target_role) = UserRole::from_db(&req.role) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid role" }))).into_response();
+    };
+    if target_role.rank() > ctx.role.rank() || (target_role == UserRole::Owner && ctx.role != UserRole::Owner) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Cannot invite with higher privilege than your own" })),
+        )
+            .into_response();
+    }
+    let raw_token = random_token_b64(32);
+    let token_sha = sha256_hex(raw_token.as_bytes());
+    let expires_at = chrono::Utc::now().timestamp() + 72 * 3600;
+    match state
+        .storage
+        .create_invitation(&ctx, &clean_email, target_role, &token_sha, expires_at)
+        .await
+    {
+        Ok(inv) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "invitation.created",
+                "org_invitation",
+                &inv.id.to_string(),
+                json!({ "email": inv.email, "role": inv.role, "expires_at": inv.expires_at }),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "invitation": inv,
+                    "token": raw_token,
+                    "invite_url": format!("/invite/{raw_token}"),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn revoke_invitation(
+    State(state): State<Arc<AppState>>,
+    Path((org, inv_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "member:write") {
+        return r;
+    }
+    if !ctx.role.can_manage_org() {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
+    }
+    match state.storage.revoke_invitation(&ctx, inv_id).await {
+        Ok(true) => {
+            record_audit(
+                &state,
+                &ctx,
+                &headers,
+                "invitation.revoked",
+                "org_invitation",
+                &inv_id.to_string(),
+                json!({}),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Invitation not found" }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
 }

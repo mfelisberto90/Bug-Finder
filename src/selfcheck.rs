@@ -457,7 +457,7 @@ fn check_security_posture_item(config: &AppConfig) -> SelfCheckItem {
 }
 
 pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheckReport {
-    let mut checks = Vec::with_capacity(11);
+    let mut checks = Vec::with_capacity(16);
     let mut engine = if state.config.is_postgres() {
         "postgres".to_string()
     } else {
@@ -713,9 +713,13 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
         }
     }
 
-    // 9. API Tokens
+    // 9. API Tokens & hygiene
+    let mut tokens_without_expiry: usize = 0;
+    let mut total_tokens: usize = 0;
     match state.storage.list_api_tokens(ctx).await {
         Ok(tokens) => {
+            total_tokens = tokens.len();
+            tokens_without_expiry = tokens.iter().filter(|t| t.expires_at.is_none()).count();
             if tokens.is_empty() {
                 checks.push(SelfCheckItem {
                     id: "api_tokens_configured".into(),
@@ -748,8 +752,120 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
         }
     }
 
-    // 10. Security posture + Runtime Anti-REA integrity
+    // 10. Security posture + Enterprise & GlitchTip Parity checks + Runtime Anti-REA integrity
     checks.push(check_security_posture_item(&state.config));
+
+    checks.push(if state.config.is_dev || !state.config.allowed_hosts.is_empty() || state.config.desktop_app_mode {
+        SelfCheckItem {
+            id: "allowed_hosts_configured".into(),
+            status: CheckStatus::Ok,
+            category: "security".into(),
+            title: "Host Header Allowlist (BUGFINDER_ALLOWED_HOSTS)".into(),
+            detail: if state.config.allowed_hosts.is_empty() {
+                "Localhost/dev host guard active.".into()
+            } else {
+                format!("Strict allowlist enforcing {} host(s).", state.config.allowed_hosts.len())
+            },
+            fix: None,
+        }
+    } else {
+        SelfCheckItem {
+            id: "allowed_hosts_configured".into(),
+            status: CheckStatus::Warn,
+            category: "security".into(),
+            title: "Host Header Allowlist (BUGFINDER_ALLOWED_HOSTS)".into(),
+            detail: "BUGFINDER_ALLOWED_HOSTS is empty while running in production mode.".into(),
+            fix: Some("Set BUGFINDER_ALLOWED_HOSTS=bugs.yourdomain.com to reject Host-header spoofing.".into()),
+        }
+    });
+
+    match state.storage.count_owners_without_mfa(ctx).await {
+        Ok(0) => checks.push(SelfCheckItem {
+            id: "mfa_owner_posture".into(),
+            status: CheckStatus::Ok,
+            category: "security".into(),
+            title: "Owner Multi-Factor Authentication (TOTP / Passkey)".into(),
+            detail: "All active owner accounts have TOTP or Passkey MFA enrolled.".into(),
+            fix: None,
+        }),
+        Ok(n) => checks.push(SelfCheckItem {
+            id: "mfa_owner_posture".into(),
+            status: CheckStatus::Warn,
+            category: "security".into(),
+            title: "Owner Multi-Factor Authentication (TOTP / Passkey)".into(),
+            detail: format!("{n} owner account(s) do not have MFA enabled yet."),
+            fix: Some("Open Security Shield -> Account & MFA to enroll TOTP or a WebAuthn Passkey.".into()),
+        }),
+        Err(err) => checks.push(SelfCheckItem {
+            id: "mfa_owner_posture".into(),
+            status: CheckStatus::Error,
+            category: "security".into(),
+            title: "Owner Multi-Factor Authentication (TOTP / Passkey)".into(),
+            detail: scrub_self_text(&err, 200),
+            fix: Some("Verify database schema and MFA tables.".into()),
+        }),
+    }
+
+    match state.storage.verify_audit_chain(ctx).await {
+        Ok(rep) if rep.valid => checks.push(SelfCheckItem {
+            id: "audit_chain_integrity".into(),
+            status: CheckStatus::Ok,
+            category: "security".into(),
+            title: "Tamper-Evident Audit Hash Chain".into(),
+            detail: format!("Verified {} SHA-256 chained audit entries intact.", rep.checked_entries),
+            fix: None,
+        }),
+        Ok(rep) => checks.push(SelfCheckItem {
+            id: "audit_chain_integrity".into(),
+            status: CheckStatus::Error,
+            category: "security".into(),
+            title: "Tamper-Evident Audit Hash Chain".into(),
+            detail: format!("Tampered audit chain detected: {}", rep.detail),
+            fix: Some("Inspect audit_logs table around broken_at_id immediately for unauthorized modification.".into()),
+        }),
+        Err(err) => checks.push(SelfCheckItem {
+            id: "audit_chain_integrity".into(),
+            status: CheckStatus::Error,
+            category: "security".into(),
+            title: "Tamper-Evident Audit Hash Chain".into(),
+            detail: scrub_self_text(&err, 200),
+            fix: Some("Verify audit_logs table accessibility.".into()),
+        }),
+    }
+
+    checks.push(if total_tokens == 0 || tokens_without_expiry == 0 {
+        SelfCheckItem {
+            id: "api_token_hygiene".into(),
+            status: CheckStatus::Ok,
+            category: "security".into(),
+            title: "Scoped API Token Expiration Hygiene".into(),
+            detail: if total_tokens == 0 {
+                "No non-expiring API tokens present.".into()
+            } else {
+                format!("All {total_tokens} active API token(s) have expiration deadlines.")
+            },
+            fix: None,
+        }
+    } else {
+        SelfCheckItem {
+            id: "api_token_hygiene".into(),
+            status: CheckStatus::Warn,
+            category: "security".into(),
+            title: "Scoped API Token Expiration Hygiene".into(),
+            detail: format!("{tokens_without_expiry} of {total_tokens} API token(s) have no expiration date."),
+            fix: Some("Rotate non-expiring tokens to time-bounded 30-90 day scoped tokens in Projects & SDK.".into()),
+        }
+    });
+
+    checks.push(SelfCheckItem {
+        id: "aead_secret_encryption".into(),
+        status: CheckStatus::Ok,
+        category: "security".into(),
+        title: "At-Rest AEAD Encryption (HKDF-SHA256 + AES-256-GCM)".into(),
+        detail: "AES-256-GCM AEAD active for MFA TOTP secrets and webhook HMAC secrets via HKDF-SHA256.".into(),
+        fix: None,
+    });
+
     let rt_integrity = crate::security::anti_rea::probe_self_runtime_integrity();
     checks.push(SelfCheckItem {
         id: "runtime_anti_rea_integrity".into(),

@@ -61,19 +61,42 @@ def check_files() -> list[str]:
         errors.append("Postgres security violation: literal BYPASSRLS token found")
 
     # Verify every table with organization_id has ENABLE + FORCE ROW LEVEL SECURITY
+    cap_tables = (
+        "dsn_key_lookup",
+        "api_token_lookup",
+        "session_lookup",
+        "tunnel_lookup",
+        "invitation_lookup",
+    )
     create_blocks = re.findall(
         r"CREATE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\);", pg_sql, flags=re.DOTALL
     )
     for tbl_name, body in create_blocks:
-        if "organization_id" in body and tbl_name not in ("dsn_key_lookup", "api_token_lookup", "session_lookup", "tunnel_lookup"):
-            if tbl_name not in pg_sql:
-                errors.append(f"Table {tbl_name} missing in PG schema")
-            # Checked in array or explicit ALTER TABLE statements
+        if "organization_id" in body:
             explicit_enable = f"ALTER TABLE {tbl_name} ENABLE ROW LEVEL SECURITY" in pg_sql
             explicit_force = f"ALTER TABLE {tbl_name} FORCE ROW LEVEL SECURITY" in pg_sql
             in_array = f"'{tbl_name}'" in pg_sql and "FOREACH tbl IN ARRAY tenant_tables" in pg_sql
             if not (in_array or (explicit_enable and explicit_force)):
                 errors.append(f"Table {tbl_name} has organization_id without ENABLE + FORCE RLS")
+    for cap in cap_tables:
+        if f"ALTER TABLE {cap} ENABLE ROW LEVEL SECURITY" not in pg_sql or f"ALTER TABLE {cap} FORCE ROW LEVEL SECURITY" not in pg_sql:
+            errors.append(f"Capability lookup table {cap} missing explicit ENABLE + FORCE RLS")
+
+    # Verify AEAD encryption at rest invariant (seal_secret used in MFA & persistence)
+    for req_file in ("src/http/auth_routes.rs", "src/storage/sqlite.rs", "src/storage/postgres.rs"):
+        fpath = ROOT / req_file
+        if fpath.exists():
+            txt = fpath.read_text(encoding="utf-8", errors="ignore")
+            if "seal_secret" not in txt:
+                errors.append(f"AEAD invariant missing seal_secret call in {req_file}")
+
+    # Verify zero inline styles in frontend TS sources
+    ui_dir = ROOT / "ui" / "src"
+    if ui_dir.is_dir():
+        for ts_file in ui_dir.glob("*.ts"):
+            txt = ts_file.read_text(encoding="utf-8", errors="ignore")
+            if re.search(r'style\s*=|\.style\.', txt):
+                errors.append(f"CSP inline style violation found in ui/src/{ts_file.name}")
 
     return errors
 

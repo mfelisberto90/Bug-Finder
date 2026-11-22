@@ -42,6 +42,7 @@ pub fn attach_ingest_cors(headers: &mut HeaderMap) {
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
     );
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("POST, OPTIONS"),
@@ -56,6 +57,25 @@ pub fn attach_ingest_cors(headers: &mut HeaderMap) {
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static("X-Sentry-Rate-Limits, Retry-After"),
     );
+}
+
+pub fn attach_ingest_cors_for_request(
+    resp_headers: &mut HeaderMap,
+    req_headers: &HeaderMap,
+    allowed_domains: &[String],
+) {
+    attach_ingest_cors(resp_headers);
+    if !allowed_domains.is_empty() {
+        resp_headers.remove(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+        if let Some(orig) = req_headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            let trimmed = orig.trim();
+            if is_origin_allowed(trimmed, allowed_domains) {
+                if let Ok(val) = HeaderValue::from_str(trimmed) {
+                    resp_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, val);
+                }
+            }
+        }
+    }
 }
 
 pub async fn options_ingest() -> Response {
@@ -102,9 +122,15 @@ async fn authenticate_project(
         ));
     };
     let key_sha = sha256_hex(raw_key.as_bytes());
+    if state.invalid_dsn_cache.is_blocked(project_id, &key_sha) {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid DSN"));
+    }
     match state.storage.resolve_dsn(project_id, &key_sha).await {
         Ok(Some(info)) => Ok(info),
-        Ok(None) => Err(error_response(StatusCode::UNAUTHORIZED, "Invalid DSN")),
+        Ok(None) => {
+            state.invalid_dsn_cache.mark_invalid(project_id, &key_sha);
+            Err(error_response(StatusCode::UNAUTHORIZED, "Invalid DSN"))
+        }
         Err(e) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)),
     }
 }
@@ -272,6 +298,21 @@ async fn emit_shield_security_event(state: &AppState, ev: NewSecurityEvent) {
     }
 }
 
+fn is_event_throttled(auth: &ProjectAuthInfo) -> bool {
+    let eff = auth
+        .filters
+        .event_throttle_rate
+        .max(auth.org_event_throttle_rate)
+        .min(100);
+    if eff >= 100 {
+        return true;
+    }
+    if eff == 0 {
+        return false;
+    }
+    rand::random::<u8>() % 100 < eff
+}
+
 async fn process_single_event(
     state: &AppState,
     auth: &ProjectAuthInfo,
@@ -293,9 +334,17 @@ async fn process_single_event(
         return Ok(None);
     }
 
+    if is_event_throttled(auth) {
+        state
+            .metrics
+            .dropped_inbound_filter_total
+            .fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+
     maybe_demangle_event(state, auth, &mut ev).await;
 
-    let scrubber = Scrubber::from_filters(&auth.filters);
+    let scrubber = Scrubber::from_filters_with_org(&auth.filters, auth.org_scrub_ip_addresses);
     let scrub_report = scrubber.scrub_event_with_report(&mut ev);
 
     let meta = extract_issue_metadata(&ev);
@@ -398,7 +447,7 @@ async fn process_logs_batch(
     if logs.is_empty() {
         return Ok(());
     }
-    let scrubber = Scrubber::from_filters(&auth.filters);
+    let scrubber = Scrubber::from_filters_with_org(&auth.filters, auth.org_scrub_ip_addresses);
     let mut live_items = Vec::with_capacity(logs.len());
     let mut detected_threats = Vec::new();
     let mut leaked_cats: Vec<&'static str> = Vec::new();
@@ -548,7 +597,7 @@ async fn handle_parsed_envelope(
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
     let received_ms = now_ms();
-    let tx_scrubber = Scrubber::from_filters(&auth.filters);
+    let tx_scrubber = Scrubber::from_filters_with_org(&auth.filters, auth.org_scrub_ip_addresses);
     for item in parsed.items {
         match item {
             EnvelopeItem::Event(ev) => {
@@ -638,7 +687,7 @@ pub async fn ingest_envelope(
     match handle_envelope_bytes(&state, &auth, &headers, &client_ip, &decompressed).await {
         Ok(resp) => {
             let mut r = (StatusCode::OK, Json(resp)).into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Err(r) => r,
@@ -708,7 +757,7 @@ pub async fn ingest_tunnel(
     match handle_parsed_envelope(&state, &auth, &headers, &client_ip, parsed).await {
         Ok(resp) => {
             let mut r = (StatusCode::OK, Json(resp)).into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Err(r) => r,
@@ -746,12 +795,12 @@ pub async fn ingest_store(
     match process_single_event(&state, &auth, &headers, &client_ip, ev).await {
         Ok(Some(eid)) => {
             let mut r = (StatusCode::OK, Json(json!({ "id": eid, "event_id": eid }))).into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Ok(None) => {
             let mut r = (StatusCode::OK, Json(json!({ "id": null, "filtered": true }))).into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Err(r) => r,
@@ -820,7 +869,7 @@ pub async fn ingest_security(
     match process_single_event(&state, &auth, &headers, &client_ip, ev).await {
         Ok(_) => {
             let mut r = StatusCode::CREATED.into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Err(r) => r,
@@ -851,8 +900,12 @@ async fn resolve_log_project_auth(
         if let Some(tok) = auth_hdr.strip_prefix("Bearer ").or_else(|| auth_hdr.strip_prefix("bearer ")) {
             if let Some((pub_key, pid)) = parse_dsn_url(tok.trim()) {
                 let key_sha = sha256_hex(pub_key.as_bytes());
-                if let Ok(Some(info)) = state.storage.resolve_dsn(pid, &key_sha).await {
-                    return Ok(info);
+                if !state.invalid_dsn_cache.is_blocked(pid, &key_sha) {
+                    match state.storage.resolve_dsn(pid, &key_sha).await {
+                        Ok(Some(info)) => return Ok(info),
+                        Ok(None) => state.invalid_dsn_cache.mark_invalid(pid, &key_sha),
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -898,7 +951,7 @@ pub async fn ingest_otlp_logs(
     match process_logs_batch(&state, &auth, &client_ip, logs).await {
         Ok(()) => {
             let mut r = (StatusCode::OK, Json(json!({ "partialSuccess": {} }))).into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Err(r) => r,
@@ -995,7 +1048,7 @@ pub async fn ingest_direct_logs(
     match process_logs_batch(&state, &auth, &client_ip, normalized).await {
         Ok(()) => {
             let mut r = (StatusCode::ACCEPTED, Json(json!({ "accepted": true }))).into_response();
-            attach_ingest_cors(r.headers_mut());
+            attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
             r
         }
         Err(r) => r,
@@ -1025,11 +1078,15 @@ async fn authenticate_shield_request(
         {
             if tok.starts_with("bf_") {
                 let sha = sha256_hex(tok.as_bytes());
-                let ctx = match state.storage.resolve_api_token(&sha, None).await {
+                let now_sec = chrono::Utc::now().timestamp();
+                let ctx = match state.storage.resolve_api_token(&sha, None, now_sec).await {
                     Ok(Some(c)) => c,
-                    Ok(None) => return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid API token")),
+                    Ok(None) => return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid or expired API token")),
                     Err(e) => return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)),
                 };
+                if !ctx.has_any_scope(&["shield:write", "event:write"]) {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Token missing shield:write or event:write scope"));
+                }
                 if !ctx.role.can_mutate_issues() {
                     return Err(error_response(StatusCode::FORBIDDEN, "Insufficient token role"));
                 }
@@ -1041,6 +1098,11 @@ async fn authenticate_shield_request(
                 let Some(proj) = projs.into_iter().find(|p| p.id == project_id) else {
                     return Err(error_response(StatusCode::NOT_FOUND, "Project not found"));
                 };
+                let org_sec = state
+                    .storage
+                    .get_org_security_settings(&ctx)
+                    .await
+                    .unwrap_or_default();
                 return Ok((
                     ProjectAuthInfo {
                         project_id: proj.id,
@@ -1050,6 +1112,8 @@ async fn authenticate_shield_request(
                         first_event_at: proj.first_event_at,
                         rate_limit_per_min: 300,
                         filters: proj.filters,
+                        org_scrub_ip_addresses: org_sec.scrub_ip_addresses,
+                        org_event_throttle_rate: org_sec.event_throttle_rate,
                     },
                     "backend_verified",
                 ));
@@ -1100,7 +1164,7 @@ pub async fn ingest_shield(
 
     if !auth.filters.shield.enabled {
         let mut r = (StatusCode::ACCEPTED, Json(json!({ "ok": true, "skipped": true }))).into_response();
-        attach_ingest_cors(r.headers_mut());
+        attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
         return r;
     }
 
@@ -1139,7 +1203,7 @@ pub async fn ingest_shield(
         "logged"
     };
 
-    let scrubber = Scrubber::from_filters(&auth.filters);
+    let scrubber = Scrubber::from_filters_with_org(&auth.filters, auth.org_scrub_ip_addresses);
     let mut details_val = req.details.unwrap_or_else(|| json!({}));
     let _ = scrubber.scrub_log_with_report(&mut String::new(), &mut details_val);
     let clean_path: String = req
@@ -1191,6 +1255,6 @@ pub async fn ingest_shield(
         })),
     )
         .into_response();
-    attach_ingest_cors(r.headers_mut());
+    attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
     r
 }
