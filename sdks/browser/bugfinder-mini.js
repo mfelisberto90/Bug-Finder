@@ -6,6 +6,7 @@
 
   var cfg = {
     endpoint: "",
+    shieldEndpoint: "",
     dsnKey: "",
     rawDsn: "",
     release: "",
@@ -27,6 +28,7 @@
       var s = String(rawUrl || "");
       if (!s) return false;
       if (cfg.endpoint && s.indexOf(cfg.endpoint) !== -1) return true;
+      if (cfg.shieldEndpoint && s.indexOf(cfg.shieldEndpoint) !== -1) return true;
       return /\/api\/\d+\/(?:envelope|store|security|shield|otlp\/v1\/logs)\b/.test(s);
     } catch (_) {
       return false;
@@ -290,6 +292,7 @@
   function init(options) {
     options = options || {};
     cfg.rawDsn = options.dsn || "";
+    cfg.shieldEndpoint = options.shieldEndpoint || "";
     if (options.tunnel) {
       cfg.endpoint = options.tunnel;
       cfg.dsnKey = "";
@@ -358,6 +361,7 @@
         init({
           dsn: ds.dsn || "",
           tunnel: ds.tunnel || "",
+          shieldEndpoint: ds.shieldEndpoint || "",
           environment: ds.env || "production",
           release: ds.release || "",
           captureFetch: capFetch,
@@ -369,22 +373,30 @@
           curScript.src &&
           typeof document !== "undefined"
         ) {
-          var sTag = document.createElement("script");
-          sTag.src = new URL("/sdk/bugfinder-shield.js", curScript.src).toString();
-          sTag.async = true;
-          if (curScript.nonce) sTag.nonce = curScript.nonce;
-          if (curScript.crossOrigin) sTag.crossOrigin = "anonymous";
-          if (ds.shieldSri) sTag.integrity = ds.shieldSri;
-          sTag.onload = function () {
-            if (root.BugFinderShield && typeof root.BugFinderShield.init === "function") {
-              root.BugFinderShield.init({
-                dsn: ds.dsn || "",
-                mode: shieldMode,
-                allowFetchPatching: capFetch
-              });
-            }
-          };
-          (document.head || document.documentElement).appendChild(sTag);
+          var baseHref = typeof location !== "undefined" && location.href ? location.href : undefined;
+          var scriptUrl = new URL(curScript.src, baseHref);
+          var shieldSrc = ds.shieldSrc || "/sdk/bugfinder-shield.js";
+          var resolvedShieldUrl = new URL(shieldSrc, scriptUrl.toString());
+          if (resolvedShieldUrl.origin === scriptUrl.origin) {
+            var sTag = document.createElement("script");
+            sTag.src = resolvedShieldUrl.toString();
+            sTag.async = true;
+            if (curScript.nonce) sTag.nonce = curScript.nonce;
+            if (curScript.crossOrigin) sTag.crossOrigin = "anonymous";
+            if (ds.shieldSri) sTag.integrity = ds.shieldSri;
+            sTag.onload = function () {
+              if (root.BugFinderShield && typeof root.BugFinderShield.init === "function") {
+                var shieldOpts = { mode: shieldMode, allowFetchPatching: capFetch };
+                if (ds.shieldEndpoint) {
+                  shieldOpts.endpoint = ds.shieldEndpoint;
+                } else if (ds.dsn) {
+                  shieldOpts.dsn = ds.dsn;
+                }
+                root.BugFinderShield.init(shieldOpts);
+              }
+            };
+            (document.head || document.documentElement).appendChild(sTag);
+          }
         }
       }
     }
