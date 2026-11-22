@@ -3516,6 +3516,12 @@ async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
         mini_txt.contains("document.currentScript"),
         "mini SDK should include 1-tag currentScript auto-boot"
     );
+    assert!(
+        mini_txt.contains("shieldSrc")
+            && mini_txt.contains("shieldEndpoint")
+            && mini_txt.contains("resolvedShieldUrl.origin === scriptUrl.origin"),
+        "mini SDK should support zero-leak same-origin data-shield-src and data-shield-endpoint with origin pinning"
+    );
 
     let (shield_st, shield_hdrs, shield_bytes) =
         send_raw(&router, "GET", "/sdk/bugfinder-shield.js", &[], Vec::new()).await;
