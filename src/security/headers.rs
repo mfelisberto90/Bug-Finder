@@ -7,6 +7,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -224,6 +225,19 @@ pub async fn security_headers_middleware(
 
     let is_https = is_https_request(&headers, &state.config);
     let mut resp = next.run(req).await;
+    if resp.status().is_server_error() {
+        state.self_monitor.record(
+            "http_5xx",
+            "error",
+            "http",
+            &format!("HTTP {} on {}", resp.status().as_u16(), path),
+            None,
+        );
+        state
+            .metrics
+            .self_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let h = resp.headers_mut();
 
     let csp = format!(

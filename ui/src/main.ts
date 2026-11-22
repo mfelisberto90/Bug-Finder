@@ -1,20 +1,24 @@
 import {
   apiFetch,
   setCsrfToken,
+  setTransportErrorHook,
   type AlertRule,
   type ApiTokenItem,
   type IssueEventDetail,
   type IssueSummary,
+  type LocalSelfError,
   type LogEventItem,
   type Organization,
   type Project,
   type ReleaseHealth,
+  type SelfCheckReport,
+  type SelfProbeResult,
   type TransactionSummary,
   type UptimeMonitor,
   type UserInfo
 } from "./api";
 
-type TabId = "issues" | "logs" | "perf" | "uptime" | "projects";
+type TabId = "issues" | "logs" | "perf" | "uptime" | "projects" | "selfcheck";
 
 interface AppStateModel {
   loading: boolean;
@@ -43,6 +47,10 @@ interface AppStateModel {
   toast: string | null;
   traceView: Record<string, any> | null;
   themePref: "system" | "light" | "dark";
+  selfCheck: SelfCheckReport | null;
+  lastProbe: SelfProbeResult | null;
+  localSelfErrors: LocalSelfError[];
+  probeRunning: boolean;
 }
 
 const state: AppStateModel = {
@@ -71,11 +79,20 @@ const state: AppStateModel = {
   lastCreatedToken: null,
   toast: null,
   traceView: null,
-  themePref: readSavedTheme()
+  themePref: readSavedTheme(),
+  selfCheck: null,
+  lastProbe: null,
+  localSelfErrors: [],
+  probeRunning: false
 };
 
 let sseSource: EventSource | null = null;
 let openDialogCount = 0;
+let inRender = false;
+let localErrSeq = 1;
+let sendingClientError = false;
+let lastClientErrSentAt = 0;
+let lastClientErrSig = "";
 
 function readSavedTheme(): "system" | "light" | "dark" {
   try {
@@ -154,6 +171,109 @@ function openDialog(dlg: HTMLDialogElement): void {
   dlg.showModal();
 }
 
+function scheduleRender(): void {
+  if (inRender) {
+    queueMicrotask(() => render());
+  } else {
+    render();
+  }
+}
+
+async function refreshSelfCheck(): Promise<void> {
+  if (!state.orgSlug || !state.user) return;
+  const res = await apiFetch<SelfCheckReport>(
+    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/`
+  );
+  if (res.ok && res.data) {
+    state.selfCheck = res.data;
+  }
+}
+
+function recordClientSelfError(
+  source: string,
+  message: string,
+  detail?: string,
+  severity: "error" | "warn" = "error"
+): void {
+  const cleanMsg = (message || "Unexpected UI error").slice(0, 240);
+  const cleanDetail = detail ? detail.slice(0, 480) : undefined;
+  const sig = `${source}|${cleanMsg}`;
+
+  let insertedEntryId: number | null = null;
+  if (state.localSelfErrors[0]?.message !== cleanMsg || state.localSelfErrors[0]?.source !== source) {
+    insertedEntryId = localErrSeq++;
+    state.localSelfErrors.unshift({
+      id: insertedEntryId,
+      timestamp: new Date().toISOString(),
+      source,
+      severity,
+      component: "spa",
+      message: cleanMsg,
+      detail: cleanDetail
+    });
+    if (state.localSelfErrors.length > 32) {
+      state.localSelfErrors.length = 32;
+    }
+    scheduleRender();
+  }
+
+  const now = Date.now();
+  if (
+    state.user &&
+    state.orgSlug &&
+    !sendingClientError &&
+    (sig !== lastClientErrSig || now - lastClientErrSentAt >= 5000)
+  ) {
+    sendingClientError = true;
+    lastClientErrSig = sig;
+    lastClientErrSentAt = now;
+    void apiFetch(
+      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/client-error/`,
+      {
+        method: "POST",
+        body: {
+          message: cleanMsg,
+          component: "spa",
+          severity,
+          detail: cleanDetail
+        }
+      }
+    )
+      .then(async (res) => {
+        if (res.ok) {
+          await refreshSelfCheck();
+          if (state.selfCheck && insertedEntryId !== null) {
+            state.localSelfErrors = state.localSelfErrors.filter((e) => e.id !== insertedEntryId);
+          }
+          scheduleRender();
+        }
+      })
+      .finally(() => {
+        sendingClientError = false;
+      });
+  }
+}
+
+window.addEventListener("error", (ev) => {
+  const loc = ev.filename ? `${ev.filename}:${ev.lineno}:${ev.colno}` : undefined;
+  recordClientSelfError("window.error", ev.message || "Unhandled JS error", loc);
+});
+
+window.addEventListener("unhandledrejection", (ev) => {
+  const reason: any = ev.reason;
+  const msg = reason?.message ? String(reason.message) : String(reason || "Unhandled Promise rejection");
+  const stack = reason?.stack ? String(reason.stack) : undefined;
+  recordClientSelfError("unhandledrejection", msg, stack);
+});
+
+setTransportErrorHook((info) => {
+  recordClientSelfError(
+    info.status === 0 ? "network_error" : "api_5xx",
+    info.message,
+    `endpoint=${info.path} status=${info.status}`
+  );
+});
+
 async function boot(): Promise<void> {
   const me = await apiFetch<any>("/api/auth/me");
   if (me.ok && me.data) {
@@ -162,7 +282,7 @@ async function boot(): Promise<void> {
     state.orgs = me.data.organizations || [];
     setCsrfToken(me.data.csrf_token || "");
     state.loading = false;
-    await loadCurrentTabData();
+    await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
     render();
     return;
   }
@@ -212,6 +332,8 @@ async function loadCurrentTabData(): Promise<void> {
   } else if (state.tab === "projects") {
     const tokRes = await apiFetch<ApiTokenItem[]>(`/api/0/api-tokens/`);
     if (tokRes.ok && tokRes.data) state.tokens = tokRes.data;
+  } else if (state.tab === "selfcheck") {
+    await refreshSelfCheck();
   }
 }
 
@@ -655,69 +777,349 @@ bugfinder mcp --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;</pre>
     </section>`;
 }
 
+function getEffectiveSelfStatus(): {
+  status: "ok" | "warn" | "error";
+  badgeClass: string;
+  badgeText: string;
+  unackErrors: number;
+  missingCount: number;
+} {
+  const serverUnack = state.selfCheck?.unacknowledged_error_count ?? 0;
+  const localCount = state.localSelfErrors.length;
+  const unackErrors = serverUnack + localCount;
+  const missingCount = state.selfCheck?.missing_count ?? 0;
+
+  if (state.selfCheck?.overall_status === "error" || localCount > 0) {
+    return {
+      status: "error",
+      badgeClass: "error",
+      badgeText: unackErrors > 0 ? `ERR (${unackErrors})` : "ERR",
+      unackErrors,
+      missingCount
+    };
+  }
+  if (state.selfCheck?.overall_status === "warn") {
+    return {
+      status: "warn",
+      badgeClass: "warn",
+      badgeText: missingCount > 0 ? `WARN (${missingCount})` : "WARN",
+      unackErrors,
+      missingCount
+    };
+  }
+  return {
+    status: "ok",
+    badgeClass: "ok",
+    badgeText: "OK",
+    unackErrors,
+    missingCount
+  };
+}
+
+function renderSelfCheckBanner(): string {
+  if (state.tab === "selfcheck") return "";
+  const summary = getEffectiveSelfStatus();
+  if (summary.status === "ok" && summary.missingCount === 0 && summary.unackErrors === 0) {
+    return "";
+  }
+  const stripClass =
+    summary.status === "error" ? "selfcheck-strip-error" : "selfcheck-strip-warn";
+  const label =
+    summary.status === "error"
+      ? `Auto-Check detectou ${summary.unackErrors} erro(s) interno(s) ou falha crítica`
+      : `Auto-Check: ${summary.missingCount} item(ns) recomendado(s) pendente(s)`;
+
+  return `
+    <div class="selfcheck-strip ${stripClass}" role="status">
+      <div class="selfcheck-strip-copy">
+        <span class="badge badge-${esc(summary.badgeClass)}">${esc(summary.badgeText)}</span>
+        <strong>${esc(label)}</strong>
+      </div>
+      <button id="btn-open-selfcheck" data-tab="selfcheck">Abrir Auto-Check</button>
+    </div>`;
+}
+
+function renderSelfCheckTab(): string {
+  const rep = state.selfCheck;
+  const summary = getEffectiveSelfStatus();
+  const origin = location.origin;
+  const firstProj = state.projects[0];
+  const sampleDsn = firstProj?.dsn_public_key
+    ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
+    : `${origin.replace("://", "://<KEY>@")}/1`;
+
+  const rssMb = rep?.vm_rss_bytes != null ? (rep.vm_rss_bytes / (1024 * 1024)).toFixed(1) : "-";
+  const dbMb = rep ? (rep.db_size_bytes / (1024 * 1024)).toFixed(2) : "-";
+
+  const mergedErrors: Array<{
+    source: string;
+    component: string;
+    severity: string;
+    message: string;
+    detail: string | null;
+    count: number;
+    time: string;
+  }> = [
+    ...state.localSelfErrors.map((e) => ({
+      source: e.source,
+      component: e.component,
+      severity: e.severity,
+      message: e.message,
+      detail: e.detail || null,
+      count: 1,
+      time: e.timestamp.slice(11, 19)
+    })),
+    ...(rep?.self_errors || []).map((e) => ({
+      source: e.source,
+      component: e.component,
+      severity: e.severity,
+      message: e.message,
+      detail: e.detail,
+      count: e.count,
+      time: new Date(e.timestamp_ms).toISOString().slice(11, 19)
+    }))
+  ];
+
+  const errRows = mergedErrors.length
+    ? mergedErrors
+        .map(
+          (e) => `
+          <tr>
+            <th scope="row" class="mono">${esc(e.source)}</th>
+            <td data-label="Component" class="mono">${esc(e.component)}</td>
+            <td data-label="Severity"><span class="badge badge-${esc(e.severity === "warn" ? "warn" : "error")}">${esc(e.severity)}</span></td>
+            <td data-label="Message">
+              <div>${esc(e.message)}</div>
+              ${e.detail ? `<div class="mono">${esc(e.detail)}</div>` : ""}
+            </td>
+            <td data-label="Count / Time" class="tabular">${e.count}x &middot; ${esc(e.time)}</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5">Zero internal app errors captured in this session or runtime buffer.</td></tr>`;
+
+  const checkRows = rep?.checks.length
+    ? rep.checks
+        .map(
+          (c) => `
+          <tr>
+            <th scope="row">${esc(c.title)}</th>
+            <td data-label="Category"><span class="badge badge-muted">${esc(c.category)}</span></td>
+            <td data-label="Status"><span class="badge badge-${esc(c.status)}">${esc(c.status)}</span></td>
+            <td data-label="Detail">${esc(c.detail)}</td>
+            <td data-label="Fix">${c.fix ? esc(c.fix) : '<span class="badge badge-ok">Ready</span>'}</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5">Loading diagnostics...</td></tr>`;
+
+  const probeHtml = state.lastProbe
+    ? `
+      <section class="card stack-col">
+        <div class="row-gap">
+          <h2>Resultado do Auto-Teste E2E</h2>
+          <span class="badge badge-${state.lastProbe.ok ? "ok" : "error"}">${state.lastProbe.ok ? "ALL PASSED" : "FAILED"}</span>
+        </div>
+        <div class="probe-list">
+          ${state.lastProbe.steps
+            .map(
+              (s) => `
+              <div class="probe-item">
+                <div>
+                  <strong class="mono">${esc(s.name)}</strong>
+                  <div>${esc(s.detail)}</div>
+                </div>
+                <span class="badge badge-${s.ok ? "ok" : "error"}">${s.ok ? "OK" : "FAIL"}</span>
+              </div>`
+            )
+            .join("")}
+        </div>
+      </section>`
+    : "";
+
+  const totalErrCount = mergedErrors.length;
+  const cmdServiceInstall = `./scripts/install.sh --service && bugfinder doctor`;
+  const cmdDockerInstall = `./scripts/install.sh --docker`;
+  const cmdMiniSdk = `<script src="${origin}/sdk/bugfinder-mini.js"></script>\n<script>\n  BugFinder.init({ dsn: "${sampleDsn}", environment: "production" });\n  BugFinder.logger.info("App started");\n</script>`;
+  const cmdSentryEnv = `SENTRY_DSN=${sampleDsn}\nGLITCHTIP_ENABLED=true\nGLITCHTIP_DSN=${sampleDsn}\nGLITCHTIP_API_URL=${origin}\nGLITCHTIP_ORGANIZATION=${state.orgSlug}`;
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">Auto-Check &amp; Self-Diagnostics</h1>
+      <div class="row-gap">
+        <button id="btn-refresh-selfcheck">Atualizar Diagnóstico</button>
+        ${
+          totalErrCount > 0 || (rep?.unacknowledged_error_count ?? 0) > 0
+            ? `<button id="btn-ack-selfcheck" class="btn-danger">Reconhecer / Limpar Erros</button>`
+            : ""
+        }
+        <div class="cta-dock">
+          <button id="btn-run-self-probe" data-primary-cta="true" ${state.probeRunning ? "disabled" : ""}>
+            ${state.probeRunning ? "Executando Auto-Teste..." : "Rodar Auto-Teste E2E"}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="card">
+        <div class="kpi-label">Status Geral</div>
+        <div class="kpi-value"><span class="badge badge-${esc(summary.badgeClass)}">${esc(summary.badgeText)}</span></div>
+      </div>
+      <div class="card">
+        <div class="kpi-label">Erros Internos</div>
+        <div class="kpi-value tabular">${summary.unackErrors}</div>
+      </div>
+      <div class="card">
+        <div class="kpi-label">Itens Faltando</div>
+        <div class="kpi-value tabular">${summary.missingCount}</div>
+      </div>
+      <div class="card">
+        <div class="kpi-label">RAM / Disco (${esc(rep?.engine || "sqlite")})</div>
+        <div class="kpi-value tabular">${esc(rssMb)} MB / ${esc(dbMb)} MiB</div>
+      </div>
+    </div>
+
+    <div class="stack-col">
+      ${probeHtml}
+
+      <section class="card stack-col">
+        <h2>Erros Internos do Próprio App</h2>
+        <div tabindex="0" role="region" aria-labelledby="self-err-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="self-err-cap" class="hp-field">Internal application errors</caption>
+            <thead><tr><th>Fonte</th><th>Componente</th><th>Severidade</th><th>Mensagem &amp; Detalhe</th><th>Qtd / Hora</th></tr></thead>
+            <tbody>${errRows}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card stack-col">
+        <h2>Checklist de Auto-Check (Sistema &amp; O que está faltando)</h2>
+        <div tabindex="0" role="region" aria-labelledby="self-chk-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="self-chk-cap" class="hp-field">System readiness diagnostics</caption>
+            <thead><tr><th>Verificação</th><th>Categoria</th><th>Status</th><th>Detalhe</th><th>Como Resolver</th></tr></thead>
+            <tbody>${checkRows}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card stack-col">
+        <h2>Instalação em 1 Comando (Servidor + SDK do Projeto)</h2>
+        <div>
+          <p><strong>1. Instalar binário + serviço systemd --user + auto-check:</strong></p>
+          <pre class="snippet-box">${esc(cmdServiceInstall)}</pre>
+          <button data-copy-text="${esc(cmdServiceInstall)}">Copiar Instalação Serviço</button>
+        </div>
+        <div>
+          <p><strong>2. Subir em Docker isolado (limite 32 MB RAM):</strong></p>
+          <pre class="snippet-box">${esc(cmdDockerInstall)}</pre>
+          <button data-copy-text="${esc(cmdDockerInstall)}">Copiar Comando Docker</button>
+        </div>
+        <div>
+          <p><strong>3. Browser Mini-SDK (&lt;3 KB zero-dep, com captura de erros + logs):</strong></p>
+          <pre class="snippet-box">${esc(cmdMiniSdk)}</pre>
+          <button data-copy-text="${esc(cmdMiniSdk)}">Copiar Snippet Browser</button>
+        </div>
+        <div>
+          <p><strong>4. .env para Sentry SDKs / RoleLane / GlitchTip:</strong></p>
+          <pre class="snippet-box">${esc(cmdSentryEnv)}</pre>
+          <button data-copy-text="${esc(cmdSentryEnv)}">Copiar Variáveis .env</button>
+        </div>
+      </section>
+    </div>`;
+}
+
 function render(): void {
   const root = document.getElementById("app");
   if (!root) return;
+  inRender = true;
+  try {
+    if (state.loading) {
+      root.innerHTML = `<main class="auth-wrap"><div class="card">Loading Bug-Finder...</div></main>`;
+      return;
+    }
 
-  if (state.loading) {
-    root.innerHTML = `<main class="auth-wrap"><div class="card">Loading Bug-Finder...</div></main>`;
-    return;
-  }
+    if (!state.user) {
+      const localErrBanner = state.localSelfErrors.length
+        ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
+        : "";
+      root.innerHTML =
+        renderAuthScreen() +
+        localErrBanner +
+        (state.toast ? `<div class="toast">${esc(state.toast)}</div>` : "");
+      bindAuthHandlers();
+      return;
+    }
 
-  if (!state.user) {
-    root.innerHTML = renderAuthScreen() + (state.toast ? `<div class="toast">${esc(state.toast)}</div>` : "");
-    bindAuthHandlers();
-    return;
-  }
+    let bodyHtml = "";
+    if (state.tab === "issues") bodyHtml = renderIssuesTab();
+    else if (state.tab === "logs") bodyHtml = renderLogsTab();
+    else if (state.tab === "perf") bodyHtml = renderPerfTab();
+    else if (state.tab === "uptime") bodyHtml = renderUptimeTab();
+    else if (state.tab === "selfcheck") bodyHtml = renderSelfCheckTab();
+    else bodyHtml = renderProjectsTab();
 
-  let bodyHtml = "";
-  if (state.tab === "issues") bodyHtml = renderIssuesTab();
-  else if (state.tab === "logs") bodyHtml = renderLogsTab();
-  else if (state.tab === "perf") bodyHtml = renderPerfTab();
-  else if (state.tab === "uptime") bodyHtml = renderUptimeTab();
-  else bodyHtml = renderProjectsTab();
+    const selfSummary = getEffectiveSelfStatus();
 
-  root.innerHTML = `
-    <div id="app-chrome" class="shell">
-      <aside class="sidebar">
-        <div class="brand-row">
-          <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
+    root.innerHTML = `
+      <div id="app-chrome" class="shell">
+        <aside class="sidebar">
+          <div class="brand-row">
+            <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
+          </div>
+          <div class="mono">Org: ${esc(state.orgSlug)}</div>
+          <nav class="nav-list" aria-label="Main navigation">
+            <button class="nav-link" data-tab="issues" ${state.tab === "issues" ? 'aria-current="page"' : ""}>Issues</button>
+            <button class="nav-link" data-tab="logs" ${state.tab === "logs" ? 'aria-current="page"' : ""}>Logs &amp; Tail</button>
+            <button class="nav-link" data-tab="perf" ${state.tab === "perf" ? 'aria-current="page"' : ""}>Performance</button>
+            <button class="nav-link" data-tab="uptime" ${state.tab === "uptime" ? 'aria-current="page"' : ""}>Uptime &amp; Alerts</button>
+            <button class="nav-link" data-tab="projects" ${state.tab === "projects" ? 'aria-current="page"' : ""}>Projects &amp; SDK</button>
+            <button class="nav-link" data-tab="selfcheck" ${state.tab === "selfcheck" ? 'aria-current="page"' : ""}>
+              <span>Auto-Check</span>
+              <span class="badge badge-${esc(selfSummary.badgeClass)}">${esc(selfSummary.badgeText)}</span>
+            </button>
+          </nav>
+          <div class="sidebar-foot">
+            <label>Theme
+              <select id="theme-select">
+                <option value="system" ${state.themePref === "system" ? "selected" : ""}>System</option>
+                <option value="light" ${state.themePref === "light" ? "selected" : ""}>Light</option>
+                <option value="dark" ${state.themePref === "dark" ? "selected" : ""}>Dark</option>
+              </select>
+            </label>
+            <button id="btn-cmdk">Command Palette (Ctrl+K)</button>
+            <button id="btn-logout">Sign Out (${esc(state.user.name)})</button>
+          </div>
+        </aside>
+
+        <div>
+          <header class="mobile-top-bar">
+            <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
+            <button data-tab="selfcheck" aria-label="Open Auto-Check">
+              <span>Auto-Check</span>
+              <span class="badge badge-${esc(selfSummary.badgeClass)}">${esc(selfSummary.badgeText)}</span>
+            </button>
+          </header>
+          <main class="main-pane">${renderSelfCheckBanner()}${bodyHtml}</main>
         </div>
-        <div class="mono">Org: ${esc(state.orgSlug)}</div>
-        <nav class="nav-list" aria-label="Main navigation">
+
+        <nav class="mobile-tabbar" aria-label="Mobile navigation">
           <button class="nav-link" data-tab="issues" ${state.tab === "issues" ? 'aria-current="page"' : ""}>Issues</button>
-          <button class="nav-link" data-tab="logs" ${state.tab === "logs" ? 'aria-current="page"' : ""}>Logs &amp; Tail</button>
-          <button class="nav-link" data-tab="perf" ${state.tab === "perf" ? 'aria-current="page"' : ""}>Performance</button>
-          <button class="nav-link" data-tab="uptime" ${state.tab === "uptime" ? 'aria-current="page"' : ""}>Uptime &amp; Alerts</button>
-          <button class="nav-link" data-tab="projects" ${state.tab === "projects" ? 'aria-current="page"' : ""}>Projects &amp; SDK</button>
+          <button class="nav-link" data-tab="logs" ${state.tab === "logs" ? 'aria-current="page"' : ""}>Logs</button>
+          <button class="nav-link" data-tab="perf" ${state.tab === "perf" ? 'aria-current="page"' : ""}>Perf</button>
+          <button class="nav-link" data-tab="uptime" ${state.tab === "uptime" ? 'aria-current="page"' : ""}>Uptime</button>
+          <button class="nav-link" data-tab="projects" ${state.tab === "projects" ? 'aria-current="page"' : ""}>SDK</button>
         </nav>
-        <div class="sidebar-foot">
-          <label>Theme
-            <select id="theme-select">
-              <option value="system" ${state.themePref === "system" ? "selected" : ""}>System</option>
-              <option value="light" ${state.themePref === "light" ? "selected" : ""}>Light</option>
-              <option value="dark" ${state.themePref === "dark" ? "selected" : ""}>Dark</option>
-            </select>
-          </label>
-          <button id="btn-cmdk">Command Palette (Ctrl+K)</button>
-          <button id="btn-logout">Sign Out (${esc(state.user.name)})</button>
-        </div>
-      </aside>
+      </div>
+      ${renderDialogs()}
+      ${state.toast ? `<div class="toast" role="status">${esc(state.toast)}</div>` : ""}`;
 
-      <main class="main-pane">${bodyHtml}</main>
-
-      <nav class="mobile-tabbar" aria-label="Mobile navigation">
-        <button class="nav-link" data-tab="issues" ${state.tab === "issues" ? 'aria-current="page"' : ""}>Issues</button>
-        <button class="nav-link" data-tab="logs" ${state.tab === "logs" ? 'aria-current="page"' : ""}>Logs</button>
-        <button class="nav-link" data-tab="perf" ${state.tab === "perf" ? 'aria-current="page"' : ""}>Perf</button>
-        <button class="nav-link" data-tab="uptime" ${state.tab === "uptime" ? 'aria-current="page"' : ""}>Uptime</button>
-        <button class="nav-link" data-tab="projects" ${state.tab === "projects" ? 'aria-current="page"' : ""}>SDK</button>
-      </nav>
-    </div>
-    ${renderDialogs()}
-    ${state.toast ? `<div class="toast" role="status">${esc(state.toast)}</div>` : ""}`;
-
-  bindDashboardHandlers();
+    bindDashboardHandlers();
+  } finally {
+    inRender = false;
+  }
 }
 
 function renderDialogs(): string {
@@ -828,6 +1230,7 @@ function renderDialogs(): string {
         <button data-cmdk-tab="perf">Go to Performance &amp; Release Health</button>
         <button data-cmdk-tab="uptime">Go to Uptime Monitors &amp; Alerts</button>
         <button data-cmdk-tab="projects">Go to Projects, DSN &amp; SDK Snippets</button>
+        <button data-cmdk-tab="selfcheck">Go to Auto-Check &amp; One-Command Install</button>
       </div>
     </dialog>`;
 }
@@ -1091,6 +1494,45 @@ function bindDashboardHandlers(): void {
   document.getElementById("btn-new-alert")?.addEventListener("click", () => openCreateDialog("alert"));
   document.getElementById("dlg-create-close")?.addEventListener("click", () => {
     (document.getElementById("dlg-create") as HTMLDialogElement | null)?.close();
+  });
+
+  document.getElementById("btn-refresh-selfcheck")?.addEventListener("click", async () => {
+    await refreshSelfCheck();
+    showToast("Diagnóstico atualizado");
+    render();
+  });
+
+  document.getElementById("btn-run-self-probe")?.addEventListener("click", async () => {
+    state.probeRunning = true;
+    render();
+    const res = await apiFetch<SelfProbeResult>(
+      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/probe/`,
+      { method: "POST", body: { send_test_log: true } }
+    );
+    state.probeRunning = false;
+    if (res.ok && res.data) {
+      state.lastProbe = res.data;
+      state.selfCheck = res.data.report;
+      showToast(res.data.ok ? "Auto-Teste E2E concluído com sucesso" : "Auto-Teste E2E detectou falhas");
+    } else {
+      showToast(res.error || "Falha ao executar Auto-Teste E2E");
+    }
+    render();
+  });
+
+  document.getElementById("btn-ack-selfcheck")?.addEventListener("click", async () => {
+    state.localSelfErrors = [];
+    const res = await apiFetch<SelfCheckReport>(
+      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/ack/`,
+      { method: "POST", body: { clear: true } }
+    );
+    if (res.ok && res.data) {
+      state.selfCheck = res.data;
+      showToast("Erros internos reconhecidos e limpos");
+    } else {
+      showToast(res.error || "Falha ao limpar erros internos");
+    }
+    render();
   });
 }
 

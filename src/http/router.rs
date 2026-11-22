@@ -15,13 +15,26 @@ mod embedded_ui {
     include!(concat!(env!("OUT_DIR"), "/embedded_ui.rs"));
 }
 
-async fn health() -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"ok","service":"bugfinder"}"#,
-    )
-        .into_response()
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let healthy = match state.storage.check_health().await {
+        Ok(info) => info.ok && (info.engine != "postgres" || info.wal_or_rls_verified),
+        Err(_) => false,
+    };
+    if healthy {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"status":"ok","service":"bugfinder"}"#,
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"status":"degraded","service":"bugfinder"}"#,
+        )
+            .into_response()
+    }
 }
 
 async fn robots_txt() -> Response {
@@ -164,6 +177,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024 + 4096));
 
+    let client_self_error_route = Router::new()
+        .route(
+            "/api/0/organizations/:org/self-check/client-error/",
+            post(api_v0::report_client_self_error),
+        )
+        .layer(DefaultBodyLimit::max(8192));
+
     let api_routes = Router::new()
         .route("/api/health", get(health))
         .route("/robots.txt", get(robots_txt))
@@ -174,6 +194,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(auth_routes::auth_login))
         .route("/api/auth/logout", post(auth_routes::auth_logout))
         .route("/api/auth/me", get(auth_routes::auth_me))
+        .route("/api/0/organizations/:org/self-check/", get(api_v0::get_self_check))
+        .route("/api/0/organizations/:org/self-check/probe/", post(api_v0::run_self_check_probe))
+        .route("/api/0/organizations/:org/self-check/ack/", post(api_v0::ack_self_check_errors))
         .route("/api/0/organizations/", get(api_v0::list_organizations))
         .route("/api/0/organizations/:org/projects/", get(api_v0::list_projects).post(api_v0::create_project))
         .route("/api/0/projects/:org/:proj/settings/", put(api_v0::update_project_settings))
@@ -217,6 +240,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(ingest_routes)
         .merge(sourcemap_route)
+        .merge(client_self_error_route)
         .merge(api_routes)
         .fallback(any(serve_spa))
         .layer(middleware::from_fn_with_state(

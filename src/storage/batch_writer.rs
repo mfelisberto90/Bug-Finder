@@ -1,6 +1,7 @@
 use crate::alerts::dispatcher::{dispatch_alert, AlertDispatchJob};
 use crate::config::AppConfig;
 use crate::security::metrics::AppMetrics;
+use crate::selfcheck::SelfMonitor;
 use crate::storage::{IngestWriteItem, StorageBackend};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ enum WriterMsg {
 pub struct BatchWriter {
     tx: mpsc::Sender<WriterMsg>,
     metrics: Arc<AppMetrics>,
+    self_monitor: Arc<SelfMonitor>,
 }
 
 impl BatchWriter {
@@ -25,9 +27,11 @@ impl BatchWriter {
         storage: Arc<dyn StorageBackend>,
         config: Arc<AppConfig>,
         metrics: Arc<AppMetrics>,
+        self_monitor: Arc<SelfMonitor>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<WriterMsg>(4096);
         let metrics_bg = metrics.clone();
+        let monitor_bg = self_monitor.clone();
 
         tokio::spawn(async move {
             let mut buffer: Vec<IngestWriteItem> = Vec::with_capacity(128);
@@ -42,7 +46,7 @@ impl BatchWriter {
                             Some(WriterMsg::Item(item)) => {
                                 buffer.push(item);
                                 if buffer.len() >= 128 {
-                                    flush_vec(&storage, &config, &metrics_bg, &mut buffer).await;
+                                    flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
                             }
                             Some(WriterMsg::Flush(ack)) => {
@@ -52,7 +56,7 @@ impl BatchWriter {
                                     }
                                 }
                                 if !buffer.is_empty() {
-                                    flush_vec(&storage, &config, &metrics_bg, &mut buffer).await;
+                                    flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
                                 let _ = ack.send(());
                             }
@@ -63,14 +67,14 @@ impl BatchWriter {
                                     }
                                 }
                                 if !buffer.is_empty() {
-                                    flush_vec(&storage, &config, &metrics_bg, &mut buffer).await;
+                                    flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
                                 let _ = ack.send(());
                                 break;
                             }
                             None => {
                                 if !buffer.is_empty() {
-                                    flush_vec(&storage, &config, &metrics_bg, &mut buffer).await;
+                                    flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
                                 break;
                             }
@@ -78,14 +82,18 @@ impl BatchWriter {
                     }
                     _ = ticker.tick() => {
                         if !buffer.is_empty() {
-                            flush_vec(&storage, &config, &metrics_bg, &mut buffer).await;
+                            flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                         }
                     }
                 }
             }
         });
 
-        Self { tx, metrics }
+        Self {
+            tx,
+            metrics,
+            self_monitor,
+        }
     }
 
     pub fn try_enqueue(&self, item: IngestWriteItem) -> Result<(), &'static str> {
@@ -94,8 +102,28 @@ impl BatchWriter {
                 self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Err("queue_full"),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err("queue_closed"),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                self.self_monitor.record(
+                    "batch_writer",
+                    "error",
+                    "queue",
+                    "Micro-batch ingest queue is full (4096)",
+                    None,
+                );
+                Err("queue_full")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                self.self_monitor.record(
+                    "batch_writer",
+                    "error",
+                    "queue",
+                    "Micro-batch ingest queue channel closed",
+                    None,
+                );
+                Err("queue_closed")
+            }
         }
     }
 
@@ -118,6 +146,7 @@ async fn flush_vec(
     storage: &Arc<dyn StorageBackend>,
     config: &Arc<AppConfig>,
     metrics: &Arc<AppMetrics>,
+    self_monitor: &Arc<SelfMonitor>,
     buffer: &mut Vec<IngestWriteItem>,
 ) {
     let drained: Vec<IngestWriteItem> = std::mem::take(buffer);
@@ -130,9 +159,17 @@ async fn flush_vec(
 
     match storage.flush_ingest_batch(drained).await {
         Ok(alerts) => {
-            spawn_alert_jobs(config, metrics, alerts);
+            spawn_alert_jobs(config, metrics, self_monitor, alerts);
         }
         Err(err) => {
+            metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+            self_monitor.record(
+                "batch_writer",
+                "error",
+                "storage",
+                "Batch ingest flush failed",
+                Some(&err),
+            );
             eprintln!("[bugfinder][batch_writer] flush failed: {err}");
         }
     }
@@ -141,14 +178,28 @@ async fn flush_vec(
 pub fn spawn_alert_jobs(
     config: &Arc<AppConfig>,
     metrics: &Arc<AppMetrics>,
+    self_monitor: &Arc<SelfMonitor>,
     alerts: Vec<AlertDispatchJob>,
 ) {
     for job in alerts {
         let cfg = config.clone();
         let m = metrics.clone();
+        let mon = self_monitor.clone();
         tokio::spawn(async move {
-            if dispatch_alert(cfg, job).await.is_ok() {
-                m.alerts_sent_total.fetch_add(1, Ordering::Relaxed);
+            match dispatch_alert(cfg, job).await {
+                Ok(()) => {
+                    m.alerts_sent_total.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    m.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                    mon.record(
+                        "alerts",
+                        "warn",
+                        "dispatcher",
+                        "Alert delivery failed",
+                        Some(&err),
+                    );
+                }
             }
         });
     }

@@ -7,6 +7,7 @@ use crate::security::auth::{
 };
 use crate::security::csv::sanitize_csv_cell;
 use crate::security::ssrf::validate_webhook_url;
+use crate::selfcheck::{evaluate_self_check, run_live_self_probe};
 use crate::storage::{IdempotencyCheck, IssueQueryParams, LogQueryParams, NewAlertRule};
 use crate::AppState;
 use axum::body::Bytes;
@@ -1318,4 +1319,155 @@ pub async fn remove_member(
         Ok(Err(msg)) => (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
+}
+
+// ----------------------------------------------------------------------------
+// Self-Check & Internal Error Monitoring
+// ----------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct RunProbeReq {
+    #[serde(default = "default_true")]
+    pub send_test_log: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ClientSelfErrorReq {
+    pub message: String,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AckSelfCheckReq {
+    #[serde(default)]
+    pub clear: bool,
+}
+
+pub async fn get_self_check(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let report = evaluate_self_check(&state, &ctx).await;
+    Json(report).into_response()
+}
+
+pub async fn run_self_check_probe(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    maybe_req: Option<Json<RunProbeReq>>,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if !ctx.role.can_write_project() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Requires admin or owner role" })),
+        )
+            .into_response();
+    }
+    let send_test_log = maybe_req.map(|r| r.send_test_log).unwrap_or(true);
+    let result = run_live_self_probe(&state, &ctx, send_test_log).await;
+    Json(result).into_response()
+}
+
+pub async fn report_client_self_error(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    Json(req): Json<ClientSelfErrorReq>,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let decision = state.rate_limiter.check_and_record(
+        "ui_self_err",
+        &ctx.organization_id.to_string(),
+        20,
+        Duration::from_secs(60),
+    );
+    if !decision.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", decision.retry_after_sec.to_string())],
+            Json(json!({ "error": "Rate limit exceeded" })),
+        )
+            .into_response();
+    }
+    let msg = req.message.trim();
+    if msg.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "message is required" })),
+        )
+            .into_response();
+    }
+    let component = req
+        .component
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("spa");
+    let severity = req
+        .severity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("error");
+    state
+        .self_monitor
+        .record("ui_client", severity, component, msg, req.detail.as_deref());
+    state
+        .metrics
+        .self_errors_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (StatusCode::ACCEPTED, Json(json!({ "accepted": true }))).into_response()
+}
+
+pub async fn ack_self_check_errors(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    maybe_req: Option<Json<AckSelfCheckReq>>,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if !ctx.role.can_write_project() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Requires admin or owner role" })),
+        )
+            .into_response();
+    }
+    let clear = maybe_req.map(|r| r.clear).unwrap_or(false);
+    if clear {
+        state.self_monitor.clear_all();
+    } else {
+        state.self_monitor.acknowledge_all();
+    }
+    let report = evaluate_self_check(&state, &ctx).await;
+    Json(report).into_response()
 }

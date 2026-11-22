@@ -61,6 +61,14 @@ pub struct LogQueryParams {
     pub limit: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StorageHealthInfo {
+    pub engine: String,
+    pub ok: bool,
+    pub detail: String,
+    pub wal_or_rls_verified: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum IdempotencyCheck {
     Proceed,
@@ -336,6 +344,7 @@ pub trait StorageBackend: Send + Sync {
     async fn flush_ingest_batch(&self, items: Vec<IngestWriteItem>) -> Result<Vec<AlertDispatchJob>, String>;
     async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String>;
     async fn db_size_bytes(&self) -> u64;
+    async fn check_health(&self) -> Result<StorageHealthInfo, String>;
 }
 
 #[cfg(test)]

@@ -12,18 +12,34 @@ Ultra-lightweight **Error Tracking, Structured Logs, Performance & Uptime Monito
 
 ## Quickstart
 
-### 1. Build Hardened Binary (UI + Rust)
+### 1. One-Command Install (Recommended)
 ```bash
-./scripts/build-release.sh
+# Install binary (~/.local/bin/bugfinder), locked-down config (0600), and run self-check
+./scripts/install.sh
+
+# Or install as an auto-starting user systemd service (64 MB RAM cap)
+./scripts/install.sh --service
+
+# Or run in an isolated 32 MB Docker container
+./scripts/install.sh --docker
+```
+Shortcuts via Make: `make install`, `make install-service`, `make install-docker`, `make doctor`.
+
+### 2. Self-Check & Built-in Diagnostics
+Bug-Finder monitors itself continuously (storage integrity, WAL / PostgreSQL `FORCE RLS`, VmRSS, disk budget, missing DSN/alerts/tokens, HTTP 5xx, `BatchWriter` queue/failures, panic crash persistence, and frontend runtime/transport errors) and surfaces issues directly inside the top **Auto-Check** banner/tab and CLI:
+```bash
+bugfinder doctor
+bugfinder doctor --url http://127.0.0.1:8080/api/health --json
 ```
 
-### 2. Run Server (SQLite WAL + FTS5, Zero External Deps)
+### 3. Manual Build & Run (SQLite WAL + FTS5, Zero External Deps)
 ```bash
+./scripts/build-release.sh
 ./target/release/bugfinder --headless --bind 127.0.0.1:8080 --data ./data
 ```
 Or launch as a standalone desktop window (`--app`) or Docker container (`docker compose up -d` with `mem_limit: 32m`).
 
-### 3. PostgreSQL 17 Multi-Tenant Mode (`ENABLE + FORCE RLS`)
+### 4. PostgreSQL 17 Multi-Tenant Mode (`ENABLE + FORCE RLS`)
 ```bash
 export DATABASE_URL="postgres://bugfinder_app:SECRET@127.0.0.1:5432/bugfinder"
 ./target/release/bugfinder --headless --bind 127.0.0.1:8080
