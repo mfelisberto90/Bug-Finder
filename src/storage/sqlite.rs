@@ -38,6 +38,45 @@ impl SqliteStorage {
             .execute_batch(SQLITE_SCHEMA)
             .map_err(|e| format!("SQLite schema migration: {e}"))?;
 
+        // Upgrade legacy alert_rules CHECK constraint in existing SQLite files if needed
+        if let Ok(Some(sql_def)) = writer
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_rules'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        {
+            if !sql_def.contains("security_threat") {
+                writer
+                    .execute_batch(
+                        "BEGIN IMMEDIATE;
+                         CREATE TABLE alert_rules_v2 (
+                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                             name TEXT NOT NULL,
+                             trigger_type TEXT NOT NULL CHECK(trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down', 'security_threat', 'secret_leak')),
+                             threshold_count INTEGER NOT NULL DEFAULT 1,
+                             window_sec INTEGER NOT NULL DEFAULT 60,
+                             cooldown_sec INTEGER NOT NULL DEFAULT 300,
+                             channel_type TEXT NOT NULL CHECK(channel_type IN ('webhook', 'slack', 'discord', 'email')),
+                             target_url TEXT NOT NULL DEFAULT '',
+                             webhook_secret TEXT NOT NULL DEFAULT '',
+                             email_to TEXT NOT NULL DEFAULT '',
+                             last_triggered_at INTEGER,
+                             is_active INTEGER NOT NULL DEFAULT 1,
+                             created_at INTEGER NOT NULL
+                         );
+                         INSERT INTO alert_rules_v2 SELECT id, organization_id, project_id, name, trigger_type, threshold_count, window_sec, cooldown_sec, channel_type, target_url, webhook_secret, email_to, last_triggered_at, is_active, created_at FROM alert_rules;
+                         DROP TABLE alert_rules;
+                         ALTER TABLE alert_rules_v2 RENAME TO alert_rules;
+                         COMMIT;",
+                    )
+                    .map_err(|e| format!("SQLite alert_rules migration: {e}"))?;
+            }
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2913,6 +2952,14 @@ impl StorageBackend for SqliteStorage {
                     params![cutoff_ms],
                 )
                 .map_err(map_sqlite_err)?;
+            let _ = tx.execute(
+                "DELETE FROM security_events WHERE timestamp_ms < ?1",
+                params![cutoff_ms],
+            );
+            let _ = tx.execute(
+                "DELETE FROM shield_quarantine WHERE expires_at <= ?1",
+                params![now_sec],
+            );
 
             // Circuit breaker: if DB exceeds max_db_mb, shed oldest 10% of logs & events
             let max_bytes = max_db_mb * 1024 * 1024;
@@ -3077,5 +3124,279 @@ impl StorageBackend for SqliteStorage {
             detail,
             wal_or_rls_verified: is_wal,
         })
+    }
+
+    async fn record_security_event(
+        &self,
+        ev: &NewSecurityEvent,
+    ) -> Result<(SecurityEventDto, Vec<AlertDispatchJob>), String> {
+        let ev = ev.clone();
+        self.write(move |conn| {
+            let now_sec = ev.timestamp_ms / 1000;
+            let details_str = ev.details_json.to_string();
+            let tx = conn.transaction().map_err(map_sqlite_err)?;
+
+            tx.execute(
+                "INSERT INTO security_events
+                 (organization_id, project_id, signal_type, category, severity, risk_score, source_kind, actor_hmac, session_id, path, details_json, action_taken, timestamp_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    ev.organization_id,
+                    ev.project_id,
+                    ev.signal_type,
+                    ev.category,
+                    ev.severity,
+                    ev.risk_score as i64,
+                    ev.source_kind,
+                    ev.actor_hmac,
+                    ev.session_id,
+                    ev.path,
+                    details_str,
+                    ev.action_taken,
+                    ev.timestamp_ms,
+                ],
+            )
+            .map_err(map_sqlite_err)?;
+            let row_id = tx.last_insert_rowid();
+
+            if let Some((ref stype, ref shmac, exp_sec)) = ev.quarantine {
+                tx.execute(
+                    "INSERT INTO shield_quarantine
+                     (organization_id, project_id, subject_type, subject_hmac, reason, risk_score, expires_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(organization_id, project_id, subject_type, subject_hmac) DO UPDATE SET
+                       reason = excluded.reason,
+                       risk_score = MAX(shield_quarantine.risk_score, excluded.risk_score),
+                       expires_at = MAX(shield_quarantine.expires_at, excluded.expires_at)",
+                    params![
+                        ev.organization_id,
+                        ev.project_id,
+                        stype,
+                        shmac,
+                        ev.signal_type,
+                        ev.risk_score as i64,
+                        exp_sec,
+                        now_sec,
+                    ],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+
+            let mut alerts = Vec::new();
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, name, trigger_type, cooldown_sec, channel_type, target_url, webhook_secret, email_to, last_triggered_at
+                     FROM alert_rules
+                     WHERE organization_id = ?1 AND project_id = ?2 AND is_active = 1
+                       AND (trigger_type = 'security_threat' OR (?3 = 'secret_leak' AND trigger_type = 'secret_leak'))",
+                )
+                .map_err(map_sqlite_err)?;
+            let mut fired = Vec::new();
+            let mut rows = stmt
+                .query(params![ev.organization_id, ev.project_id, ev.category])
+                .map_err(map_sqlite_err)?;
+            while let Some(r) = rows.next().map_err(map_sqlite_err)? {
+                let rid: i64 = r.get(0).map_err(map_sqlite_err)?;
+                let cd: i64 = r.get(3).map_err(map_sqlite_err)?;
+                let last: Option<i64> = r.get(8).map_err(map_sqlite_err)?;
+                if last.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                    let trig: String = r.get(2).map_err(map_sqlite_err)?;
+                    fired.push(rid);
+                    alerts.push(AlertDispatchJob {
+                        rule_id: rid,
+                        rule_name: r.get(1).map_err(map_sqlite_err)?,
+                        channel_type: r.get(4).map_err(map_sqlite_err)?,
+                        target_url: r.get(5).map_err(map_sqlite_err)?,
+                        webhook_secret: r.get(6).map_err(map_sqlite_err)?,
+                        email_to: r.get(7).map_err(map_sqlite_err)?,
+                        title: format!("[{}:{}] {} (score {})", ev.category, ev.severity, ev.signal_type, ev.risk_score),
+                        message: format!(
+                            "Trigger={trig} | Source={} | Action={} | Path={}",
+                            ev.source_kind, ev.action_taken, ev.path
+                        ),
+                        level: if ev.severity == "critical" || ev.severity == "high" {
+                            "fatal".into()
+                        } else {
+                            "warning".into()
+                        },
+                        project_slug: ev.project_slug.clone(),
+                        short_id: None,
+                    });
+                }
+            }
+            drop(rows);
+            drop(stmt);
+            for rid in fired {
+                tx.execute(
+                    "UPDATE alert_rules SET last_triggered_at = ?1 WHERE id = ?2",
+                    params![now_sec, rid],
+                )
+                .map_err(map_sqlite_err)?;
+            }
+
+            tx.commit().map_err(map_sqlite_err)?;
+            Ok((
+                SecurityEventDto {
+                    id: row_id,
+                    project_id: ev.project_id,
+                    signal_type: ev.signal_type,
+                    category: ev.category,
+                    severity: ev.severity,
+                    risk_score: ev.risk_score as i64,
+                    source_kind: ev.source_kind,
+                    actor_hmac: ev.actor_hmac,
+                    session_id: ev.session_id,
+                    path: ev.path,
+                    details_json: ev.details_json,
+                    action_taken: ev.action_taken,
+                    timestamp: iso_from_ms(ev.timestamp_ms),
+                },
+                alerts,
+            ))
+        })
+        .await
+    }
+
+    async fn list_security_events(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<SecurityEventDto>, ShieldSummaryDto), String> {
+        let org_id = ctx.organization_id;
+        let lim = limit.clamp(1, 200);
+        self.read(move |conn| {
+            let now = now_ms();
+            let since_24h = now - 86_400_000;
+            let now_sec = now / 1000;
+
+            let (events_24h, high_critical_24h, secret_leaks_24h): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                       COUNT(*),
+                       COALESCE(SUM(CASE WHEN severity IN ('high', 'critical') THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN category = 'secret_leak' THEN 1 ELSE 0 END), 0)
+                     FROM security_events
+                     WHERE organization_id = ?1 AND timestamp_ms >= ?2
+                       AND (?3 IS NULL OR project_id = ?3)",
+                    params![org_id, since_24h, project_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(map_sqlite_err)?;
+
+            let active_quarantines: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM shield_quarantine
+                     WHERE organization_id = ?1 AND expires_at > ?2
+                       AND (?3 IS NULL OR project_id = ?3)",
+                    params![org_id, now_sec, project_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite_err)?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, project_id, signal_type, category, severity, risk_score, source_kind,
+                            actor_hmac, session_id, path, details_json, action_taken, timestamp_ms
+                     FROM security_events
+                     WHERE organization_id = ?1 AND (?2 IS NULL OR project_id = ?2)
+                     ORDER BY timestamp_ms DESC, id DESC
+                     LIMIT ?3",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![org_id, project_id, lim], |r| {
+                    let dj: String = r.get(10)?;
+                    let ts: i64 = r.get(12)?;
+                    Ok(SecurityEventDto {
+                        id: r.get(0)?,
+                        project_id: r.get(1)?,
+                        signal_type: r.get(2)?,
+                        category: r.get(3)?,
+                        severity: r.get(4)?,
+                        risk_score: r.get(5)?,
+                        source_kind: r.get(6)?,
+                        actor_hmac: r.get(7)?,
+                        session_id: r.get(8)?,
+                        path: r.get(9)?,
+                        details_json: serde_json::from_str(&dj).unwrap_or_else(|_| json!({})),
+                        action_taken: r.get(11)?,
+                        timestamp: iso_from_ms(ts),
+                    })
+                })
+                .map_err(map_sqlite_err)?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(map_sqlite_err)?);
+            }
+
+            Ok((
+                items,
+                ShieldSummaryDto {
+                    events_24h,
+                    high_critical_24h,
+                    secret_leaks_24h,
+                    active_quarantines,
+                },
+            ))
+        })
+        .await
+    }
+
+    async fn list_quarantine(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+    ) -> Result<Vec<QuarantineEntryDto>, String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            let now_sec = now_ms() / 1000;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, project_id, subject_type, subject_hmac, reason, risk_score, expires_at, created_at
+                     FROM shield_quarantine
+                     WHERE organization_id = ?1 AND expires_at > ?2
+                       AND (?3 IS NULL OR project_id = ?3)
+                     ORDER BY expires_at DESC, id DESC
+                     LIMIT 250",
+                )
+                .map_err(map_sqlite_err)?;
+            let rows = stmt
+                .query_map(params![org_id, now_sec, project_id], |r| {
+                    let exp: i64 = r.get(6)?;
+                    let crt: i64 = r.get(7)?;
+                    Ok(QuarantineEntryDto {
+                        id: r.get(0)?,
+                        project_id: r.get(1)?,
+                        subject_type: r.get(2)?,
+                        subject_hmac: r.get(3)?,
+                        reason: r.get(4)?,
+                        risk_score: r.get(5)?,
+                        expires_at: iso_from_ms(exp * 1000),
+                        created_at: iso_from_ms(crt * 1000),
+                    })
+                })
+                .map_err(map_sqlite_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_sqlite_err)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn delete_quarantine(&self, ctx: &TenantCtx, entry_id: i64) -> Result<bool, String> {
+        let org_id = ctx.organization_id;
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM shield_quarantine WHERE id = ?1 AND organization_id = ?2",
+                    params![entry_id, org_id],
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(changed > 0)
+        })
+        .await
     }
 }

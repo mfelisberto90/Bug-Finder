@@ -110,6 +110,7 @@ pub struct AppConfig {
     pub is_dev: bool,
     pub desktop_app_mode: bool,
     pub dev_allow_http_webhooks: bool,
+    pub anti_ptrace: bool,
     pub smtp: Option<SmtpConfig>,
 }
 
@@ -196,6 +197,10 @@ impl AppConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let anti_ptrace = env::var("BUGFINDER_ANTI_PTRACE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         let smtp = env::var("BUGFINDER_SMTP_HOST")
             .ok()
             .map(|h| h.trim().to_string())
@@ -233,6 +238,7 @@ impl AppConfig {
             is_dev,
             desktop_app_mode,
             dev_allow_http_webhooks,
+            anti_ptrace,
             smtp,
         })
     }

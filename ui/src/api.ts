@@ -12,6 +12,17 @@ export interface Organization {
   role: string;
 }
 
+export interface ShieldPolicy {
+  enabled: boolean;
+  mode: string;
+  quarantine_threshold: number;
+  quarantine_ttl_sec: number;
+  enforce_origin_check: boolean;
+  secret_leak_alerts: boolean;
+  log_ids_enabled: boolean;
+  canary_globals: string[];
+}
+
 export interface ProjectFilters {
   allowed_domains: string[];
   ignore_browser_extensions: boolean;
@@ -25,6 +36,41 @@ export interface ProjectFilters {
   scrub_emails: boolean;
   safe_keys: string[];
   sensitive_keys: string[];
+  shield?: ShieldPolicy;
+}
+
+export interface SecurityEventItem {
+  id: number;
+  project_id: number;
+  signal_type: string;
+  category: string;
+  severity: string;
+  risk_score: number;
+  source_kind: string;
+  actor_hmac: string;
+  session_id: string;
+  path: string;
+  details_json: Record<string, unknown>;
+  action_taken: string;
+  timestamp: string;
+}
+
+export interface QuarantineItem {
+  id: number;
+  project_id: number;
+  subject_type: string;
+  subject_hmac: string;
+  reason: string;
+  risk_score: number;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface ShieldSummary {
+  events_24h: number;
+  high_critical_24h: number;
+  secret_leaks_24h: number;
+  active_quarantines: number;
 }
 
 export interface Project {

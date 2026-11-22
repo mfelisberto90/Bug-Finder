@@ -13,6 +13,7 @@ pub mod storage;
 use crate::config::AppConfig;
 use crate::domain::models::LiveStreamEvent;
 use crate::domain::sourcemap::SourceMapCache;
+use crate::security::anti_rea::ShieldEngine;
 use crate::security::headers::ScannerGuard;
 use crate::security::metrics::AppMetrics;
 use crate::security::ratelimit::{EventDedupeCache, HmacRateLimiter};
@@ -35,6 +36,7 @@ pub struct AppState {
     pub sourcemap_cache: SourceMapCache,
     pub metrics: Arc<AppMetrics>,
     pub self_monitor: Arc<SelfMonitor>,
+    pub shield_engine: ShieldEngine,
     pub live_tx: broadcast::Sender<LiveStreamEvent>,
 }
 
@@ -55,6 +57,7 @@ pub fn build_app_state(
 ) -> Arc<AppState> {
     let metrics = Arc::new(AppMetrics::default());
     let self_monitor = Arc::new(SelfMonitor::new(config.data_dir.clone()));
+    let shield_engine = ShieldEngine::new();
     let batch_writer = BatchWriter::spawn(
         storage.clone(),
         config.clone(),
@@ -77,6 +80,7 @@ pub fn build_app_state(
         sourcemap_cache,
         metrics,
         self_monitor,
+        shield_engine,
         live_tx,
     })
 }

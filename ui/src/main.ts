@@ -13,15 +13,19 @@ import {
   type Project,
   type ProjectFilters,
   type ProjectKeyItem,
+  type QuarantineItem,
   type ReleaseHealth,
+  type SecurityEventItem,
   type SelfCheckReport,
   type SelfProbeResult,
+  type ShieldPolicy,
+  type ShieldSummary,
   type TransactionSummary,
   type UptimeMonitor,
   type UserInfo
 } from "./api";
 
-type TabId = "issues" | "logs" | "perf" | "uptime" | "projects" | "selfcheck";
+type TabId = "issues" | "logs" | "perf" | "uptime" | "projects" | "shield" | "selfcheck";
 type MountedMode = "none" | "loading" | "setup" | "login" | "dashboard";
 
 interface AppStateModel {
@@ -52,6 +56,10 @@ interface AppStateModel {
   alerts: AlertRule[];
   tokens: ApiTokenItem[];
   members: MemberItem[];
+  shieldEvents: SecurityEventItem[];
+  shieldSummary: ShieldSummary;
+  shieldQuarantine: QuarantineItem[];
+  shieldProjectFilter: number | null;
   activeProjectModalId: number | null;
   activeProjectKeys: ProjectKeyItem[];
   lastCreatedToken: string | null;
@@ -94,6 +102,10 @@ const state: AppStateModel = {
   alerts: [],
   tokens: [],
   members: [],
+  shieldEvents: [],
+  shieldSummary: { events_24h: 0, high_critical_24h: 0, secret_leaks_24h: 0, active_quarantines: 0 },
+  shieldQuarantine: [],
+  shieldProjectFilter: null,
   activeProjectModalId: null,
   activeProjectKeys: [],
   lastCreatedToken: null,
@@ -467,6 +479,21 @@ async function loadCurrentTabData(): Promise<void> {
     ]);
     if (tokRes.ok && tokRes.data) state.tokens = tokRes.data;
     if (memRes.ok && memRes.data) state.members = memRes.data;
+  } else if (state.tab === "shield") {
+    const q = state.shieldProjectFilter ? `?project_id=${state.shieldProjectFilter}` : "";
+    const [evRes, qRes] = await Promise.all([
+      apiFetch<{ summary: ShieldSummary; events: SecurityEventItem[] }>(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/events/${q}`
+      ),
+      apiFetch<QuarantineItem[]>(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/quarantine/${q}`
+      )
+    ]);
+    if (evRes.ok && evRes.data) {
+      state.shieldEvents = evRes.data.events || [];
+      state.shieldSummary = evRes.data.summary || state.shieldSummary;
+    }
+    if (qRes.ok && qRes.data) state.shieldQuarantine = qRes.data;
   } else if (state.tab === "selfcheck") {
     await refreshSelfCheck();
   }
@@ -1098,6 +1125,192 @@ function getEffectiveSelfStatus(): {
   };
 }
 
+function renderShieldTab(): string {
+  const origin = location.origin;
+  const firstProj = state.projects[0];
+  const sampleDsn = firstProj?.dsn_public_key
+    ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
+    : `${origin.replace("://", "://<KEY>@")}/1`;
+  const pid = firstProj ? firstProj.id : 1;
+  const pslug = firstProj?.slug || "app";
+  const org = state.orgSlug;
+  const mode = firstProj?.filters?.shield?.mode || "detect";
+  const s = state.shieldSummary;
+
+  const projOpts = state.projects
+    .map(
+      (p) =>
+        `<option value="${p.id}" ${state.shieldProjectFilter === p.id ? "selected" : ""}>${esc(p.name)}</option>`
+    )
+    .join("");
+
+  const qRows = state.shieldQuarantine.length
+    ? state.shieldQuarantine
+        .map(
+          (q) => `
+          <tr>
+            <th scope="row"><span class="badge badge-${q.subject_type === "ip" ? "error" : "warn"}">${esc(q.subject_type)}</span></th>
+            <td data-label="Subject HMAC" class="mono">${esc(q.subject_hmac.slice(0, 16))}...</td>
+            <td data-label="Reason">${esc(q.reason)}</td>
+            <td data-label="Score" class="tabular">${q.risk_score}</td>
+            <td data-label="Expires" class="tabular">${esc(q.expires_at.slice(0, 19).replace("T", " "))}</td>
+            <td data-label="Action"><button type="button" class="btn-danger" data-del-quarantine="${q.id}">Liberar</button></td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="6">Nenhuma sessão ou IP em quarentena ativa.</td></tr>`;
+
+  const evRows = state.shieldEvents.length
+    ? state.shieldEvents
+        .map(
+          (e) => `
+          <tr>
+            <th scope="row" class="mono">${esc(e.signal_type)}</th>
+            <td data-label="Category"><span class="badge badge-muted">${esc(e.category)}</span></td>
+            <td data-label="Severity / Score">
+              <span class="badge badge-${e.severity === "critical" || e.severity === "high" ? "error" : e.severity === "medium" ? "warn" : "info"}">${esc(e.severity)} (${e.risk_score})</span>
+            </td>
+            <td data-label="Source / Path" class="mono">${esc(e.source_kind)} &middot; ${esc(e.path || "-")}</td>
+            <td data-label="Action / Time" class="tabular">${esc(e.action_taken)} &middot; ${esc(e.timestamp.slice(11, 19))}</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5">Nenhum evento Anti-REA, Log-IDS ou vazamento detectado ainda.</td></tr>`;
+
+  const snipBrowser = `<script src="${origin}/sdk/bugfinder-shield.js"></script>
+<script>
+  BugFinderShield.init({
+    dsn: "${sampleDsn}",
+    mode: "${mode}",
+    threshold: 80,
+    canaryGlobals: ["__BF_INTERNAL_SECRETS__"],
+    clearStorageKeys: ["auth_token"]
+  });
+</script>`;
+
+  const snipNode = `// Express Anti-REA & Blocklist Middleware
+const crypto = require("node:crypto");
+const cache = { etag: "", ipKey: "", ips: new Set(), sids: new Set(), exp: 0 };
+async function syncBlocklist() {
+  if (Date.now() < cache.exp) return;
+  const r = await fetch("${origin}/api/0/projects/${org}/${pslug}/shield/blocklist/", {
+    headers: { Authorization: "Bearer <API_TOKEN>", "If-None-Match": cache.etag }
+  });
+  cache.exp = Date.now() + 10000;
+  if (r.status === 200) {
+    cache.etag = r.headers.get("etag") || "";
+    const { ip_hmac_key, entries } = await r.json();
+    cache.ipKey = ip_hmac_key || "";
+    cache.ips = new Set(entries.filter((e) => e.subject_type === "ip").map((e) => e.subject_hmac));
+    cache.sids = new Set(entries.filter((e) => e.subject_type === "session").map((e) => e.subject_hmac));
+  }
+}
+app.use(async (req, res, next) => {
+  await syncBlocklist().catch(() => {});
+  if (cache.ipKey && cache.ips.has(crypto.createHmac("sha256", cache.ipKey).update(req.ip || "").digest("hex"))) {
+    return res.status(403).end();
+  }
+  if (req.path.endsWith(".js.map") || req.path === "/.env" || req.path === "/.git/config") {
+    void fetch("${origin}/api/${pid}/shield/", {
+      method: "POST",
+      headers: { Authorization: "Bearer <API_TOKEN>", "Content-Type": "application/json" },
+      body: JSON.stringify({ signals: [req.path.endsWith(".map") ? "sourcemap_harvest" : "canary_route_hit"], actor_ip: req.ip, path: req.path })
+    }).catch(() => {});
+    return res.status(404).end();
+  }
+  next();
+});`;
+
+  const snipPhp = `// Laravel / RoleLane Shield + SourceMap & Canary Guard
+if (str_ends_with($request->path(), '.js.map') || in_array('/' . ltrim($request->path(), '/'), ['/.env', '/.git/config'], true)) {
+    Http::withToken(config('services.bugfinder.api_token'))->timeout(1)->post(
+        '${origin}/api/${pid}/shield/',
+        ['signals' => [str_ends_with($request->path(), '.js.map') ? 'sourcemap_harvest' : 'canary_route_hit'], 'actor_ip' => $request->ip(), 'path' => '/' . $request->path()]
+    );
+    abort(404);
+}`;
+
+  const snipPython = `# FastAPI Anti-REA + Debugger Check + Blocklist Sync
+import sys, httpx
+if sys.gettrace() is not None:
+    httpx.post("${origin}/api/${pid}/shield/", headers={"Authorization": "Bearer <API_TOKEN>"}, json={"signals": ["runtime_debugger_attached"], "path": "/startup"}, timeout=1.5)`;
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">Anti-REA Shield &amp; Mini-IDS</h1>
+      <div class="row-gap">
+        <button type="button" id="btn-shield-settings">Configurar Shield do Projeto</button>
+        <div class="cta-dock">
+          <button type="button" id="btn-refresh-shield" data-primary-cta="true">Atualizar Escudo</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <label for="shield-project-filter">Projeto
+        <select id="shield-project-filter" name="shield_project_id">
+          <option value="" ${state.shieldProjectFilter === null ? "selected" : ""}>Todos os Projetos</option>
+          ${projOpts}
+        </select>
+      </label>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="card"><div class="kpi-label">Ameaças (24h)</div><div class="kpi-value tabular">${s.events_24h}</div></div>
+      <div class="card"><div class="kpi-label">Alta / Crítica</div><div class="kpi-value tabular">${s.high_critical_24h}</div></div>
+      <div class="card"><div class="kpi-label">Segredos Interceptados</div><div class="kpi-value tabular">${s.secret_leaks_24h}</div></div>
+      <div class="card"><div class="kpi-label">Quarentenas Ativas</div><div class="kpi-value tabular">${s.active_quarantines}</div></div>
+    </div>
+
+    <div class="stack-col">
+      <section class="card stack-col">
+        <h2>Quarentena Ativa (CGNAT-Safe: Sessões Browser / IPs Verificados Backend)</h2>
+        <div tabindex="0" role="region" aria-labelledby="sh-q-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="sh-q-cap" class="hp-field">Active quarantine entries</caption>
+            <thead><tr><th>Tipo</th><th>HMAC</th><th>Motivo</th><th>Score</th><th>Expira</th><th>Ação</th></tr></thead>
+            <tbody>${qRows}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card stack-col">
+        <h2>Eventos Anti-REA, Log-IDS &amp; Secret Leak Radar</h2>
+        <div tabindex="0" role="region" aria-labelledby="sh-ev-cap" class="table-wrapper">
+          <table class="data-table">
+            <caption id="sh-ev-cap" class="hp-field">Security events</caption>
+            <thead><tr><th>Sinal</th><th>Categoria</th><th>Severidade / Score</th><th>Fonte &amp; Rota</th><th>Ação / Hora</th></tr></thead>
+            <tbody>${evRows}</tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card stack-col">
+        <h2>Proteções Prontas para o App Monitorado (1-Clique)</h2>
+        <div>
+          <p><strong>1. Browser Anti-REA Shield (~3 KB gzip, zero-dep, CDP/Hook/Canary Guard):</strong></p>
+          <pre class="snippet-box">${esc(snipBrowser)}</pre>
+          <button type="button" data-copy-text="${esc(snipBrowser)}">Copiar Snippet Browser</button>
+        </div>
+        <div>
+          <p><strong>2. Node / Express Middleware (Blocklist ETag + SourceMap &amp; Canary Trap):</strong></p>
+          <pre class="snippet-box">${esc(snipNode)}</pre>
+          <button type="button" data-copy-text="${esc(snipNode)}">Copiar Middleware Node</button>
+        </div>
+        <div>
+          <p><strong>3. Laravel / PHP Middleware (RoleLane):</strong></p>
+          <pre class="snippet-box">${esc(snipPhp)}</pre>
+          <button type="button" data-copy-text="${esc(snipPhp)}">Copiar Middleware PHP</button>
+        </div>
+        <div>
+          <p><strong>4. Python / FastAPI Debugger &amp; Anti-REA Guard:</strong></p>
+          <pre class="snippet-box">${esc(snipPython)}</pre>
+          <button type="button" data-copy-text="${esc(snipPython)}">Copiar Snippet Python</button>
+        </div>
+      </section>
+    </div>`;
+}
+
 function renderSelfCheckBanner(): string {
   if (state.tab === "selfcheck") return "";
   const summary = getEffectiveSelfStatus();
@@ -1329,6 +1542,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
           <button type="button" class="nav-link" data-tab="perf">Performance</button>
           <button type="button" class="nav-link" data-tab="uptime">Uptime &amp; Alerts</button>
           <button type="button" class="nav-link" data-tab="projects">Projects &amp; SDK</button>
+          <button type="button" class="nav-link" data-tab="shield">Security Shield</button>
           <button type="button" class="nav-link" data-tab="selfcheck">
             <span>Auto-Check</span>
             <span class="badge badge-ok" data-selfcheck-badge="1">OK</span>
@@ -1350,10 +1564,13 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
       <div>
         <header class="mobile-top-bar">
           <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
-          <button type="button" data-tab="selfcheck" aria-label="Open Auto-Check">
-            <span>Auto-Check</span>
-            <span class="badge badge-ok" data-selfcheck-badge="1">OK</span>
-          </button>
+          <div class="row-gap">
+            <button type="button" data-tab="shield" aria-label="Open Security Shield">Shield</button>
+            <button type="button" data-tab="selfcheck" aria-label="Open Auto-Check">
+              <span>Auto-Check</span>
+              <span class="badge badge-ok" data-selfcheck-badge="1">OK</span>
+            </button>
+          </div>
         </header>
         <div id="selfcheck-banner-slot"></div>
         <main id="main-pane" class="main-pane"></main>
@@ -1438,6 +1655,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
         <button type="button" data-cmdk-tab="perf">Go to Performance &amp; Release Health</button>
         <button type="button" data-cmdk-tab="uptime">Go to Uptime Monitors &amp; Alerts</button>
         <button type="button" data-cmdk-tab="projects">Go to Projects, DSN &amp; SDK Snippets</button>
+        <button type="button" data-cmdk-tab="shield">Go to Anti-REA Security Shield &amp; Mini-IDS</button>
         <button type="button" data-cmdk-tab="selfcheck">Go to Auto-Check &amp; One-Command Install</button>
       </div>
     </dialog>`;
@@ -1506,6 +1724,7 @@ function renderMainPane(): void {
   else if (state.tab === "logs") bodyHtml = renderLogsTab();
   else if (state.tab === "perf") bodyHtml = renderPerfTab();
   else if (state.tab === "uptime") bodyHtml = renderUptimeTab();
+  else if (state.tab === "shield") bodyHtml = renderShieldTab();
   else if (state.tab === "selfcheck") bodyHtml = renderSelfCheckTab();
   else bodyHtml = renderProjectsTab();
 
@@ -2059,6 +2278,42 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     }
     syncSelfCheckSlots();
   });
+
+  // Security Shield tab handlers
+  document.getElementById("btn-refresh-shield")?.addEventListener("click", async () => {
+    await loadCurrentTabData();
+    renderMainPane();
+    showToast("Escudo atualizado");
+  });
+
+  document.getElementById("btn-shield-settings")?.addEventListener("click", () => {
+    const pid = state.shieldProjectFilter ?? state.projects[0]?.id;
+    if (pid) openProjectSettingsDialog(pid);
+  });
+
+  const shProjSel = document.getElementById("shield-project-filter") as HTMLSelectElement | null;
+  shProjSel?.addEventListener("change", async () => {
+    state.shieldProjectFilter = shProjSel.value ? Number(shProjSel.value) : null;
+    await loadCurrentTabData();
+    renderMainPane();
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-quarantine]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.dataset.delQuarantine);
+      const res = await apiFetch(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/quarantine/${id}/`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Falha ao liberar quarentena");
+        return;
+      }
+      showToast("Quarentena liberada");
+      await loadCurrentTabData();
+      renderMainPane();
+    });
+  });
 }
 
 function splitFilterList(raw: string): string[] {
@@ -2077,6 +2332,16 @@ function openProjectSettingsDialog(projectId: number): void {
 
   state.activeProjectModalId = proj.id;
   const f = proj.filters;
+  const sh: ShieldPolicy = f.shield || {
+    enabled: true,
+    mode: "detect",
+    quarantine_threshold: 80,
+    quarantine_ttl_sec: 900,
+    enforce_origin_check: false,
+    secret_leak_alerts: true,
+    log_ids_enabled: true,
+    canary_globals: ["__BF_INTERNAL_SECRETS__"]
+  };
   titleEl.textContent = `Filters & Scrubbing — ${proj.name}`;
   bodyEl.innerHTML = `
     <form id="proj-settings-form" class="stack-col">
@@ -2125,6 +2390,39 @@ function openProjectSettingsDialog(projectId: number): void {
       <label for="pf-sens-keys">Extra Sensitive Keys (comma-separated)
         <input id="pf-sens-keys" name="sensitive_keys" type="text" autocomplete="off" value="${esc((f.sensitive_keys || []).join(", "))}">
       </label>
+      <h3>Anti-REA Security Shield &amp; Mini-IDS</h3>
+      <label class="check-row" for="pf-sh-en">
+        <input id="pf-sh-en" type="checkbox" name="shield_enabled" ${sh.enabled ? "checked" : ""}>
+        <span>Enable Anti-REA Shield &amp; Mini-IDS</span>
+      </label>
+      <label for="pf-sh-mode">Protection Mode
+        <select id="pf-sh-mode" name="shield_mode">
+          <option value="detect" ${sh.mode === "detect" ? "selected" : ""}>detect (Telemetry &amp; Alerts only)</option>
+          <option value="defend" ${sh.mode === "defend" ? "selected" : ""}>defend (Clear ephemeral tokens on threat)</option>
+          <option value="lockdown" ${sh.mode === "lockdown" ? "selected" : ""}>lockdown (Lock client runtime + quarantine)</option>
+        </select>
+      </label>
+      <label for="pf-sh-thresh">Quarantine Risk Score Threshold (10-100)
+        <input id="pf-sh-thresh" name="shield_threshold" type="number" min="10" max="100" value="${sh.quarantine_threshold}">
+      </label>
+      <label for="pf-sh-ttl">Quarantine TTL (seconds)
+        <input id="pf-sh-ttl" name="shield_ttl" type="number" min="60" max="86400" value="${sh.quarantine_ttl_sec}">
+      </label>
+      <label class="check-row" for="pf-sh-orig">
+        <input id="pf-sh-orig" type="checkbox" name="shield_enforce_origin" ${sh.enforce_origin_check ? "checked" : ""}>
+        <span>Enforce Allowed Domains Origin check on Shield ingest</span>
+      </label>
+      <label class="check-row" for="pf-sh-leaks">
+        <input id="pf-sh-leaks" type="checkbox" name="shield_secret_leaks" ${sh.secret_leak_alerts ? "checked" : ""}>
+        <span>Secret Leak Radar (alert when live keys/JWTs are scrubbed)</span>
+      </label>
+      <label class="check-row" for="pf-sh-ids">
+        <input id="pf-sh-ids" type="checkbox" name="shield_log_ids" ${sh.log_ids_enabled ? "checked" : ""}>
+        <span>Log-Driven Mini-IDS (SQLi/Traversal/403 bursts)</span>
+      </label>
+      <label for="pf-sh-canaries">Canary Globals (comma-separated trap properties)
+        <input id="pf-sh-canaries" name="shield_canaries" type="text" autocomplete="off" value="${esc((sh.canary_globals || []).join(", "))}">
+      </label>
       <button type="submit" autofocus>Save Filters &amp; Scrubbing</button>
     </form>`;
 
@@ -2147,7 +2445,17 @@ function openProjectSettingsDialog(projectId: number): void {
       storm_sample_every: Math.max(1, Number(getVal("pf-storm-every") || 1)),
       auto_promote_log_level: getVal("pf-promote") || null,
       safe_keys: splitFilterList(getVal("pf-safe-keys")),
-      sensitive_keys: splitFilterList(getVal("pf-sens-keys"))
+      sensitive_keys: splitFilterList(getVal("pf-sens-keys")),
+      shield: {
+        enabled: getChecked("pf-sh-en"),
+        mode: getVal("pf-sh-mode") || "detect",
+        quarantine_threshold: Math.min(100, Math.max(10, Number(getVal("pf-sh-thresh") || 80))),
+        quarantine_ttl_sec: Math.min(86400, Math.max(60, Number(getVal("pf-sh-ttl") || 900))),
+        enforce_origin_check: getChecked("pf-sh-orig"),
+        secret_leak_alerts: getChecked("pf-sh-leaks"),
+        log_ids_enabled: getChecked("pf-sh-ids"),
+        canary_globals: splitFilterList(getVal("pf-sh-canaries"))
+      }
     };
 
     const res = await apiFetch<Project>(
@@ -2361,6 +2669,8 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member"): voi
             <option value="threshold">Event Threshold</option>
             <option value="fatal_log">Fatal Log</option>
             <option value="uptime_down">Uptime Down</option>
+            <option value="security_threat">Security Threat (Anti-REA / Mini-IDS)</option>
+            <option value="secret_leak">Secret Leak Detected (Radar)</option>
           </select>
         </label>
         <div id="cr-al-thresh-wrap" class="stack-col is-hidden">

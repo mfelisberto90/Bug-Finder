@@ -1,6 +1,7 @@
 use crate::alerts::dispatcher::{dispatch_alert, AlertDispatchJob};
 use crate::domain::models::*;
 use crate::http::auth_routes::{resolve_request_session, sanitize_slug, verify_csrf_for_session};
+use crate::security::anti_rea::derive_project_ip_hmac_key;
 use crate::security::auth::{
     canonical_json_sha256, generate_api_token, generate_dsn_public_key, hash_password,
     random_token_b64, sha256_hex,
@@ -1036,7 +1037,13 @@ pub async fn create_alert(
     }
     if !matches!(
         req.trigger_type.as_str(),
-        "new_issue" | "regression" | "threshold" | "fatal_log" | "uptime_down"
+        "new_issue"
+            | "regression"
+            | "threshold"
+            | "fatal_log"
+            | "uptime_down"
+            | "security_threat"
+            | "secret_leak"
     ) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid trigger_type" }))).into_response();
     }
@@ -1512,4 +1519,145 @@ pub async fn ack_self_check_errors(
     }
     let report = evaluate_self_check(&state, &ctx).await;
     Json(report).into_response()
+}
+
+// ----------------------------------------------------------------------------
+// Anti-REA Shield Events, Quarantine & Cached Blocklist Feed
+// ----------------------------------------------------------------------------
+
+pub async fn list_shield_events(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let project_id = query.get("project_id").and_then(|s| s.parse::<i64>().ok());
+    let limit = query
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    match state.storage.list_security_events(&ctx, project_id, limit).await {
+        Ok((events, summary)) => Json(json!({ "summary": summary, "events": events })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn list_shield_quarantine(
+    State(state): State<Arc<AppState>>,
+    Path(org): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let project_id = query.get("project_id").and_then(|s| s.parse::<i64>().ok());
+    match state.storage.list_quarantine(&ctx, project_id).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn delete_shield_quarantine(
+    State(state): State<Arc<AppState>>,
+    Path((org, entry_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if !ctx.role.can_write_project() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Requires admin or owner role" })),
+        )
+            .into_response();
+    }
+    match state.storage.delete_quarantine(&ctx, entry_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Quarantine entry not found" }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub async fn get_shield_blocklist(
+    State(state): State<Arc<AppState>>,
+    Path((org, proj)): Path<(String, String)>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let projects = match state.storage.list_projects(&ctx).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    };
+    let Some(project) = projects.into_iter().find(|p| p.slug == proj) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Project not found" }))).into_response();
+    };
+    let entries = match state.storage.list_quarantine(&ctx, Some(project.id)).await {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    };
+
+    let compact: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "subject_type": e.subject_type,
+                "subject_hmac": e.subject_hmac,
+                "reason": e.reason,
+                "risk_score": e.risk_score,
+                "expires_at": e.expires_at,
+            })
+        })
+        .collect();
+    let payload = json!({
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "ip_hmac_key": derive_project_ip_hmac_key(&state.config.app_key, project.id),
+        "session_hash_alg": "sha256",
+        "entries": compact,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let etag = format!("\"{}\"", &sha256_hex(&bytes)[..24]);
+
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|inm| inm.trim() == etag)
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "private, max-age=10".to_string()),
+            ],
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private, max-age=10".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
 }

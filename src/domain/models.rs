@@ -184,6 +184,34 @@ impl IssueType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ShieldPolicy {
+    pub enabled: bool,
+    pub mode: String, // "detect" | "defend" | "lockdown"
+    pub quarantine_threshold: u32,
+    pub quarantine_ttl_sec: u64,
+    pub enforce_origin_check: bool,
+    pub secret_leak_alerts: bool,
+    pub log_ids_enabled: bool,
+    pub canary_globals: Vec<String>,
+}
+
+impl Default for ShieldPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: "detect".to_string(),
+            quarantine_threshold: 80,
+            quarantine_ttl_sec: 900,
+            enforce_origin_check: false,
+            secret_leak_alerts: true,
+            log_ids_enabled: true,
+            canary_globals: vec!["__BF_INTERNAL_SECRETS__".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProjectFilters {
     pub allowed_domains: Vec<String>,
     pub ignore_browser_extensions: bool,
@@ -197,6 +225,7 @@ pub struct ProjectFilters {
     pub scrub_emails: bool,
     pub safe_keys: Vec<String>,
     pub sensitive_keys: Vec<String>,
+    pub shield: ShieldPolicy,
 }
 
 impl Default for ProjectFilters {
@@ -214,6 +243,7 @@ impl Default for ProjectFilters {
             scrub_emails: false,
             safe_keys: Vec::new(),
             sensitive_keys: Vec::new(),
+            shield: ShieldPolicy::default(),
         }
     }
 }
@@ -535,6 +565,62 @@ pub struct LiveStreamEvent {
     pub trace_id: Option<String>,
     pub timestamp_ms: i64,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewSecurityEvent {
+    pub organization_id: i64,
+    pub project_id: i64,
+    pub project_slug: String,
+    pub signal_type: String,
+    pub category: String,
+    pub severity: String,
+    pub risk_score: u32,
+    pub source_kind: String,
+    pub actor_hmac: String,
+    pub session_id: String,
+    pub path: String,
+    pub details_json: Value,
+    pub action_taken: String,
+    pub timestamp_ms: i64,
+    pub quarantine: Option<(String, String, i64)>, // (subject_type, subject_hmac, expires_at_sec)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityEventDto {
+    pub id: i64,
+    pub project_id: i64,
+    pub signal_type: String,
+    pub category: String,
+    pub severity: String,
+    pub risk_score: i64,
+    pub source_kind: String,
+    pub actor_hmac: String,
+    pub session_id: String,
+    pub path: String,
+    pub details_json: Value,
+    pub action_taken: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuarantineEntryDto {
+    pub id: i64,
+    pub project_id: i64,
+    pub subject_type: String,
+    pub subject_hmac: String,
+    pub reason: String,
+    pub risk_score: i64,
+    pub expires_at: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShieldSummaryDto {
+    pub events_24h: i64,
+    pub high_critical_24h: i64,
+    pub secret_leaks_24h: i64,
+    pub active_quarantines: i64,
 }
 
 pub fn iso_from_ms(ms: i64) -> String {

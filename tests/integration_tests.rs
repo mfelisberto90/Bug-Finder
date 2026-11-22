@@ -726,6 +726,67 @@ async fn postgres_rls_live_isolation_test() {
         "Pre-maintenance expired row should still exist in session_lookup"
     );
 
+    // Anti-REA Shield security_events & shield_quarantine FORCE RLS + NOBYPASSRLS verification
+    let future_exp = bugfinder::domain::models::now_ms() / 1000 + 3600;
+    let sec_ev = bugfinder::domain::models::NewSecurityEvent {
+        organization_id: org1.id,
+        project_id: proj1.id,
+        project_slug: "proj1".into(),
+        signal_type: "canary_route_hit".into(),
+        category: "anti_rea".into(),
+        severity: "high".into(),
+        risk_score: 75,
+        source_kind: "backend_verified".into(),
+        actor_hmac: "pg_actor_hmac_1".into(),
+        session_id: "pg_sess_1".into(),
+        path: "/.env".into(),
+        details_json: json!({ "test": true }),
+        action_taken: "quarantined".into(),
+        timestamp_ms: bugfinder::domain::models::now_ms(),
+        quarantine: Some(("ip".into(), "pg_actor_hmac_1".into(), future_exp)),
+    };
+    let (rec_sec, _) = app_backend.record_security_event(&sec_ev).await.unwrap();
+    assert_eq!(rec_sec.signal_type, "canary_route_hit");
+
+    let sec_leak: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM security_events")
+        .fetch_one(app_pg.pool())
+        .await
+        .unwrap();
+    assert_eq!(sec_leak, 0, "FORCE RLS fail-closed failed on security_events");
+    let q_leak: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shield_quarantine")
+        .fetch_one(app_pg.pool())
+        .await
+        .unwrap();
+    assert_eq!(q_leak, 0, "FORCE RLS fail-closed failed on shield_quarantine");
+
+    let (pg_evs, pg_sum) = app_backend.list_security_events(&ctx1, None, 20).await.unwrap();
+    assert_eq!(pg_evs.len(), 1);
+    assert_eq!(pg_sum.active_quarantines, 1);
+    let pg_qs = app_backend.list_quarantine(&ctx1, None).await.unwrap();
+    assert_eq!(pg_qs.len(), 1);
+    assert!(app_backend.delete_quarantine(&ctx1, pg_qs[0].id).await.unwrap());
+    assert!(app_backend.list_quarantine(&ctx1, None).await.unwrap().is_empty());
+
+    // Insert an already-expired quarantine row to verify run_maintenance purges it cleanly
+    let exp_sec = bugfinder::domain::models::NewSecurityEvent {
+        organization_id: org1.id,
+        project_id: proj1.id,
+        project_slug: "proj1".into(),
+        signal_type: "sourcemap_harvest".into(),
+        category: "anti_rea".into(),
+        severity: "medium".into(),
+        risk_score: 65,
+        source_kind: "backend_verified".into(),
+        actor_hmac: "pg_expired_hmac".into(),
+        session_id: String::new(),
+        path: "/app.js.map".into(),
+        details_json: json!({}),
+        action_taken: "quarantined".into(),
+        timestamp_ms: bugfinder::domain::models::now_ms(),
+        quarantine: Some(("ip".into(), "pg_expired_hmac".into(), 1)),
+    };
+    app_backend.record_security_event(&exp_sec).await.unwrap();
+
     let maint_jobs = app_backend.run_maintenance(30, 512).await.unwrap();
     assert!(
         maint_jobs.iter().any(|j| j.title.contains("PG Overdue Cron")),
@@ -734,6 +795,10 @@ async fn postgres_rls_live_isolation_test() {
     assert!(
         app_backend.resolve_session(&expired_sha, 0).await.unwrap().is_none(),
         "Expired session must be deleted from sessions/session_lookup by run_maintenance"
+    );
+    assert!(
+        app_backend.list_quarantine(&ctx1, None).await.unwrap().is_empty(),
+        "Expired shield_quarantine row must be deleted by run_maintenance"
     );
 }
 
@@ -1164,4 +1229,383 @@ async fn audit_security_and_stability_fixes_test() {
     .await;
     assert_eq!(fts_st, StatusCode::OK);
     assert!(fts_body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+    ];
+
+    // 1. Browser Shield SDK served cleanly
+    let (sdk_st, sdk_hdrs, sdk_raw) =
+        send_raw(&router, "GET", "/sdk/bugfinder-shield.js", &[], Vec::new()).await;
+    assert_eq!(sdk_st, StatusCode::OK);
+    let sdk_ct = sdk_hdrs.get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+    assert!(sdk_ct.contains("javascript"));
+    let sdk_txt = String::from_utf8(sdk_raw).unwrap();
+    assert!(sdk_txt.contains("BugFinderShield"));
+
+    // 2. Invalid DSN on /shield/ -> 401
+    let (bad_dsn_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/shield/?sentry_key=wrong_key"),
+        &[],
+        json!({ "signals": ["webdriver_detected"] }),
+    )
+    .await;
+    assert_eq!(bad_dsn_st, StatusCode::UNAUTHORIZED);
+
+    // 3. Configure Shield policy + allowed_domains with enforce_origin_check = true
+    let (upd_st, _, _) = send_json(
+        &router,
+        "PUT",
+        "/api/0/projects/alpha/rolelane/settings/",
+        &owner_hdrs,
+        json!({
+            "allowed_domains": ["https://app.example.com"],
+            "shield": {
+                "enabled": true,
+                "mode": "defend",
+                "quarantine_threshold": 70,
+                "quarantine_ttl_sec": 900,
+                "enforce_origin_check": true,
+                "log_ids_enabled": true,
+                "secret_leak_alerts": true
+            }
+        }),
+    )
+    .await;
+    assert_eq!(upd_st, StatusCode::OK);
+
+    // 4. Browser DSN report from disallowed Origin -> 403
+    let (bad_orig_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/shield/?sentry_key={dsn_key}"),
+        &[("origin", "https://evil.test")],
+        json!({ "signals": ["cdp_automation", "honeypot_access"], "session_id": "sess_browser_123456" }),
+    )
+    .await;
+    assert_eq!(bad_orig_st, StatusCode::FORBIDDEN);
+
+    // 5. Valid browser report -> CGNAT-safe quarantine (session ONLY, never IP)
+    let (br_ok_st, _, br_ok_body) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/shield/?sentry_key={dsn_key}"),
+        &[("origin", "https://app.example.com")],
+        json!({
+            "signals": ["cdp_automation", "honeypot_access"],
+            "session_id": "sess_browser_123456",
+            "path": "/checkout"
+        }),
+    )
+    .await;
+    assert_eq!(br_ok_st, StatusCode::ACCEPTED);
+    assert_eq!(br_ok_body["action"], "quarantined");
+    assert_eq!(br_ok_body["risk_score"], 100);
+
+    let (q1_st, _, q1_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/shield/quarantine/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(q1_st, StatusCode::OK);
+    let q1_arr = q1_body.as_array().unwrap();
+    assert_eq!(q1_arr.len(), 1);
+    assert_eq!(q1_arr[0]["subject_type"], "session");
+
+    // 6. Backend-verified API token report quarantines actor IP HMAC + blocklist ETag / 304 + HMAC match
+    let (tk_st, _, tk_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &owner_hdrs,
+        json!({ "name": "Shield Middleware", "role": "member" }),
+    )
+    .await;
+    assert_eq!(tk_st, StatusCode::CREATED);
+    let api_tok = tk_body["token"].as_str().unwrap().to_string();
+    let bearer_auth = format!("Bearer {api_tok}");
+
+    let (be_st, _, be_body) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/shield/"),
+        &[(header::AUTHORIZATION.as_str(), &bearer_auth)],
+        json!({
+            "signals": ["canary_route_hit"],
+            "actor_ip": "203.0.113.42",
+            "path": "/.env"
+        }),
+    )
+    .await;
+    assert_eq!(be_st, StatusCode::ACCEPTED);
+    assert_eq!(be_body["action"], "quarantined");
+
+    let (bl_st, bl_hdrs, bl_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/projects/alpha/rolelane/shield/blocklist/",
+        &[(header::AUTHORIZATION.as_str(), &bearer_auth)],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(bl_st, StatusCode::OK);
+    let etag = bl_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let ip_key = bl_body["ip_hmac_key"].as_str().unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(ip_key.as_bytes()).unwrap();
+    mac.update(b"203.0.113.42");
+    let expected_ip_hmac = hex::encode(mac.finalize().into_bytes());
+    let entries = bl_body["entries"].as_array().unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| e["subject_type"] == "ip" && e["subject_hmac"] == expected_ip_hmac));
+
+    let (bl304_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/projects/alpha/rolelane/shield/blocklist/",
+        &[
+            (header::AUTHORIZATION.as_str(), &bearer_auth),
+            (header::IF_NONE_MATCH.as_str(), &etag),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(bl304_st, StatusCode::NOT_MODIFIED);
+
+    // 7. RBAC: Viewer cannot release quarantine (403); Owner releases cleanly (204)
+    let _ = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/members/",
+        &owner_hdrs,
+        json!({
+            "email": "shieldviewer@alpha.test",
+            "name": "Shield Viewer",
+            "password": "StrongPassword123!",
+            "role": "viewer"
+        }),
+    )
+    .await;
+    let (v_cookie, v_csrf) =
+        login_cookie_and_csrf(&router, "shieldviewer@alpha.test", "StrongPassword123!").await;
+    let session_q_id = q1_arr[0]["id"].as_i64().unwrap();
+    let (del_deny, _, _) = send_json(
+        &router,
+        "DELETE",
+        &format!("/api/0/organizations/alpha/shield/quarantine/{session_q_id}/"),
+        &[(header::COOKIE.as_str(), &v_cookie), ("x-csrf-token", &v_csrf)],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(del_deny, StatusCode::FORBIDDEN);
+
+    let (del_ok, _, _) = send_json(
+        &router,
+        "DELETE",
+        &format!("/api/0/organizations/alpha/shield/quarantine/{session_q_id}/"),
+        &owner_hdrs,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(del_ok, StatusCode::NO_CONTENT);
+
+    // 8. Alert rules accept security_threat and secret_leak
+    for trig in ["security_threat", "secret_leak"] {
+        let (al_st, _, _) = send_json(
+            &router,
+            "POST",
+            "/api/0/organizations/alpha/alerts/",
+            &owner_hdrs,
+            json!({
+                "project_id": project_id,
+                "name": format!("Alert {trig}"),
+                "trigger_type": trig,
+                "channel_type": "email",
+                "email_to": "sec@example.com"
+            }),
+        )
+        .await;
+        assert_eq!(al_st, StatusCode::CREATED);
+    }
+
+    // 9. False-positive guardrails BEFORE positive triggers (avoiding cooldown masking)
+    // 9a. Test key + already filtered string must NOT fire secret_leak
+    // 9b. Normal SQL prose, ../../src/app.ts, and 25x /favicon.ico 404 must NOT fire log_ids
+    let test_prefix = "sk_test_";
+    let fp_test_key = format!("{test_prefix}51234567890abcdef1234567890");
+    let mut benign_logs = vec![
+        json!({
+            "level": "info",
+            "body": format!("Loaded sandbox {fp_test_key} and token=[Filtered]"),
+            "service": "web"
+        }),
+        json!({
+            "level": "info",
+            "body": "User selected items from cart at ../../src/app.ts",
+            "service": "web",
+            "attributes": { "url.path": "/cart" }
+        }),
+    ];
+    for _ in 0..25 {
+        benign_logs.push(json!({
+            "level": "warn",
+            "body": "not found",
+            "service": "web",
+            "attributes": {
+                "http.status_code": 404,
+                "url.path": "/favicon.ico",
+                "client.address": "198.51.100.7"
+            }
+        }));
+    }
+    let (fp_log_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/v1/logs?project_id={project_id}&sentry_key={dsn_key}"),
+        &[],
+        json!({ "items": benign_logs }),
+    )
+    .await;
+    assert_eq!(fp_log_st, StatusCode::ACCEPTED);
+
+    // 9c. Browser extension CSP report must NOT fire csp_script_tamper
+    let (fp_csp_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/security/?sentry_key={dsn_key}"),
+        &[],
+        json!({
+            "csp-report": {
+                "violated-directive": "script-src",
+                "blocked-uri": "chrome-extension://abc/inject.js"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(fp_csp_st, StatusCode::CREATED);
+
+    let (ev_fp_st, _, ev_fp_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/shield/events/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ev_fp_st, StatusCode::OK);
+    let fp_events = ev_fp_body["events"].as_array().unwrap();
+    assert!(
+        !fp_events
+            .iter()
+            .any(|e| matches!(e["category"].as_str(), Some("secret_leak" | "log_ids" | "csp"))),
+        "False positive fired on benign telemetry: {fp_events:?}"
+    );
+
+    // 10. Positive detections: live secret leak, SQLi/Traversal, 20x 403 IDOR burst, external CSP tamper
+    let live_secret = ["sk", "live", "51234567890abcdef1234567890"].join("_"); // gitleaks:allow
+    let mut attack_logs = vec![
+        json!({
+            "level": "error",
+            "body": format!("Stripe init failed key={live_secret}"),
+            "service": "billing"
+        }),
+        json!({
+            "level": "warn",
+            "body": "GET /search?q=1 UNION ALL SELECT NULL,NULL--",
+            "service": "api",
+            "attributes": { "url.path": "/search" }
+        }),
+        json!({
+            "level": "warn",
+            "body": "GET /download?f=../../etc/passwd",
+            "service": "api",
+            "attributes": { "url.path": "/download" }
+        }),
+    ];
+    for i in 0..20 {
+        attack_logs.push(json!({
+            "level": "warn",
+            "body": "Forbidden",
+            "service": "api",
+            "attributes": {
+                "http.status_code": 403,
+                "url.path": format!("/api/admin/users/{i}"),
+                "client.address": "198.51.100.8"
+            }
+        }));
+    }
+    let (atk_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/v1/logs?project_id={project_id}&sentry_key={dsn_key}"),
+        &[],
+        json!({ "items": attack_logs }),
+    )
+    .await;
+    assert_eq!(atk_st, StatusCode::ACCEPTED);
+    state.batch_writer.flush_now().await;
+
+    // Verify stored logs scrubbed the live secret
+    let (logs_st, _, logs_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/logs/?service=billing",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(logs_st, StatusCode::OK);
+    let log_str = logs_body.to_string();
+    assert!(!log_str.contains(&live_secret));
+    assert!(log_str.contains("[Filtered]"));
+
+    // External CSP tamper triggers csp_script_tamper
+    let (atk_csp_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/security/?sentry_key={dsn_key}"),
+        &[],
+        json!({
+            "csp-report": {
+                "effective-directive": "script-src",
+                "blocked-uri": "https://evil.cdn/hook.js"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(atk_csp_st, StatusCode::CREATED);
+
+    let (ev2_st, _, ev2_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/shield/events/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ev2_st, StatusCode::OK);
+    let ev2_arr = ev2_body["events"].as_array().unwrap();
+    let has_sig = |sig: &str| ev2_arr.iter().any(|e| e["signal_type"] == sig);
+    assert!(has_sig("honeypot_access"));
+    assert!(has_sig("canary_route_hit"));
+    assert!(has_sig("secret_leak"));
+    assert!(has_sig("injection_probe"));
+    assert!(has_sig("idor_or_enum_burst"));
+    assert!(has_sig("csp_script_tamper"));
+    assert!(ev2_body["summary"]["secret_leaks_24h"].as_i64().unwrap() >= 1);
 }

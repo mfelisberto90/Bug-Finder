@@ -2888,6 +2888,16 @@ impl StorageBackend for PostgresStorage {
                 .execute(&mut *tx)
                 .await
                 .map_err(map_pg_err)?;
+            sqlx::query("DELETE FROM security_events WHERE timestamp_ms < $1")
+                .bind(cutoff_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("DELETE FROM shield_quarantine WHERE expires_at <= $1")
+                .bind(now_sec)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
 
             if over_budget {
                 sqlx::query(
@@ -3031,5 +3041,259 @@ impl StorageBackend for PostgresStorage {
             detail,
             wal_or_rls_verified: rls_verified,
         })
+    }
+
+    async fn record_security_event(
+        &self,
+        ev: &NewSecurityEvent,
+    ) -> Result<(SecurityEventDto, Vec<AlertDispatchJob>), String> {
+        let mut tx = self.begin_tenant(ev.organization_id).await?;
+        let now_sec = ev.timestamp_ms / 1000;
+
+        let row_id: i64 = sqlx::query_scalar(
+            "INSERT INTO security_events
+             (organization_id, project_id, signal_type, category, severity, risk_score, source_kind, actor_hmac, session_id, path, details_json, action_taken, timestamp_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             RETURNING id",
+        )
+        .bind(ev.organization_id)
+        .bind(ev.project_id)
+        .bind(&ev.signal_type)
+        .bind(&ev.category)
+        .bind(&ev.severity)
+        .bind(ev.risk_score as i32)
+        .bind(&ev.source_kind)
+        .bind(&ev.actor_hmac)
+        .bind(&ev.session_id)
+        .bind(&ev.path)
+        .bind(&ev.details_json)
+        .bind(&ev.action_taken)
+        .bind(ev.timestamp_ms)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        if let Some((ref stype, ref shmac, exp_sec)) = ev.quarantine {
+            sqlx::query(
+                "INSERT INTO shield_quarantine
+                 (organization_id, project_id, subject_type, subject_hmac, reason, risk_score, expires_at, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(organization_id, project_id, subject_type, subject_hmac) DO UPDATE SET
+                   reason = EXCLUDED.reason,
+                   risk_score = GREATEST(shield_quarantine.risk_score, EXCLUDED.risk_score),
+                   expires_at = GREATEST(shield_quarantine.expires_at, EXCLUDED.expires_at)",
+            )
+            .bind(ev.organization_id)
+            .bind(ev.project_id)
+            .bind(stype)
+            .bind(shmac)
+            .bind(&ev.signal_type)
+            .bind(ev.risk_score as i32)
+            .bind(exp_sec)
+            .bind(now_sec)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        }
+
+        let rule_rows = sqlx::query(
+            "SELECT id, name, trigger_type, cooldown_sec, channel_type, target_url, webhook_secret, email_to, last_triggered_at
+             FROM alert_rules
+             WHERE project_id = $1 AND is_active = TRUE
+               AND (trigger_type = 'security_threat' OR ($2 = 'secret_leak' AND trigger_type = 'secret_leak'))",
+        )
+        .bind(ev.project_id)
+        .bind(&ev.category)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let mut alerts = Vec::new();
+        let mut fired = Vec::new();
+        for r in rule_rows {
+            let rid: i64 = r.get("id");
+            let cd: i64 = r.get("cooldown_sec");
+            let last: Option<i64> = r.get("last_triggered_at");
+            if last.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                let trig: String = r.get("trigger_type");
+                fired.push(rid);
+                alerts.push(AlertDispatchJob {
+                    rule_id: rid,
+                    rule_name: r.get("name"),
+                    channel_type: r.get("channel_type"),
+                    target_url: r.get("target_url"),
+                    webhook_secret: r.get("webhook_secret"),
+                    email_to: r.get("email_to"),
+                    title: format!("[{}:{}] {} (score {})", ev.category, ev.severity, ev.signal_type, ev.risk_score),
+                    message: format!(
+                        "Trigger={trig} | Source={} | Action={} | Path={}",
+                        ev.source_kind, ev.action_taken, ev.path
+                    ),
+                    level: if ev.severity == "critical" || ev.severity == "high" {
+                        "fatal".into()
+                    } else {
+                        "warning".into()
+                    },
+                    project_slug: ev.project_slug.clone(),
+                    short_id: None,
+                });
+            }
+        }
+        for rid in fired {
+            sqlx::query("UPDATE alert_rules SET last_triggered_at = $1 WHERE id = $2")
+                .bind(now_sec)
+                .bind(rid)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+        }
+
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok((
+            SecurityEventDto {
+                id: row_id,
+                project_id: ev.project_id,
+                signal_type: ev.signal_type.clone(),
+                category: ev.category.clone(),
+                severity: ev.severity.clone(),
+                risk_score: ev.risk_score as i64,
+                source_kind: ev.source_kind.clone(),
+                actor_hmac: ev.actor_hmac.clone(),
+                session_id: ev.session_id.clone(),
+                path: ev.path.clone(),
+                details_json: ev.details_json.clone(),
+                action_taken: ev.action_taken.clone(),
+                timestamp: iso_from_ms(ev.timestamp_ms),
+            },
+            alerts,
+        ))
+    }
+
+    async fn list_security_events(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<SecurityEventDto>, ShieldSummaryDto), String> {
+        let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        let now = now_ms();
+        let since_24h = now - 86_400_000;
+        let now_sec = now / 1000;
+        let lim = limit.clamp(1, 200);
+
+        let stats_row = sqlx::query(
+            "SELECT
+               COUNT(*)::bigint AS total,
+               COALESCE(SUM(CASE WHEN severity IN ('high', 'critical') THEN 1 ELSE 0 END), 0)::bigint AS hc,
+               COALESCE(SUM(CASE WHEN category = 'secret_leak' THEN 1 ELSE 0 END), 0)::bigint AS leaks
+             FROM security_events
+             WHERE timestamp_ms >= $1 AND ($2::bigint IS NULL OR project_id = $2)",
+        )
+        .bind(since_24h)
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let active_q: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM shield_quarantine WHERE expires_at > $1 AND ($2::bigint IS NULL OR project_id = $2)",
+        )
+        .bind(now_sec)
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let rows = sqlx::query(
+            "SELECT id, project_id, signal_type, category, severity, risk_score, source_kind,
+                    actor_hmac, session_id, path, details_json, action_taken, timestamp_ms
+             FROM security_events
+             WHERE ($1::bigint IS NULL OR project_id = $1)
+             ORDER BY timestamp_ms DESC, id DESC
+             LIMIT $2",
+        )
+        .bind(project_id)
+        .bind(lim)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let items = rows
+            .into_iter()
+            .map(|r| SecurityEventDto {
+                id: r.get("id"),
+                project_id: r.get("project_id"),
+                signal_type: r.get("signal_type"),
+                category: r.get("category"),
+                severity: r.get("severity"),
+                risk_score: r.get::<i32, _>("risk_score") as i64,
+                source_kind: r.get("source_kind"),
+                actor_hmac: r.get("actor_hmac"),
+                session_id: r.get("session_id"),
+                path: r.get("path"),
+                details_json: r.get::<Value, _>("details_json"),
+                action_taken: r.get("action_taken"),
+                timestamp: iso_from_ms(r.get("timestamp_ms")),
+            })
+            .collect();
+
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok((
+            items,
+            ShieldSummaryDto {
+                events_24h: stats_row.get("total"),
+                high_critical_24h: stats_row.get("hc"),
+                secret_leaks_24h: stats_row.get("leaks"),
+                active_quarantines: active_q,
+            },
+        ))
+    }
+
+    async fn list_quarantine(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+    ) -> Result<Vec<QuarantineEntryDto>, String> {
+        let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        let now_sec = now_ms() / 1000;
+        let rows = sqlx::query(
+            "SELECT id, project_id, subject_type, subject_hmac, reason, risk_score, expires_at, created_at
+             FROM shield_quarantine
+             WHERE expires_at > $1 AND ($2::bigint IS NULL OR project_id = $2)
+             ORDER BY expires_at DESC, id DESC
+             LIMIT 250",
+        )
+        .bind(now_sec)
+        .bind(project_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let out = rows
+            .into_iter()
+            .map(|r| QuarantineEntryDto {
+                id: r.get("id"),
+                project_id: r.get("project_id"),
+                subject_type: r.get("subject_type"),
+                subject_hmac: r.get("subject_hmac"),
+                reason: r.get("reason"),
+                risk_score: r.get::<i32, _>("risk_score") as i64,
+                expires_at: iso_from_ms(r.get::<i64, _>("expires_at") * 1000),
+                created_at: iso_from_ms(r.get::<i64, _>("created_at") * 1000),
+            })
+            .collect();
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(out)
+    }
+
+    async fn delete_quarantine(&self, ctx: &TenantCtx, entry_id: i64) -> Result<bool, String> {
+        let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        let res = sqlx::query("DELETE FROM shield_quarantine WHERE id = $1")
+            .bind(entry_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(res.rows_affected() > 0)
     }
 }
