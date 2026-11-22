@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI Security Invariant Linter for Bug-Finder (RoleLane V2 / Enterprise Security Blueprint)."""
+"""CI Security Invariant Linter for Bug-Finder (Enterprise Security Blueprint)."""
 
 import pathlib
 import re

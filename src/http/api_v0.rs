@@ -689,7 +689,7 @@ pub async fn enable_project_tunnel(
 }
 
 // ----------------------------------------------------------------------------
-// Issues, Events, Export CSV & Stats v2 (RoleLane + GlitchTip Compatible)
+// Issues, Events, Export CSV & Stats v2 (GlitchTip & Sentry Compatible)
 // ----------------------------------------------------------------------------
 
 fn parse_issue_query(q: &HashMap<String, String>) -> IssueQueryParams {
@@ -1375,7 +1375,7 @@ pub async fn upload_sourcemap(
 }
 
 // ----------------------------------------------------------------------------
-// Uptime Monitors & RoleLane Heartbeat Check
+// Uptime Monitors & Heartbeat Check
 // ----------------------------------------------------------------------------
 
 pub async fn list_monitors(
@@ -2739,6 +2739,7 @@ pub async fn get_sdk_meta(
         "version": env!("CARGO_PKG_VERSION"),
         "mini_sdk_sri": mini_sri,
         "shield_sdk_sri": shield_sri,
+        "public_url": state.config.public_url,
     }))
     .into_response()
 }

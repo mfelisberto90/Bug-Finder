@@ -1500,7 +1500,7 @@ mod tests {
             "ErrorBoundary mounted cleanly",
             r#"127.0.0.1 - - "GET /api/0/errors 200 12ms""#,
             "worker started listening on port 8080",
-            "imob-on listening on http://127.0.0.1:3366",
+            "acme-server listening on http://127.0.0.1:3366",
             "[WEBCHAT-INIT-CHIPS-WARN] tenant_id=1 err=none",
             "[master-audit] ok",
         ] {

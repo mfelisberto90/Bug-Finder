@@ -42,8 +42,8 @@ async fn setup_test_app() -> (TempDir, Arc<AppState>, axum::Router, String, i64)
             "email": "owner@alpha.test",
             "name": "Alice",
             "password": "StrongPassword123!",
-            "project_name": "RoleLane App",
-            "project_slug": "rolelane"
+            "project_name": "Acme App",
+            "project_slug": "acme-web"
         }),
     )
     .await;
@@ -127,7 +127,7 @@ async fn login_cookie_and_csrf(
 }
 
 #[tokio::test]
-async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
+async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
     let (cookie, csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
 
@@ -142,7 +142,7 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
     let (sm_st, _, _) = send_raw(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/releases/1.2.0/sourcemaps/?filename=app.min.js.map",
+        "/api/0/projects/alpha/acme-web/releases/1.2.0/sourcemaps/?filename=app.min.js.map",
         &[(header::COOKIE.as_str(), &cookie), ("x-csrf-token", &csrf)],
         sm_bytes,
     )
@@ -162,8 +162,8 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
             "environment": "production",
             "release": "1.2.0",
             "contexts": { "trace": { "trace_id": trace_id, "span_id": "00f067aa0ba902b7" } },
-            "request": { "url": "https://app.rolelane.co.uk/pay?token=supersecret", "headers": { "Authorization": "Bearer jwt_secret" } },
-            "exception": { "values": [{ "type": "PaymentError", "value": "Card 4111-1111-1111-1111 declined", "stacktrace": { "frames": [{ "filename": "https://cdn.rolelane.co.uk/app.min.js", "lineno": 1, "colno": 0, "in_app": true }] } }] }
+            "request": { "url": "https://app.acme.example/pay?token=supersecret", "headers": { "Authorization": "Bearer jwt_secret" } },
+            "exception": { "values": [{ "type": "PaymentError", "value": "Card 4111-1111-1111-1111 declined", "stacktrace": { "frames": [{ "filename": "https://cdn.acme.example/app.min.js", "lineno": 1, "colno": 0, "in_app": true }] } }] }
         }),
         json!({ "type": "log", "item_count": 1, "content_type": "application/vnd.sentry.items.log+json" }),
         json!({
@@ -203,7 +203,7 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
         &[
             ("content-encoding", "gzip"),
             ("x-sentry-auth", &sentry_auth),
-            ("origin", "https://app.rolelane.co.uk"),
+            ("origin", "https://app.acme.example"),
             ("user-agent", "Mozilla/5.0"),
         ],
         gz_bytes,
@@ -211,11 +211,11 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
     .await;
     assert_eq!(ing_st, StatusCode::OK, "envelope ingest failed: {}", String::from_utf8_lossy(&ing_raw));
 
-    // 3. Send RoleLane GlitchTipClient.php `/store/` event + retry duplicate check
+    // 3. Send GlitchTip `/store/` event + retry duplicate check
     let store_payload = json!({
         "event_id": "22222222222222222222222222222222",
         "level": "error",
-        "message": "RoleLane webhook warning",
+        "message": "Acme webhook warning",
         "environment": "production",
         "release": "1.2.0"
     });
@@ -250,7 +250,7 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
     // Deterministically flush micro-batch writer
     state.batch_writer.flush_now().await;
 
-    // 5. RoleLane GlitchTipReadClient compatibility check: X-Hits + stats_v2 + heartbeat_check
+    // 5. GlitchTipReadClient compatibility check: X-Hits + stats_v2 + heartbeat_check
     let (iss_st, iss_hdrs, iss_body) = send_raw(
         &router,
         "GET",
@@ -312,7 +312,7 @@ async fn end_to_end_sentry_envelope_logs_otlp_rolelane_sourcemap_and_mcp() {
     let (tun_st, _, tun_body) = send_json(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/tunnel/",
+        "/api/0/projects/alpha/acme-web/tunnel/",
         &[(header::COOKIE.as_str(), &cookie), ("x-csrf-token", &csrf)],
         json!({}),
     )
@@ -1256,7 +1256,7 @@ async fn audit_security_and_stability_fixes_test() {
     let (sm_ok, _, _) = send_raw(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/releases/2.0.0/sourcemaps/?filename=bundle.min.js.map",
+        "/api/0/projects/alpha/acme-web/releases/2.0.0/sourcemaps/?filename=bundle.min.js.map",
         &owner_hdrs,
         sm_bytes,
     )
@@ -1426,7 +1426,7 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     let (upd_st, _, _) = send_json(
         &router,
         "PUT",
-        "/api/0/projects/alpha/rolelane/settings/",
+        "/api/0/projects/alpha/acme-web/settings/",
         &owner_hdrs,
         json!({
             "allowed_domains": ["https://app.example.com"],
@@ -1516,7 +1516,7 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     let (bl_st, bl_hdrs, bl_body) = send_json(
         &router,
         "GET",
-        "/api/0/projects/alpha/rolelane/shield/blocklist/",
+        "/api/0/projects/alpha/acme-web/shield/blocklist/",
         &[(header::AUTHORIZATION.as_str(), &bearer_auth)],
         Value::Null,
     )
@@ -1535,7 +1535,7 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     let (bl304_st, _, _) = send_raw(
         &router,
         "GET",
-        "/api/0/projects/alpha/rolelane/shield/blocklist/",
+        "/api/0/projects/alpha/acme-web/shield/blocklist/",
         &[
             (header::AUTHORIZATION.as_str(), &bearer_auth),
             (header::IF_NONE_MATCH.as_str(), &etag),
@@ -2614,7 +2614,7 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
     let (pset_st, _, _) = send_json(
         &router,
         "PUT",
-        "/api/0/projects/alpha/rolelane/settings/",
+        "/api/0/projects/alpha/acme-web/settings/",
         &owner_hdrs,
         json!({
             "allowed_domains": ["app.example.com"],
@@ -2811,7 +2811,7 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     let (ck_st, _, ck_body) = send_json(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/keys/",
+        "/api/0/projects/alpha/acme-web/keys/",
         &hdrs,
         json!({ "label": "Temp Edge Key" }),
     )
@@ -2838,7 +2838,7 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     let (uk_st, _, _) = send_json(
         &router,
         "PUT",
-        &format!("/api/0/projects/alpha/rolelane/keys/{temp_key_id}/"),
+        &format!("/api/0/projects/alpha/acme-web/keys/{temp_key_id}/"),
         &hdrs,
         json!({ "rate_limit_per_min": 600, "is_active": false }),
     )
@@ -3241,8 +3241,8 @@ async fn alerts_telegram_discord_and_oidc_flow_test() {
             "email": "owner@alpha.test",
             "name": "Alice",
             "password": "StrongPassword123!",
-            "project_name": "RoleLane App",
-            "project_slug": "rolelane"
+            "project_name": "Acme App",
+            "project_slug": "acme-web"
         }),
     )
     .await;
@@ -3598,7 +3598,7 @@ async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
     let (unauth_ev_st, _, _) = send_json(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/test-event/",
+        "/api/0/projects/alpha/acme-web/test-event/",
         &[],
         json!({}),
     )
@@ -3623,7 +3623,7 @@ async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
     let (forb_ev_st, _, _) = send_json(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/test-event/",
+        "/api/0/projects/alpha/acme-web/test-event/",
         &[(header::AUTHORIZATION.as_str(), viewer_auth.as_str())],
         json!({}),
     )
@@ -3646,7 +3646,7 @@ async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
     let (ok_ev_st, _, ok_ev_body) = send_json(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/test-event/",
+        "/api/0/projects/alpha/acme-web/test-event/",
         &[
             (header::COOKIE.as_str(), owner_cookie.as_str()),
             ("x-csrf-token", owner_csrf.as_str()),
@@ -3663,7 +3663,7 @@ async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
         let (st, _, _) = send_json(
             &router,
             "POST",
-            "/api/0/projects/alpha/rolelane/test-event/",
+            "/api/0/projects/alpha/acme-web/test-event/",
             &[
                 (header::COOKIE.as_str(), owner_cookie.as_str()),
                 ("x-csrf-token", owner_csrf.as_str()),
@@ -3676,7 +3676,7 @@ async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
     let (rl_st, _, _) = send_json(
         &router,
         "POST",
-        "/api/0/projects/alpha/rolelane/test-event/",
+        "/api/0/projects/alpha/acme-web/test-event/",
         &[
             (header::COOKIE.as_str(), owner_cookie.as_str()),
             ("x-csrf-token", owner_csrf.as_str()),

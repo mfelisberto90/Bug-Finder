@@ -293,7 +293,7 @@ echo ""
 echo "Quick 30s App Onboarding (run inside your app directory):"
 echo "  1) Auto-configure .env + connector: bugfinder init --dsn <YOUR_DSN>"
 echo "  2) Zero-code crash & log wrapper:   bugfinder wrap --dsn <YOUR_DSN> -- <your-app-command>"
-echo "  3) Browser 1-tag snippet:           Open the Web UI -> Projects -> 'Conectar App'"
+echo "  3) Browser 1-tag snippet:           Open the Web UI -> Projects -> 'Connect App'"
 if [[ ":${PATH}:" != *":${PREFIX}:"* ]]; then
   echo "  Note:   Add ${PREFIX} to your PATH: export PATH=\"${PREFIX}:\$PATH\""
 fi
