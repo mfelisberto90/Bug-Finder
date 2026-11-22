@@ -279,7 +279,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down')),
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down', 'security_threat', 'secret_leak')),
     threshold_count BIGINT NOT NULL DEFAULT 1,
     window_sec BIGINT NOT NULL DEFAULT 60,
     cooldown_sec BIGINT NOT NULL DEFAULT 300,
@@ -291,6 +291,42 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at BIGINT NOT NULL
 );
+
+ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_trigger_type_check;
+ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_trigger_type_check
+    CHECK (trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down', 'security_threat', 'secret_leak'));
+
+CREATE TABLE IF NOT EXISTS security_events (
+    id BIGSERIAL PRIMARY KEY,
+    organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    signal_type TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    risk_score INTEGER NOT NULL,
+    source_kind TEXT NOT NULL,
+    actor_hmac TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    action_taken TEXT NOT NULL DEFAULT 'logged',
+    timestamp_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pg_security_events_proj_time ON security_events(organization_id, project_id, timestamp_ms DESC);
+
+CREATE TABLE IF NOT EXISTS shield_quarantine (
+    id BIGSERIAL PRIMARY KEY,
+    organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    subject_type TEXT NOT NULL CHECK (subject_type IN ('session', 'ip')),
+    subject_hmac TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    risk_score INTEGER NOT NULL,
+    expires_at BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    UNIQUE(organization_id, project_id, subject_type, subject_hmac)
+);
+CREATE INDEX IF NOT EXISTS idx_pg_shield_quarantine_exp ON shield_quarantine(organization_id, project_id, expires_at);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id BIGSERIAL PRIMARY KEY,
@@ -386,7 +422,9 @@ DECLARE
         'uptime_monitors',
         'uptime_checks',
         'alert_rules',
-        'audit_logs'
+        'audit_logs',
+        'security_events',
+        'shield_quarantine'
     ];
 BEGIN
     FOREACH tbl IN ARRAY tenant_tables LOOP

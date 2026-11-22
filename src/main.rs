@@ -183,6 +183,7 @@ fn main() -> ExitCode {
 }
 
 async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
+    bugfinder::security::anti_rea::apply_anti_ptrace_if_enabled(config.anti_ptrace);
     install_panic_hook(config.data_dir.clone());
     let storage = match build_storage(&config).await {
         Ok(s) => s,

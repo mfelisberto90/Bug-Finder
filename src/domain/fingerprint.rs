@@ -346,6 +346,47 @@ const EXTENSION_PREFIXES: &[&str] = &[
     "ms-browser-extension://",
 ];
 
+pub fn is_origin_allowed(origin_or_referer: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.is_empty() {
+        return true;
+    }
+    let host = origin_or_referer
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin_or_referer)
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    allowed_domains.iter().any(|d| {
+        let d_raw = d.trim().to_ascii_lowercase();
+        let d_low = d_raw
+            .split("://")
+            .last()
+            .unwrap_or(&d_raw)
+            .split(&['/', '?', '#'][..])
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        if d_low.is_empty() {
+            return false;
+        }
+        if let Some(suffix) = d_low.strip_prefix("*.") {
+            host == suffix || host.ends_with(&format!(".{suffix}"))
+        } else {
+            host == d_low
+        }
+    })
+}
+
 /// Edge Inbound Filters protecting quota & noise before DB batching.
 pub fn evaluate_inbound_filters(
     ev: &Value,
@@ -378,26 +419,7 @@ pub fn evaluate_inbound_filters(
     if !filters.allowed_domains.is_empty() {
         let source = origin_or_referer.or(if req_url.is_empty() { None } else { Some(req_url) });
         if let Some(src) = source {
-            let host = src
-                .split("://")
-                .nth(1)
-                .unwrap_or(src)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let allowed = filters.allowed_domains.iter().any(|d| {
-                let d_low = d.trim().to_ascii_lowercase();
-                if let Some(suffix) = d_low.strip_prefix("*.") {
-                    host == suffix || host.ends_with(&format!(".{suffix}"))
-                } else {
-                    host == d_low
-                }
-            });
-            if !allowed && !host.is_empty() {
+            if !is_origin_allowed(src, &filters.allowed_domains) {
                 return FilterDecision::Drop("disallowed_domain");
             }
         }

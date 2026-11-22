@@ -58,6 +58,18 @@ async fn mini_sdk_js() -> Response {
         .into_response()
 }
 
+async fn shield_sdk_js() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        embedded_ui::SHIELD_SDK_JS,
+    )
+        .into_response()
+}
+
 async fn prometheus_metrics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -163,6 +175,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/:project_id/otlp/v1/logs", post(ingest::ingest_otlp_logs).options(ingest::options_ingest))
         .route("/v1/logs", post(ingest::ingest_otlp_logs).options(ingest::options_ingest))
         .route("/api/v1/logs", post(ingest::ingest_direct_logs).options(ingest::options_ingest))
+        .route("/api/:project_id/shield/", post(ingest::ingest_shield).options(ingest::options_ingest))
+        .route("/api/:project_id/shield", post(ingest::ingest_shield).options(ingest::options_ingest))
         .route("/t/:slug", post(ingest::ingest_tunnel).options(ingest::options_ingest))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024));
 
@@ -189,6 +203,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/robots.txt", get(robots_txt))
         .route("/metrics", get(prometheus_metrics))
         .route("/sdk/bugfinder-mini.js", get(mini_sdk_js))
+        .route("/sdk/bugfinder-shield.js", get(shield_sdk_js))
         .route("/api/auth/status", get(auth_routes::auth_status))
         .route("/api/auth/setup", post(auth_routes::auth_setup))
         .route("/api/auth/login", post(auth_routes::auth_login))
@@ -229,6 +244,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/0/organizations/:org/alerts/", get(api_v0::list_alerts).post(api_v0::create_alert))
         .route("/api/0/organizations/:org/alerts/:rule_id/", delete(api_v0::delete_alert))
         .route("/api/0/organizations/:org/alerts/:rule_id/test/", post(api_v0::test_alert))
+        .route("/api/0/organizations/:org/shield/events/", get(api_v0::list_shield_events))
+        .route("/api/0/organizations/:org/shield/quarantine/", get(api_v0::list_shield_quarantine))
+        .route("/api/0/organizations/:org/shield/quarantine/:entry_id/", delete(api_v0::delete_shield_quarantine))
+        .route("/api/0/projects/:org/:proj/shield/blocklist/", get(api_v0::get_shield_blocklist))
         .route("/api/0/api-tokens/", get(api_v0::list_api_tokens).post(api_v0::create_api_token))
         .route("/api/0/api-tokens/:token_id/", delete(api_v0::delete_api_token))
         .route("/api/0/organizations/:org/members/", get(api_v0::list_members).post(api_v0::invite_member))

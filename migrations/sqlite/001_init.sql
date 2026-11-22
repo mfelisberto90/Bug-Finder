@@ -280,7 +280,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    trigger_type TEXT NOT NULL CHECK(trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down')),
+    trigger_type TEXT NOT NULL CHECK(trigger_type IN ('new_issue', 'regression', 'threshold', 'fatal_log', 'uptime_down', 'security_threat', 'secret_leak')),
     threshold_count INTEGER NOT NULL DEFAULT 1,
     window_sec INTEGER NOT NULL DEFAULT 60,
     cooldown_sec INTEGER NOT NULL DEFAULT 300,
@@ -326,3 +326,35 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_issues_fts_del AFTER DELETE ON issues BEGIN
     DELETE FROM issues_fts WHERE issue_id = OLD.id;
 END;
+
+CREATE TABLE IF NOT EXISTS security_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    signal_type TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    risk_score INTEGER NOT NULL,
+    source_kind TEXT NOT NULL,
+    actor_hmac TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    action_taken TEXT NOT NULL DEFAULT 'logged',
+    timestamp_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_security_events_proj_time ON security_events(organization_id, project_id, timestamp_ms DESC);
+
+CREATE TABLE IF NOT EXISTS shield_quarantine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('session', 'ip')),
+    subject_hmac TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    risk_score INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(organization_id, project_id, subject_type, subject_hmac)
+);
+CREATE INDEX IF NOT EXISTS idx_shield_quarantine_exp ON shield_quarantine(organization_id, project_id, expires_at);

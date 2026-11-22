@@ -280,10 +280,11 @@ pub fn run_tail_cli(
                         Ok(line) => {
                             if let Some(data) = line.strip_prefix("data:") {
                                 if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                                    let lvl = v.get("level").and_then(|x| x.as_str()).unwrap_or("info");
-                                    let svc = v.get("service").and_then(|x| x.as_str()).unwrap_or("-");
-                                    let msg = v.get("title_or_body").and_then(|x| x.as_str()).unwrap_or("");
-                                    let tid = v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("-");
+                                    let strip = crate::domain::scrubber::strip_ansi_and_bidi;
+                                    let lvl = strip(v.get("level").and_then(|x| x.as_str()).unwrap_or("info"));
+                                    let svc = strip(v.get("service").and_then(|x| x.as_str()).unwrap_or("-"));
+                                    let msg = strip(v.get("title_or_body").and_then(|x| x.as_str()).unwrap_or(""));
+                                    let tid = strip(v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("-"));
                                     println!("[{lvl}] [{svc}] [trace={tid}] {msg}");
                                 }
                             }

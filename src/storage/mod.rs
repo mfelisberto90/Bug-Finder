@@ -348,6 +348,17 @@ pub trait StorageBackend: Send + Sync {
     async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String>;
     async fn db_size_bytes(&self) -> u64;
     async fn check_health(&self) -> Result<StorageHealthInfo, String>;
+
+    // Anti-REA Shield & Log-IDS telemetry / quarantine
+    async fn record_security_event(&self, ev: &NewSecurityEvent) -> Result<(SecurityEventDto, Vec<AlertDispatchJob>), String>;
+    async fn list_security_events(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<SecurityEventDto>, ShieldSummaryDto), String>;
+    async fn list_quarantine(&self, ctx: &TenantCtx, project_id: Option<i64>) -> Result<Vec<QuarantineEntryDto>, String>;
+    async fn delete_quarantine(&self, ctx: &TenantCtx, entry_id: i64) -> Result<bool, String>;
 }
 
 #[cfg(test)]

@@ -56,6 +56,7 @@ fn content_type_for(rel: &str) -> &'static str {
 fn main() {
     println!("cargo:rerun-if-changed=ui/dist");
     println!("cargo:rerun-if-changed=sdks/browser/bugfinder-mini.js");
+    println!("cargo:rerun-if-changed=sdks/browser/bugfinder-shield.js");
     println!("cargo:rerun-if-changed=migrations/sqlite/001_init.sql");
     println!("cargo:rerun-if-changed=migrations/postgres/001_init_rls.sql");
 
@@ -120,5 +121,13 @@ fn main() {
         writeln!(file, "pub const MINI_SDK_JS: &[u8] = include_bytes!(\"{}\");", abs_str).unwrap();
     } else {
         writeln!(file, "pub const MINI_SDK_JS: &[u8] = b\"/* BugFinder Mini SDK placeholder */\";").unwrap();
+    }
+
+    let shield_sdk_path = manifest_dir.join("sdks").join("browser").join("bugfinder-shield.js");
+    if shield_sdk_path.is_file() {
+        let abs_str = shield_sdk_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(file, "pub const SHIELD_SDK_JS: &[u8] = include_bytes!(\"{}\");", abs_str).unwrap();
+    } else {
+        writeln!(file, "pub const SHIELD_SDK_JS: &[u8] = b\"/* BugFinder Shield SDK placeholder */\";").unwrap();
     }
 }

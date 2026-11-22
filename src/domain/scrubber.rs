@@ -86,7 +86,7 @@ fn regexes() -> &'static ScrubRegexes {
             r"-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[A-Za-z0-9+/=\r\n \t]+-----END [A-Z0-9 ]+PRIVATE KEY-----",
         ),
         auth_header: build_ascii_regex(
-            r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9\-._~+/]+=*",
+            r"(?i)\b(Bearer|Basic)\s+([A-Za-z0-9\-._~+/]+=*)",
         ),
         jwt: build_ascii_regex(
             r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\b",
@@ -165,6 +165,63 @@ fn split_key_tokens(key: &str) -> Vec<String> {
     tokens
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScrubReport {
+    pub categories: Vec<&'static str>,
+}
+
+impl ScrubReport {
+    fn push_unique(&mut self, cat: &'static str) {
+        if !self.categories.contains(&cat) {
+            self.categories.push(cat);
+        }
+    }
+}
+
+pub fn strip_ansi_and_bidi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if c == '\r'
+            || c == '\0'
+            || ('\u{202A}'..='\u{202E}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+            || matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}')
+            || (c.is_control() && c != '\n' && c != '\t')
+        {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub struct Scrubber {
     safe_keys: HashSet<String>,
     sensitive_keys: HashSet<String>,
@@ -201,6 +258,11 @@ impl Scrubber {
     }
 
     pub fn scrub_string(&self, input: &str) -> String {
+        let mut report = ScrubReport::default();
+        self.scrub_string_with_report(input, &mut report)
+    }
+
+    pub fn scrub_string_with_report(&self, input: &str, report: &mut ScrubReport) -> String {
         let mut s = if input.contains('\0') {
             input.replace('\0', "")
         } else {
@@ -208,16 +270,35 @@ impl Scrubber {
         };
 
         let rx = regexes();
-        if s.contains("PRIVATE KEY") {
+        if s.contains("PRIVATE KEY") && rx.pem_block.is_match(&s) {
+            report.push_unique("pem_private_key");
             s = rx.pem_block.replace_all(&s, PLACEHOLDER).into_owned();
         }
         if s.contains("Bearer ") || s.contains("bearer ") || s.contains("Basic ") || s.contains("basic ") {
-            s = rx.auth_header.replace_all(&s, "$1 [Filtered]").into_owned();
+            if rx.auth_header.is_match(&s) {
+                for cap in rx.auth_header.captures_iter(&s) {
+                    if let Some(tok) = cap.get(2).map(|m| m.as_str()) {
+                        if tok.len() >= 12 {
+                            report.push_unique("auth_header");
+                            break;
+                        }
+                    }
+                }
+                s = rx.auth_header.replace_all(&s, "$1 [Filtered]").into_owned();
+            }
         }
-        if s.contains("eyJ") {
+        if s.contains("eyJ") && rx.jwt.is_match(&s) {
+            report.push_unique("jwt");
             s = rx.jwt.replace_all(&s, PLACEHOLDER).into_owned();
         }
-        if s.contains('_') || s.contains('-') {
+        if (s.contains('_') || s.contains('-')) && rx.prefixed_secret.is_match(&s) {
+            for m in rx.prefixed_secret.find_iter(&s) {
+                let raw = m.as_str();
+                if !raw.starts_with("sk_test_") && !raw.starts_with("rk_test_") {
+                    report.push_unique("live_prefixed_secret");
+                    break;
+                }
+            }
             s = rx.prefixed_secret.replace_all(&s, PLACEHOLDER).into_owned();
         }
         if s.contains('=') && (s.contains('?') || s.contains('&')) {
@@ -229,6 +310,7 @@ impl Scrubber {
                 .replace_all(&s, |caps: &regex::Captures| {
                     let m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
                     if is_luhn_valid(m) {
+                        report.push_unique("luhn_card_pan");
                         PLACEHOLDER.to_string()
                     } else {
                         m.to_string()
@@ -242,17 +324,17 @@ impl Scrubber {
         s
     }
 
-    fn scrub_value(&self, val: &mut Value, depth: usize) {
+    fn scrub_value(&self, val: &mut Value, depth: usize, report: &mut ScrubReport) {
         if depth >= MAX_SCRUB_DEPTH {
             return;
         }
         match val {
             Value::String(s) => {
-                *s = self.scrub_string(s);
+                *s = self.scrub_string_with_report(s, report);
             }
             Value::Array(arr) => {
                 for item in arr.iter_mut() {
-                    self.scrub_value(item, depth + 1);
+                    self.scrub_value(item, depth + 1, report);
                 }
             }
             Value::Object(map) => {
@@ -260,6 +342,11 @@ impl Scrubber {
                 for k in keys {
                     if self.is_sensitive_key(&k) {
                         if let Some(entry) = map.get_mut(&k) {
+                            if let Some(s) = entry.as_str() {
+                                if s != PLACEHOLDER && !s.is_empty() {
+                                    let _ = self.scrub_string_with_report(s, report);
+                                }
+                            }
                             if !entry.is_null() {
                                 *entry = Value::String(PLACEHOLDER.to_string());
                             }
@@ -269,7 +356,7 @@ impl Scrubber {
                             *ip = anonymize_ip(ip);
                         }
                     } else if let Some(entry) = map.get_mut(&k) {
-                        self.scrub_value(entry, depth + 1);
+                        self.scrub_value(entry, depth + 1, report);
                     }
                 }
             }
@@ -278,12 +365,17 @@ impl Scrubber {
     }
 
     pub fn scrub_event_in_place(&self, event: &mut Value) {
+        let _ = self.scrub_event_with_report(event);
+    }
+
+    pub fn scrub_event_with_report(&self, event: &mut Value) -> ScrubReport {
+        let mut report = ScrubReport::default();
         let Some(obj) = event.as_object_mut() else {
-            return;
+            return report;
         };
         for section in EVENT_SECTIONS {
             if let Some(val) = obj.get_mut(*section) {
-                self.scrub_value(val, 0);
+                self.scrub_value(val, 0, &mut report);
             }
         }
         if let Some(Value::String(rel)) = obj.get_mut("release") {
@@ -292,11 +384,18 @@ impl Scrubber {
         if let Some(Value::String(env)) = obj.get_mut("environment") {
             *env = env.replace('\0', "");
         }
+        report
     }
 
     pub fn scrub_log_in_place(&self, body: &mut String, attrs: &mut Value) {
-        *body = self.scrub_string(body);
-        self.scrub_value(attrs, 0);
+        let _ = self.scrub_log_with_report(body, attrs);
+    }
+
+    pub fn scrub_log_with_report(&self, body: &mut String, attrs: &mut Value) -> ScrubReport {
+        let mut report = ScrubReport::default();
+        *body = self.scrub_string_with_report(body, &mut report);
+        self.scrub_value(attrs, 0, &mut report);
+        report
     }
 }
 
@@ -367,5 +466,29 @@ mod tests {
         assert!(!msg.contains("sk_live_"));
         assert!(!msg.contains("eyJhbGci"));
         assert!(!msg.contains('\0'));
+    }
+
+    #[test]
+    fn secret_leak_radar_avoids_false_positives_and_strip_ansi_works() {
+        let scrubber = Scrubber::from_filters(&ProjectFilters::default());
+
+        // Test keys, empty password, pre-filtered placeholder, short Bearer label -> 0 categories
+        let mut benign = json!({
+            "message": "Using sk_test_1234567890abcdef and Bearer short with password=", // gitleaks:allow
+            "extra": { "password": "", "token": "[Filtered]" }
+        });
+        let rep0 = scrubber.scrub_event_with_report(&mut benign);
+        assert!(rep0.categories.is_empty(), "Unexpected false positive: {:?}", rep0.categories);
+
+        // Live secret in log -> triggers live_prefixed_secret
+        let mut leak_body = "Leaked key sk_live_0000111122223333".to_string(); // gitleaks:allow
+        let mut leak_attrs = json!({});
+        let rep1 = scrubber.scrub_log_with_report(&mut leak_body, &mut leak_attrs);
+        assert_eq!(rep1.categories, vec!["live_prefixed_secret"]);
+        assert!(leak_body.contains(PLACEHOLDER));
+
+        // ANSI + bidi terminal injection stripped while preserving valid text
+        let raw = "\x1b[31mFAKE\x1b[0m \u{202E}txt\r\nok";
+        assert_eq!(strip_ansi_and_bidi(raw), "FAKE txt\nok");
     }
 }

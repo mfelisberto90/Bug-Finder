@@ -4,12 +4,17 @@ use crate::domain::envelope::{
     ParsedEnvelope,
 };
 use crate::domain::fingerprint::{
-    evaluate_inbound_filters, extract_issue_metadata, FilterDecision,
+    evaluate_inbound_filters, extract_issue_metadata, is_origin_allowed, FilterDecision,
 };
-use crate::domain::models::{now_ms, LiveStreamEvent, LogLevel, NormalizedLog, ProjectAuthInfo};
+use crate::domain::models::{
+    now_ms, LiveStreamEvent, LogLevel, NewSecurityEvent, NormalizedLog, ProjectAuthInfo,
+};
 use crate::domain::otlp::decode_otlp_logs;
-use crate::domain::scrubber::Scrubber;
+use crate::domain::scrubber::{strip_ansi_and_bidi, Scrubber};
 use crate::domain::sourcemap::{demangle_event_with_maps, strip_url_basename};
+use crate::security::anti_rea::{
+    decide_quarantine, inspect_csp_for_tamper, score_signals, shield_ip_hmac,
+};
 use crate::security::auth::sha256_hex;
 use crate::security::headers::ClientIp;
 use crate::security::ratelimit::sentry_rate_limit_header;
@@ -254,10 +259,24 @@ async fn maybe_demangle_event(state: &AppState, auth: &ProjectAuthInfo, ev: &mut
     });
 }
 
+async fn emit_shield_security_event(state: &AppState, ev: NewSecurityEvent) {
+    if let Ok((_, jobs)) = state.storage.record_security_event(&ev).await {
+        if !jobs.is_empty() {
+            crate::storage::batch_writer::spawn_alert_jobs(
+                &state.config,
+                &state.metrics,
+                &state.self_monitor,
+                jobs,
+            );
+        }
+    }
+}
+
 async fn process_single_event(
     state: &AppState,
     auth: &ProjectAuthInfo,
     headers: &HeaderMap,
+    client_ip: &str,
     mut ev: Value,
 ) -> Result<Option<String>, Response> {
     let origin = headers
@@ -277,7 +296,7 @@ async fn process_single_event(
     maybe_demangle_event(state, auth, &mut ev).await;
 
     let scrubber = Scrubber::from_filters(&auth.filters);
-    scrubber.scrub_event_in_place(&mut ev);
+    let scrub_report = scrubber.scrub_event_with_report(&mut ev);
 
     let meta = extract_issue_metadata(&ev);
     if state.event_dedupe.contains(auth.project_id, &meta.event_id) {
@@ -291,6 +310,45 @@ async fn process_single_event(
     let payload_json = serde_json::to_vec(&ev).unwrap_or_else(|_| b"{}".to_vec());
     let received_ms = now_ms();
     let event_id = meta.event_id.clone();
+
+    if auth.filters.shield.enabled
+        && auth.filters.shield.secret_leak_alerts
+        && !scrub_report.categories.is_empty()
+        && state
+            .shield_engine
+            .allow_cooldown(auth.project_id, "secret_leak:event", 60_000, received_ms)
+    {
+        let ev_path = ev
+            .get("request")
+            .and_then(|r| r.get("url"))
+            .and_then(|v| v.as_str())
+            .map(strip_ansi_and_bidi)
+            .unwrap_or_default();
+        emit_shield_security_event(
+            state,
+            NewSecurityEvent {
+                organization_id: auth.organization_id,
+                project_id: auth.project_id,
+                project_slug: auth.project_slug.clone(),
+                signal_type: "secret_leak".into(),
+                category: "secret_leak".into(),
+                severity: "medium".into(),
+                risk_score: 60,
+                source_kind: "log_ids".into(),
+                actor_hmac: shield_ip_hmac(&state.config.app_key, auth.project_id, client_ip),
+                session_id: String::new(),
+                path: ev_path.chars().take(200).collect(),
+                details_json: json!({
+                    "categories": scrub_report.categories,
+                    "event_id": event_id,
+                }),
+                action_taken: "redacted_and_alerted".into(),
+                timestamp_ms: received_ms,
+                quarantine: None,
+            },
+        )
+        .await;
+    }
 
     let live_ev = LiveStreamEvent {
         organization_id: auth.organization_id,
@@ -331,9 +389,10 @@ async fn process_single_event(
     Ok(Some(event_id))
 }
 
-fn process_logs_batch(
+async fn process_logs_batch(
     state: &AppState,
     auth: &ProjectAuthInfo,
+    client_ip: &str,
     mut logs: Vec<NormalizedLog>,
 ) -> Result<(), Response> {
     if logs.is_empty() {
@@ -341,14 +400,32 @@ fn process_logs_batch(
     }
     let scrubber = Scrubber::from_filters(&auth.filters);
     let mut live_items = Vec::with_capacity(logs.len());
+    let mut detected_threats = Vec::new();
+    let mut leaked_cats: Vec<&'static str> = Vec::new();
 
     for l in logs.iter_mut() {
-        scrubber.scrub_log_in_place(&mut l.body, &mut l.attributes);
+        let rep = scrubber.scrub_log_with_report(&mut l.body, &mut l.attributes);
+        if auth.filters.shield.enabled && auth.filters.shield.secret_leak_alerts {
+            for c in rep.categories {
+                if !leaked_cats.contains(&c) {
+                    leaked_cats.push(c);
+                }
+            }
+        }
         if l.environment.is_empty() {
             l.environment = "production".into();
         }
         if l.service.is_empty() {
             l.service = auth.project_slug.clone();
+        }
+        if let Some(threat) = state.shield_engine.inspect_log_for_threats(
+            auth.project_id,
+            &auth.filters.shield,
+            l.timestamp_ms,
+            |actor| shield_ip_hmac(&state.config.app_key, auth.project_id, actor),
+            l,
+        ) {
+            detected_threats.push(threat);
         }
         live_items.push(LiveStreamEvent {
             organization_id: auth.organization_id,
@@ -362,6 +439,68 @@ fn process_logs_batch(
             timestamp_ms: l.timestamp_ms,
             payload: l.attributes.clone(),
         });
+    }
+
+    let now = now_ms();
+    if !leaked_cats.is_empty()
+        && state
+            .shield_engine
+            .allow_cooldown(auth.project_id, "secret_leak:log", 60_000, now)
+    {
+        emit_shield_security_event(
+            state,
+            NewSecurityEvent {
+                organization_id: auth.organization_id,
+                project_id: auth.project_id,
+                project_slug: auth.project_slug.clone(),
+                signal_type: "secret_leak".into(),
+                category: "secret_leak".into(),
+                severity: "medium".into(),
+                risk_score: 60,
+                source_kind: "log_ids".into(),
+                actor_hmac: shield_ip_hmac(&state.config.app_key, auth.project_id, client_ip),
+                session_id: String::new(),
+                path: String::new(),
+                details_json: json!({ "categories": leaked_cats }),
+                action_taken: "redacted_and_alerted".into(),
+                timestamp_ms: now,
+                quarantine: None,
+            },
+        )
+        .await;
+    }
+
+    for threat in detected_threats {
+        let q = decide_quarantine(
+            &auth.filters.shield,
+            "log_ids",
+            threat.risk_score,
+            &threat.actor_hmac,
+            None,
+        )
+        .map(|(st, sh)| (st, sh, now / 1000 + auth.filters.shield.quarantine_ttl_sec as i64));
+        let action = if q.is_some() { "quarantined" } else { "alerted" };
+        emit_shield_security_event(
+            state,
+            NewSecurityEvent {
+                organization_id: auth.organization_id,
+                project_id: auth.project_id,
+                project_slug: auth.project_slug.clone(),
+                signal_type: threat.signal_type,
+                category: threat.category,
+                severity: threat.severity,
+                risk_score: threat.risk_score,
+                source_kind: "log_ids".into(),
+                actor_hmac: threat.actor_hmac,
+                session_id: String::new(),
+                path: strip_ansi_and_bidi(&threat.path).chars().take(200).collect(),
+                details_json: threat.details,
+                action_taken: action.into(),
+                timestamp_ms: now,
+                quarantine: q,
+            },
+        )
+        .await;
     }
 
     let auto_promote = auth
@@ -399,6 +538,7 @@ async fn handle_parsed_envelope(
     state: &AppState,
     auth: &ProjectAuthInfo,
     headers: &HeaderMap,
+    client_ip: &str,
     parsed: ParsedEnvelope,
 ) -> Result<Value, Response> {
     let mut primary_event_id = parsed
@@ -412,12 +552,12 @@ async fn handle_parsed_envelope(
     for item in parsed.items {
         match item {
             EnvelopeItem::Event(ev) => {
-                if let Some(eid) = process_single_event(state, auth, headers, ev).await? {
+                if let Some(eid) = process_single_event(state, auth, headers, client_ip, ev).await? {
                     primary_event_id = eid;
                 }
             }
             EnvelopeItem::Logs(logs) => {
-                process_logs_batch(state, auth, logs)?;
+                process_logs_batch(state, auth, client_ip, logs).await?;
             }
             EnvelopeItem::Transaction(mut tr) => {
                 tx_scrubber.scrub_log_in_place(&mut tr.name, &mut tr.spans);
@@ -464,11 +604,12 @@ async fn handle_envelope_bytes(
     state: &AppState,
     auth: &ProjectAuthInfo,
     headers: &HeaderMap,
+    client_ip: &str,
     decompressed: &[u8],
 ) -> Result<Value, Response> {
     let parsed = parse_envelope(decompressed)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, &e.0))?;
-    handle_parsed_envelope(state, auth, headers, parsed).await
+    handle_parsed_envelope(state, auth, headers, client_ip, parsed).await
 }
 
 pub async fn ingest_envelope(
@@ -494,7 +635,7 @@ pub async fn ingest_envelope(
         Ok(b) => b,
         Err(r) => return r,
     };
-    match handle_envelope_bytes(&state, &auth, &headers, &decompressed).await {
+    match handle_envelope_bytes(&state, &auth, &headers, &client_ip, &decompressed).await {
         Ok(resp) => {
             let mut r = (StatusCode::OK, Json(resp)).into_response();
             attach_ingest_cors(r.headers_mut());
@@ -564,7 +705,7 @@ pub async fn ingest_tunnel(
     if let Err(r) = check_ingest_rate_limit(&state, &auth, &client_ip, "error") {
         return r;
     }
-    match handle_parsed_envelope(&state, &auth, &headers, parsed).await {
+    match handle_parsed_envelope(&state, &auth, &headers, &client_ip, parsed).await {
         Ok(resp) => {
             let mut r = (StatusCode::OK, Json(resp)).into_response();
             attach_ingest_cors(r.headers_mut());
@@ -602,7 +743,7 @@ pub async fn ingest_store(
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid JSON event body"),
     };
-    match process_single_event(&state, &auth, &headers, ev).await {
+    match process_single_event(&state, &auth, &headers, &client_ip, ev).await {
         Ok(Some(eid)) => {
             let mut r = (StatusCode::OK, Json(json!({ "id": eid, "event_id": eid }))).into_response();
             attach_ingest_cors(r.headers_mut());
@@ -644,8 +785,39 @@ pub async fn ingest_security(
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid CSP JSON"),
     };
+    if auth.filters.shield.enabled {
+        if let Some(blocked) = inspect_csp_for_tamper(&raw) {
+            let now = now_ms();
+            if state
+                .shield_engine
+                .allow_cooldown(auth.project_id, &format!("csp:{blocked}"), 60_000, now)
+            {
+                emit_shield_security_event(
+                    &state,
+                    NewSecurityEvent {
+                        organization_id: auth.organization_id,
+                        project_id: auth.project_id,
+                        project_slug: auth.project_slug.clone(),
+                        signal_type: "csp_script_tamper".into(),
+                        category: "csp".into(),
+                        severity: "medium".into(),
+                        risk_score: 40,
+                        source_kind: "browser".into(),
+                        actor_hmac: shield_ip_hmac(&state.config.app_key, auth.project_id, &client_ip),
+                        session_id: String::new(),
+                        path: String::new(),
+                        details_json: json!({ "blocked_uri": strip_ansi_and_bidi(&blocked) }),
+                        action_taken: "logged".into(),
+                        timestamp_ms: now,
+                        quarantine: None,
+                    },
+                )
+                .await;
+            }
+        }
+    }
     let ev = normalize_csp_report(raw);
-    match process_single_event(&state, &auth, &headers, ev).await {
+    match process_single_event(&state, &auth, &headers, &client_ip, ev).await {
         Ok(_) => {
             let mut r = StatusCode::CREATED.into_response();
             attach_ingest_cors(r.headers_mut());
@@ -723,7 +895,7 @@ pub async fn ingest_otlp_logs(
         Ok(l) => l,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.0),
     };
-    match process_logs_batch(&state, &auth, logs) {
+    match process_logs_batch(&state, &auth, &client_ip, logs).await {
         Ok(()) => {
             let mut r = (StatusCode::OK, Json(json!({ "partialSuccess": {} }))).into_response();
             attach_ingest_cors(r.headers_mut());
@@ -820,7 +992,7 @@ pub async fn ingest_direct_logs(
                 .unwrap_or_else(|| json!({})),
         });
     }
-    match process_logs_batch(&state, &auth, normalized) {
+    match process_logs_batch(&state, &auth, &client_ip, normalized).await {
         Ok(()) => {
             let mut r = (StatusCode::ACCEPTED, Json(json!({ "accepted": true }))).into_response();
             attach_ingest_cors(r.headers_mut());
@@ -828,4 +1000,197 @@ pub async fn ingest_direct_logs(
         }
         Err(r) => r,
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ShieldIngestReq {
+    pub signals: Vec<String>,
+    pub session_id: Option<String>,
+    pub actor_ip: Option<String>,
+    pub path: Option<String>,
+    pub details: Option<Value>,
+}
+
+async fn authenticate_shield_request(
+    state: &AppState,
+    project_id: i64,
+    query: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<(ProjectAuthInfo, &'static str), Response> {
+    if let Some(auth_hdr) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(tok) = auth_hdr
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_hdr.strip_prefix("bearer "))
+            .map(str::trim)
+        {
+            if tok.starts_with("bf_") {
+                let sha = sha256_hex(tok.as_bytes());
+                let ctx = match state.storage.resolve_api_token(&sha, None).await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => return Err(error_response(StatusCode::UNAUTHORIZED, "Invalid API token")),
+                    Err(e) => return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)),
+                };
+                if !ctx.role.can_mutate_issues() {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Insufficient token role"));
+                }
+                let projs = state
+                    .storage
+                    .list_projects(&ctx)
+                    .await
+                    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+                let Some(proj) = projs.into_iter().find(|p| p.id == project_id) else {
+                    return Err(error_response(StatusCode::NOT_FOUND, "Project not found"));
+                };
+                return Ok((
+                    ProjectAuthInfo {
+                        project_id: proj.id,
+                        organization_id: proj.organization_id,
+                        organization_slug: ctx.organization_slug,
+                        project_slug: proj.slug,
+                        first_event_at: proj.first_event_at,
+                        rate_limit_per_min: 300,
+                        filters: proj.filters,
+                    },
+                    "backend_verified",
+                ));
+            }
+        }
+    }
+    let auth = authenticate_project(state, project_id, query, headers).await?;
+    Ok((auth, "browser"))
+}
+
+pub async fn ingest_shield(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i64>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+    body: Bytes,
+) -> Response {
+    let client_ip = ext
+        .get::<ClientIp>()
+        .map(|c| c.0.to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let (auth, source_kind) = match authenticate_shield_request(&state, project_id, &query, &headers).await {
+        Ok(res) => res,
+        Err(r) => return r,
+    };
+
+    if source_kind == "browser" && auth.filters.shield.enforce_origin_check && !auth.filters.allowed_domains.is_empty() {
+        let origin_hdr = headers
+            .get(header::ORIGIN)
+            .or_else(|| headers.get(header::REFERER))
+            .and_then(|v| v.to_str().ok());
+        match origin_hdr {
+            Some(orig) if is_origin_allowed(orig, &auth.filters.allowed_domains) => {}
+            _ => return error_response(StatusCode::FORBIDDEN, "Disallowed origin for Shield telemetry"),
+        }
+    }
+
+    let rate_dec = state.rate_limiter.check_and_record(
+        "shield_project_ip",
+        &format!("{project_id}:{client_ip}"),
+        120,
+        Duration::from_secs(60),
+    );
+    if !rate_dec.allowed {
+        return rate_limited_response(rate_dec.retry_after_sec, "security");
+    }
+
+    if !auth.filters.shield.enabled {
+        let mut r = (StatusCode::ACCEPTED, Json(json!({ "ok": true, "skipped": true }))).into_response();
+        attach_ingest_cors(r.headers_mut());
+        return r;
+    }
+
+    let req: ShieldIngestReq = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid Shield JSON payload"),
+    };
+    if req.signals.is_empty() || req.signals.len() > 32 {
+        return error_response(StatusCode::BAD_REQUEST, "Provide between 1 and 32 security signals");
+    }
+    let Some(scored) = score_signals(&req.signals) else {
+        return error_response(StatusCode::BAD_REQUEST, "No recognized security signals provided");
+    };
+
+    let actor_raw = if source_kind == "backend_verified" {
+        req.actor_ip.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&client_ip)
+    } else {
+        &client_ip
+    };
+    let actor_hmac = shield_ip_hmac(&state.config.app_key, auth.project_id, actor_raw);
+    let now = now_ms();
+    let quarantine = decide_quarantine(
+        &auth.filters.shield,
+        source_kind,
+        scored.risk_score,
+        &actor_hmac,
+        req.session_id.as_deref(),
+    )
+    .map(|(st, sh)| (st, sh, now / 1000 + auth.filters.shield.quarantine_ttl_sec as i64));
+
+    let action = if quarantine.is_some() {
+        "quarantined"
+    } else if scored.risk_score >= auth.filters.shield.quarantine_threshold && auth.filters.shield.mode != "detect" {
+        "defended"
+    } else {
+        "logged"
+    };
+
+    let scrubber = Scrubber::from_filters(&auth.filters);
+    let mut details_val = req.details.unwrap_or_else(|| json!({}));
+    let _ = scrubber.scrub_log_with_report(&mut String::new(), &mut details_val);
+    let clean_path: String = req
+        .path
+        .as_deref()
+        .map(strip_ansi_and_bidi)
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+    let clean_sid: String = req
+        .session_id
+        .as_deref()
+        .map(strip_ansi_and_bidi)
+        .unwrap_or_default()
+        .chars()
+        .take(64)
+        .collect();
+
+    emit_shield_security_event(
+        &state,
+        NewSecurityEvent {
+            organization_id: auth.organization_id,
+            project_id: auth.project_id,
+            project_slug: auth.project_slug.clone(),
+            signal_type: scored.primary_signal,
+            category: scored.category,
+            severity: scored.severity.clone(),
+            risk_score: scored.risk_score,
+            source_kind: source_kind.to_string(),
+            actor_hmac,
+            session_id: clean_sid,
+            path: clean_path,
+            details_json: details_val,
+            action_taken: action.to_string(),
+            timestamp_ms: now,
+            quarantine,
+        },
+    )
+    .await;
+
+    let mut r = (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "risk_score": scored.risk_score,
+            "severity": scored.severity,
+            "action": action,
+        })),
+    )
+        .into_response();
+    attach_ingest_cors(r.headers_mut());
+    r
 }

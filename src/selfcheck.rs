@@ -748,8 +748,27 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
         }
     }
 
-    // 10. Security posture
+    // 10. Security posture + Runtime Anti-REA integrity
     checks.push(check_security_posture_item(&state.config));
+    let rt_integrity = crate::security::anti_rea::probe_self_runtime_integrity();
+    checks.push(SelfCheckItem {
+        id: "runtime_anti_rea_integrity".into(),
+        status: if rt_integrity.ok {
+            CheckStatus::Ok
+        } else if rt_integrity.indicators.iter().any(|i| i.starts_with("mapped:frida")) && !state.config.is_dev {
+            CheckStatus::Error
+        } else {
+            CheckStatus::Warn
+        },
+        category: "security".into(),
+        title: "Self Runtime Anti-REA Integrity (TracerPid / Frida / LD_PRELOAD)".into(),
+        detail: rt_integrity.detail,
+        fix: if rt_integrity.ok {
+            None
+        } else {
+            Some("Inspect attached debugger/preload libraries and enable BUGFINDER_ANTI_PTRACE=1 in production.".into())
+        },
+    });
 
     // 11. Internal self errors
     let (self_errors, unacknowledged_error_count) = state.self_monitor.snapshot();
