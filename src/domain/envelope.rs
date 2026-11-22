@@ -595,9 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_rolelane_x_sentry_auth_header_and_dsn() {
+    fn parses_custom_x_sentry_auth_header_and_dsn() {
         let mut q = HashMap::new();
-        let hdr = "Sentry sentry_version=7, sentry_client=rolelane-observability/1.0, sentry_key=abc123def456"; // gitleaks:allow
+        let hdr = "Sentry sentry_version=7, sentry_client=acme-observability/1.0, sentry_key=abc123def456"; // gitleaks:allow
         assert_eq!(
             extract_dsn_key(&q, None, Some(hdr)).as_deref(),
             Some("abc123def456")

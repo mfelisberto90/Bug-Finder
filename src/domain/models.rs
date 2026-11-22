@@ -879,9 +879,9 @@ mod tests {
         assert_eq!(base32_encode(0), "0");
         assert_eq!(base32_encode(10), "A");
         assert_eq!(base32_encode(42), "1A");
-        let s = format_short_id("rolelane-api", 42);
-        assert_eq!(s, "ROLELANE-API-1A");
-        assert_eq!(parse_short_id(&s), Some(("rolelane-api".to_string(), 42)));
+        let s = format_short_id("acme-api", 42);
+        assert_eq!(s, "ACME-API-1A");
+        assert_eq!(parse_short_id(&s), Some(("acme-api".to_string(), 42)));
     }
 
     #[test]

@@ -511,14 +511,14 @@ mod tests {
         ));
 
         let filters = ProjectFilters {
-            allowed_domains: vec!["*.rolelane.co.uk".into()],
+            allowed_domains: vec!["*.acme.example".into()],
             ..Default::default()
         };
         let ext_ev = json!({
             "exception": {"values": [{"stacktrace": {"frames": [{"filename": "chrome-extension://abc/content.js"}]}}]}
         });
         assert_eq!(
-            evaluate_inbound_filters(&ext_ev, Some("https://app.rolelane.co.uk"), None, &filters),
+            evaluate_inbound_filters(&ext_ev, Some("https://app.acme.example"), None, &filters),
             FilterDecision::Drop("browser_extension")
         );
         let ok_ev = json!({"message": "ok"});
@@ -527,11 +527,11 @@ mod tests {
             FilterDecision::Drop("disallowed_domain")
         );
         assert_eq!(
-            evaluate_inbound_filters(&ok_ev, Some("https://app.rolelane.co.uk"), Some("Googlebot/2.1"), &filters),
+            evaluate_inbound_filters(&ok_ev, Some("https://app.acme.example"), Some("Googlebot/2.1"), &filters),
             FilterDecision::Drop("crawler")
         );
         assert_eq!(
-            evaluate_inbound_filters(&ok_ev, Some("https://app.rolelane.co.uk"), Some("Mozilla/5.0"), &filters),
+            evaluate_inbound_filters(&ok_ev, Some("https://app.acme.example"), Some("Mozilla/5.0"), &filters),
             FilterDecision::Accept
         );
     }

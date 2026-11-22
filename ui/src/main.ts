@@ -243,6 +243,10 @@ window.addEventListener("storage", (e) => {
   }
 });
 
+function publicOrigin(): string {
+  return (state.sdkMeta?.public_url || location.origin).replace(/\/+$/, "");
+}
+
 function esc(val: unknown): string {
   return String(val ?? "")
     .replace(/&/g, "&amp;")
@@ -381,7 +385,7 @@ function syncSelfCheckSlots(): void {
     const authSlot = document.getElementById("auth-selfcheck-slot");
     if (authSlot) {
       authSlot.innerHTML = state.localSelfErrors.length
-        ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
+        ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Internal app error:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
         : "";
     }
     return;
@@ -501,7 +505,7 @@ async function boot(): Promise<void> {
       state.inviteError = null;
     } else {
       state.inviteInfo = null;
-      state.inviteError = invRes.error || "Convite inválido ou expirado";
+      state.inviteError = invRes.error || "Invalid or expired invitation";
     }
     state.loading = false;
     render();
@@ -776,7 +780,7 @@ function toggleLiveTail(): void {
 
 function renderAuthScreen(): string {
   const errBanner = state.localSelfErrors.length
-    ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
+    ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Internal app error:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
     : "";
 
   if (state.inviteToken) {
@@ -784,9 +788,9 @@ function renderAuthScreen(): string {
       return `
       <main class="auth-wrap">
         <section class="card auth-card stack-col">
-          <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Convite de Organização</div></div>
-          <p class="badge badge-error">${esc(state.inviteError || "Convite inválido ou expirado")}</p>
-          <button type="button" id="btn-invite-home">Voltar ao Login</button>
+          <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Organization Invitation</div></div>
+          <p class="badge badge-error">${esc(state.inviteError || "Invalid or expired invitation")}</p>
+          <button type="button" id="btn-invite-home">Back to Sign In</button>
         </section>
       </main>
       <div id="auth-selfcheck-slot">${errBanner}</div>`;
@@ -794,21 +798,21 @@ function renderAuthScreen(): string {
     return `
       <main class="auth-wrap">
         <section class="card auth-card stack-col">
-          <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Aceitar Convite</div></div>
-          <p>Você foi convidado para <strong>${esc(state.inviteInfo.organization_name)}</strong> (${esc(state.inviteInfo.role)}) com o e-mail <span class="mono">${esc(state.inviteInfo.email)}</span>.</p>
+          <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Accept Invitation</div></div>
+          <p>You were invited to join <strong>${esc(state.inviteInfo.organization_name)}</strong> (${esc(state.inviteInfo.role)}) with email <span class="mono">${esc(state.inviteInfo.email)}</span>.</p>
           <form id="invite-accept-form" class="stack-col">
             <div class="hp-field" aria-hidden="true">
               <label for="inv-website">Website</label>
               <input id="inv-website" name="website" tabindex="-1" autocomplete="off">
             </div>
-            <label for="inv-name">Seu Nome Completo
+            <label for="inv-name">Full Name
               <input id="inv-name" name="name" type="text" required autocomplete="name" enterkeyhint="next" autofocus>
             </label>
-            <label for="inv-password">Nova Senha (mín. 10 caracteres)
+            <label for="inv-password">New Password (min 10 chars)
               <input id="inv-password" name="password" type="password" required minlength="10" autocomplete="new-password" enterkeyhint="done">
             </label>
             <div class="cta-dock">
-              <button type="submit" data-primary-cta="true">Aceitar Convite e Entrar</button>
+              <button type="submit" data-primary-cta="true">Accept Invitation &amp; Sign In</button>
             </div>
           </form>
         </section>
@@ -865,37 +869,37 @@ function renderAuthScreen(): string {
       <main class="auth-wrap">
         <section class="card auth-card stack-col">
           <div class="brand-row">
-            <div class="brand-title"><span class="brand-mark">BF</span> Verificação em 2 Etapas (2FA)</div>
+            <div class="brand-title"><span class="brand-mark">BF</span> Two-Factor Verification (2FA)</div>
           </div>
-          <p>Confirme sua identidade usando seu autenticador TOTP, código de recuperação ou Passkey.</p>
+          <p>Confirm your identity using your TOTP authenticator, a recovery code, or a Passkey.</p>
           ${
             hasTotp
               ? `<div class="subtabs" role="tablist">
-                  <button type="button" class="subtab-btn" role="tab" aria-selected="${!isRecovery ? "true" : "false"}" id="btn-mfa-tab-totp">Código 2FA (6 dígitos)</button>
-                  <button type="button" class="subtab-btn" role="tab" aria-selected="${isRecovery ? "true" : "false"}" id="btn-mfa-tab-rec">Código de Recuperação</button>
+                  <button type="button" class="subtab-btn" role="tab" aria-selected="${!isRecovery ? "true" : "false"}" id="btn-mfa-tab-totp">2FA Code (6 digits)</button>
+                  <button type="button" class="subtab-btn" role="tab" aria-selected="${isRecovery ? "true" : "false"}" id="btn-mfa-tab-rec">Recovery Code</button>
                 </div>`
               : ""
           }
           <form id="mfa-verify-form" class="stack-col">
             ${
               !isRecovery
-                ? `<label for="mfa-code-input">Código TOTP (6 dígitos)
+                ? `<label for="mfa-code-input">TOTP Code (6 digits)
                     <input id="mfa-code-input" name="code" type="text" inputmode="numeric" pattern="[0-9]{6}" required autocomplete="one-time-code" placeholder="123456" autofocus>
                   </label>`
-                : `<label for="mfa-rec-input">Código de Recuperação
+                : `<label for="mfa-rec-input">Recovery Code
                     <input id="mfa-rec-input" name="recovery_code" type="text" pattern="[A-Za-z0-9\\-]{10,12}" required autocomplete="off" placeholder="XXXXX-XXXXX" autofocus>
                   </label>`
             }
             <div class="cta-dock">
-              <button type="submit" data-primary-cta="true">Verificar e Entrar</button>
+              <button type="submit" data-primary-cta="true">Verify &amp; Sign In</button>
             </div>
           </form>
           ${
             hasPasskey
-              ? `<button type="button" id="btn-mfa-passkey">Validar com Passkey (FIDO2)</button>`
+              ? `<button type="button" id="btn-mfa-passkey">Verify with Passkey (FIDO2)</button>`
               : ""
           }
-          <button type="button" id="btn-mfa-cancel">Voltar ao Login</button>
+          <button type="button" id="btn-mfa-cancel">Back to Sign In</button>
         </section>
       </main>
       <div id="auth-selfcheck-slot">${errBanner}</div>`;
@@ -923,8 +927,8 @@ function renderAuthScreen(): string {
             <button type="submit" data-primary-cta="true">Sign In</button>
           </div>
         </form>
-        <div class="divider-row">ou</div>
-        <button type="button" id="btn-passkey-login">Entrar com Passkey</button>
+        <div class="divider-row">or</div>
+        <button type="button" id="btn-passkey-login">Sign in with Passkey</button>
         ${
           state.oidcEnabled
             ? `<a class="nav-link" href="/api/auth/oidc/login">Sign in with ${esc(state.oidcName || "SSO")}</a>`
@@ -965,8 +969,8 @@ function renderIssuesTab(): string {
         .join("")
     : `<tr><td colspan="6"><div class="row-gap"><span>No issues matching filter.</span>${
         state.projects.length
-          ? `<button type="button" id="btn-empty-connect-app">Conectar App em 1 Clique</button>`
-          : `<button type="button" id="btn-empty-go-projects">Criar Projeto primeiro</button>`
+          ? `<button type="button" id="btn-empty-connect-app">1-Click Connect App</button>`
+          : `<button type="button" id="btn-empty-go-projects">Create Project First</button>`
       }</div></td></tr>`;
 
   return `
@@ -1013,7 +1017,7 @@ function renderIssuesTab(): string {
       <span class="mono">Showing ${state.issues.length} of ${totalLabel} issues</span>
       ${
         state.issues.length < state.issueTotalHits
-          ? `<button type="button" id="btn-load-more-issues">Carregar Mais</button>`
+          ? `<button type="button" id="btn-load-more-issues">Load More</button>`
           : ""
       }
     </div>`;
@@ -1058,7 +1062,7 @@ function renderLogsTab(): string {
 
     <div id="logs-pager-row" class="pager-row ${showMore ? "" : "is-hidden"}">
       <span class="mono">Loaded ${state.logs.length} logs</span>
-      <button type="button" id="btn-load-more-logs">Carregar Mais</button>
+      <button type="button" id="btn-load-more-logs">Load More</button>
     </div>`;
 }
 
@@ -1219,7 +1223,7 @@ function renderUptimeTab(): string {
 }
 
 function renderProjectsTab(): string {
-  const origin = location.origin;
+  const origin = publicOrigin();
   const firstProj = state.projects[0];
   const sampleDsn = firstProj?.dsn_public_key
     ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
@@ -1239,7 +1243,7 @@ function renderProjectsTab(): string {
           </div>
           <div class="mono">DSN: ${esc(dsn)}</div>
           <div class="row-gap">
-            <button type="button" data-connect-app="${p.id}">Conectar App</button>
+            <button type="button" data-connect-app="${p.id}">Connect App</button>
             <button type="button" data-copy-text="${esc(dsn)}">Copy DSN</button>
             <button type="button" data-open-proj-settings="${p.id}">Filters &amp; Scrubbing</button>
             <button type="button" data-open-proj-keys="${p.id}">DSN Keys</button>
@@ -1261,7 +1265,7 @@ function renderProjectsTab(): string {
         <td data-label="Prefix" class="mono">${esc(t.token_prefix)}...</td>
         <td data-label="Role">${esc(t.role)}</td>
         <td data-label="Scopes" class="mono">${esc(t.scopes || "(default)")}</td>
-        <td data-label="Expires" class="tabular">${esc(t.expires_at ? t.expires_at.slice(0, 10) : "Nunca")}</td>
+        <td data-label="Expires" class="tabular">${esc(t.expires_at ? t.expires_at.slice(0, 10) : "Never")}</td>
         <td data-label="Revoke"><button type="button" class="btn-danger" data-del-token="${t.id}">Revoke</button></td>
       </tr>`
     )
@@ -1302,10 +1306,10 @@ function renderProjectsTab(): string {
         <th scope="row" class="mono">${esc(inv.email)}</th>
         <td data-label="Role">${esc(inv.role)}</td>
         <td data-label="Status">
-          <span class="badge badge-${inv.accepted_at ? "ok" : "info"}">${inv.accepted_at ? "Aceito" : "Pendente"}</span>
+          <span class="badge badge-${inv.accepted_at ? "ok" : "info"}">${inv.accepted_at ? "Accepted" : "Pending"}</span>
         </td>
-        <td data-label="Expira" class="tabular">${esc(inv.expires_at.slice(0, 16).replace("T", " "))}</td>
-        <td data-label="Ação"><button type="button" class="btn-danger" data-del-invite="${inv.id}">Revogar</button></td>
+        <td data-label="Expires" class="tabular">${esc(inv.expires_at.slice(0, 16).replace("T", " "))}</td>
+        <td data-label="Action"><button type="button" class="btn-danger" data-del-invite="${inv.id}">Revoke</button></td>
       </tr>`
     )
     .join("");
@@ -1323,12 +1327,12 @@ function renderProjectsTab(): string {
     <section class="card stack-col">
       <div class="row-gap">
         <h2>Team Members</h2>
-        <button type="button" id="btn-create-invite-link">Gerar Link de Convite (72h)</button>
+        <button type="button" id="btn-create-invite-link">Generate Invite Link (72h)</button>
         <button type="button" id="btn-add-member">Add Member</button>
       </div>
       ${
         state.lastInviteUrl
-          ? `<div class="secret-banner secret-banner-info">Link de convite (72h): <span class="mono">${esc(state.lastInviteUrl)}</span> <button type="button" data-copy-text="${esc(state.lastInviteUrl)}">Copiar Link</button></div>`
+          ? `<div class="secret-banner secret-banner-info">Invite link (72h): <span class="mono">${esc(state.lastInviteUrl)}</span> <button type="button" data-copy-text="${esc(state.lastInviteUrl)}">Copy Link</button></div>`
           : ""
       }
       <div tabindex="0" role="region" aria-labelledby="mem-cap" class="table-wrapper">
@@ -1338,18 +1342,18 @@ function renderProjectsTab(): string {
           <tbody>${memberRows || '<tr><td colspan="4">No team members found.</td></tr>'}</tbody>
         </table>
       </div>
-      <h3>Convites Expiráveis Pendentes / Históricos</h3>
+      <h3>Expiring Pending / Historical Invitations</h3>
       <div tabindex="0" role="region" aria-labelledby="inv-cap" class="table-wrapper">
         <table class="data-table">
           <caption id="inv-cap" class="hp-field">Organization Invitations</caption>
-          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Expira</th><th>Ação</th></tr></thead>
-          <tbody>${inviteRows || '<tr><td colspan="5">Nenhum link de convite gerado ainda.</td></tr>'}</tbody>
+          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Expires</th><th>Action</th></tr></thead>
+          <tbody>${inviteRows || '<tr><td colspan="5">No invite links generated yet.</td></tr>'}</tbody>
         </table>
       </div>
     </section>
 
     <section class="card">
-      <h2>Drop-in SDK Quickstart (1-Tag Browser + Zero-Dep CLI + RoleLane)</h2>
+      <h2>Drop-in SDK Quickstart (1-Tag Browser + Zero-Dep CLI + GlitchTip)</h2>
       <p>1. Browser 1-Tag Auto-Init (&lt; 4 KB, CSP + SRI Ready, zero inline JS):</p>
       <pre class="snippet-box">&lt;script src="${esc(origin)}/sdk/bugfinder-mini.js" data-dsn="${esc(sampleDsn)}"${
         state.sdkMeta?.mini_sdk_sri ? ` integrity="${esc(state.sdkMeta.mini_sdk_sri)}"` : ""
@@ -1357,7 +1361,7 @@ function renderProjectsTab(): string {
       <p>2. Terminal Zero-Dep CLI (Auto-Config + Process Wrapper):</p>
       <pre class="snippet-box">bugfinder init --dsn "${esc(sampleDsn)}"
 bugfinder wrap --dsn "${esc(sampleDsn)}" -- node server.js</pre>
-      <p>3. Official Sentry SDKs (@sentry/browser / @sentry/node / sentry-sdk) &amp; RoleLane .env:</p>
+      <p>3. Official Sentry SDKs (@sentry/browser / @sentry/node / sentry-sdk) &amp; GlitchTip .env:</p>
       <pre class="snippet-box">GLITCHTIP_ENABLED=true
 GLITCHTIP_DSN=${esc(sampleDsn)}
 GLITCHTIP_API_URL=${esc(origin)}
@@ -1370,12 +1374,12 @@ bugfinder mcp --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;</pre>
 
     <section class="card stack-col">
       <div class="row-gap">
-        <h2>API Tokens (RoleLane ReadClient / CLI / MCP)</h2>
+        <h2>API Tokens (CLI / MCP / ReadClient)</h2>
         <button type="button" id="btn-create-token">Generate Scoped API Token</button>
       </div>
       ${
         state.lastCreatedToken
-          ? `<div class="secret-banner secret-banner-ok">Copy token now (shown once): <span class="mono">${esc(state.lastCreatedToken)}</span> <button type="button" data-copy-text="${esc(state.lastCreatedToken)}">Copiar Token</button></div>`
+          ? `<div class="secret-banner secret-banner-ok">Copy token now (shown once): <span class="mono">${esc(state.lastCreatedToken)}</span> <button type="button" data-copy-text="${esc(state.lastCreatedToken)}">Copy Token</button></div>`
           : ""
       }
       <div tabindex="0" role="region" aria-labelledby="tok-cap" class="table-wrapper">
@@ -1430,9 +1434,9 @@ function getEffectiveSelfStatus(): {
 function renderShieldSubTabsHtml(): string {
   return `
     <div class="subtabs" role="tablist" aria-label="Security Shield Sub-Tabs">
-      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "anti-rea" ? "true" : "false"}" data-shield-subtab="anti-rea">Escudo Anti-REA</button>
-      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "mfa" ? "true" : "false"}" data-shield-subtab="mfa">Conta &amp; MFA</button>
-      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "audit" ? "true" : "false"}" data-shield-subtab="audit">Auditoria &amp; Org</button>
+      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "anti-rea" ? "true" : "false"}" data-shield-subtab="anti-rea">Anti-REA Shield</button>
+      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "mfa" ? "true" : "false"}" data-shield-subtab="mfa">Account &amp; MFA</button>
+      <button type="button" class="subtab-btn" role="tab" aria-selected="${state.shieldSubTab === "audit" ? "true" : "false"}" data-shield-subtab="audit">Audit &amp; Org</button>
     </div>`;
 }
 
@@ -1449,13 +1453,13 @@ function renderShieldMfaSubTab(): string {
           (pk) => `
           <tr>
             <th scope="row">${esc(pk.name)}</th>
-            <td data-label="Algoritmo" class="mono">${pk.cose_alg === -7 ? "ES256" : pk.cose_alg === -8 ? "Ed25519" : esc(pk.cose_alg)}</td>
+            <td data-label="Algorithm" class="mono">${pk.cose_alg === -7 ? "ES256" : pk.cose_alg === -8 ? "Ed25519" : esc(pk.cose_alg)}</td>
             <td data-label="Counter" class="tabular">${pk.sign_count}</td>
-            <td data-label="Ação"><button type="button" class="btn-danger" data-del-passkey="${pk.id}">Remover</button></td>
+            <td data-label="Action"><button type="button" class="btn-danger" data-del-passkey="${pk.id}">Remove</button></td>
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="4">Nenhuma Passkey WebAuthn cadastrada ainda.</td></tr>`;
+    : `<tr><td colspan="4">No WebAuthn Passkeys registered yet.</td></tr>`;
 
   const sessionRows = state.sessions.length
     ? state.sessions
@@ -1466,35 +1470,35 @@ function renderShieldMfaSubTab(): string {
               <div>${esc(s.user_agent)}</div>
               <div class="mono">IP HMAC: ${esc(s.ip_hmac_short)}</div>
             </th>
-            <td data-label="Último acesso" class="tabular">${esc(s.last_seen_at.slice(0, 19).replace("T", " "))}</td>
-            <td data-label="Status">${s.is_current ? '<span class="badge badge-ok">Atual</span>' : '<span class="badge badge-muted">Ativa</span>'}</td>
-            <td data-label="Ação"><button type="button" class="btn-danger" data-revoke-session="${s.id}" ${s.is_current ? "disabled" : ""}>Revogar</button></td>
+            <td data-label="Last Seen" class="tabular">${esc(s.last_seen_at.slice(0, 19).replace("T", " "))}</td>
+            <td data-label="Status">${s.is_current ? '<span class="badge badge-ok">Current</span>' : '<span class="badge badge-muted">Active</span>'}</td>
+            <td data-label="Action"><button type="button" class="btn-danger" data-revoke-session="${s.id}" ${s.is_current ? "disabled" : ""}>Revoke</button></td>
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="4">Nenhuma sessão encontrada.</td></tr>`;
+    : `<tr><td colspan="4">No active sessions found.</td></tr>`;
 
   return `
     <div class="page-header">
-      <h1 class="page-title">Conta, Autenticação 2FA (TOTP) &amp; Passkeys</h1>
+      <h1 class="page-title">Account, 2FA Authentication (TOTP) &amp; Passkeys</h1>
       <div class="cta-dock">
-        <button type="button" id="btn-refresh-shield" data-primary-cta="true">Atualizar Segurança</button>
+        <button type="button" id="btn-refresh-shield" data-primary-cta="true">Refresh Security</button>
       </div>
     </div>
     ${renderShieldSubTabsHtml()}
     <div class="stack-col">
       <section class="card stack-col">
         <div class="row-gap">
-          <h2>Autenticação em 2 Etapas (TOTP RFC 6238)</h2>
-          <span class="badge badge-${totpOn ? "ok" : "warn"}">${totpOn ? "Ativo" : "Inativo"}</span>
-          ${totpOn ? `<span class="badge badge-info">Códigos restantes: ${mfa?.recovery_codes_remaining ?? 0}</span>` : ""}
+          <h2>Two-Factor Authentication (TOTP RFC 6238)</h2>
+          <span class="badge badge-${totpOn ? "ok" : "warn"}">${totpOn ? "Enabled" : "Disabled"}</span>
+          ${totpOn ? `<span class="badge badge-info">Recovery codes left: ${mfa?.recovery_codes_remaining ?? 0}</span>` : ""}
         </div>
         ${
           !totpOn
-            ? `<div class="row-gap"><button type="button" id="btn-totp-enroll">Configurar 2FA (TOTP)</button></div>`
+            ? `<div class="row-gap"><button type="button" id="btn-totp-enroll">Configure 2FA (TOTP)</button></div>`
             : `<div class="row-gap">
-                <button type="button" id="btn-regen-recovery">Regenerar Códigos de Recuperação</button>
-                <button type="button" class="btn-danger" id="btn-totp-disable">Desativar 2FA</button>
+                <button type="button" id="btn-regen-recovery">Regenerate Recovery Codes</button>
+                <button type="button" class="btn-danger" id="btn-totp-disable">Disable 2FA</button>
               </div>`
         }
         ${
@@ -1502,14 +1506,14 @@ function renderShieldMfaSubTab(): string {
             ? `<div class="qr-box">
                 ${qrPreview}
                 <div class="stack-col">
-                  <div><strong>Escaneie no app autenticador</strong> ou copie a chave secreta Base32:</div>
+                  <div><strong>Scan in your authenticator app</strong> or copy the Base32 secret key:</div>
                   <div class="mono">${esc(enroll.secret_b32)}</div>
-                  <button type="button" data-copy-text="${esc(enroll.secret_b32)}">Copiar Chave Base32</button>
+                  <button type="button" data-copy-text="${esc(enroll.secret_b32)}">Copy Base32 Secret</button>
                   <form id="totp-confirm-form" class="row-gap">
-                    <label for="totp-confirm-code">Código de 6 dígitos
+                    <label for="totp-confirm-code">6-Digit Code
                       <input id="totp-confirm-code" name="code" type="text" inputmode="numeric" pattern="[0-9]{6}" required autocomplete="one-time-code" placeholder="123456">
                     </label>
-                    <button type="submit">Ativar 2FA</button>
+                    <button type="submit">Enable 2FA</button>
                   </form>
                 </div>
               </div>`
@@ -1518,9 +1522,9 @@ function renderShieldMfaSubTab(): string {
         ${
           recCodes
             ? `<div class="stack-col">
-                <div class="badge badge-ok">Guarde estes 10 códigos de recuperação (exibidos uma única vez):</div>
+                <div class="badge badge-ok">Save these 10 recovery codes (shown only once):</div>
                 <div class="code-grid">${recCodes.map((c) => `<div class="code-pill">${esc(c)}</div>`).join("")}</div>
-                <button type="button" data-copy-text="${esc(recCodes.join("\n"))}">Copiar Códigos</button>
+                <button type="button" data-copy-text="${esc(recCodes.join("\n"))}">Copy Codes</button>
               </div>`
             : ""
         }
@@ -1529,43 +1533,43 @@ function renderShieldMfaSubTab(): string {
       <section class="card stack-col">
         <h2>Passkeys (WebAuthn FIDO2)</h2>
         <form id="passkey-reg-form" class="row-gap">
-          <label for="passkey-name-input">Nome do Dispositivo
+          <label for="passkey-name-input">Device Name
             <input id="passkey-name-input" name="name" type="text" required autocomplete="off" placeholder="MacBook / YubiKey / Chrome">
           </label>
-          <button type="submit">Registrar Passkey</button>
+          <button type="submit">Register Passkey</button>
         </form>
         <div tabindex="0" role="region" aria-labelledby="pk-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="pk-cap" class="hp-field">Registered Passkeys</caption>
-            <thead><tr><th>Nome</th><th>Algoritmo</th><th>Sign Count</th><th>Ação</th></tr></thead>
+            <thead><tr><th>Name</th><th>Algorithm</th><th>Sign Count</th><th>Action</th></tr></thead>
             <tbody>${passkeyRows}</tbody>
           </table>
         </div>
       </section>
 
       <section class="card stack-col">
-        <h2>Trocar Senha</h2>
+        <h2>Change Password</h2>
         <form id="pw-change-form" class="stack-col">
           <input class="hp-field" type="text" tabindex="-1" aria-hidden="true" autocomplete="username" value="${esc(state.user?.email || "")}" readonly>
-          <label for="pw-cur">Senha Atual
+          <label for="pw-cur">Current Password
             <input id="pw-cur" name="current_password" type="password" required autocomplete="current-password">
           </label>
-          <label for="pw-new">Nova Senha (mín. 10 caracteres; revoga outras sessões)
+          <label for="pw-new">New Password (min 10 chars; revokes other sessions)
             <input id="pw-new" name="new_password" type="password" required minlength="10" autocomplete="new-password">
           </label>
-          <div><button type="submit">Atualizar Senha</button></div>
+          <div><button type="submit">Update Password</button></div>
         </form>
       </section>
 
       <section class="card stack-col">
         <div class="row-gap">
-          <h2>Sessões Ativas</h2>
-          <button type="button" class="btn-danger" id="btn-revoke-other-sessions">Encerrar Outras Sessões</button>
+          <h2>Active Sessions</h2>
+          <button type="button" class="btn-danger" id="btn-revoke-other-sessions">Revoke Other Sessions</button>
         </div>
         <div tabindex="0" role="region" aria-labelledby="sess-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="sess-cap" class="hp-field">Active Sessions</caption>
-            <thead><tr><th>Agente / IP HMAC</th><th>Último Acesso</th><th>Status</th><th>Ação</th></tr></thead>
+            <thead><tr><th>User Agent / IP HMAC</th><th>Last Seen</th><th>Status</th><th>Action</th></tr></thead>
             <tbody>${sessionRows}</tbody>
           </table>
         </div>
@@ -1582,49 +1586,49 @@ function renderShieldAuditSubTab(): string {
           (a) => `
           <tr>
             <th scope="row" class="tabular">${esc(a.created_at.slice(0, 19).replace("T", " "))}</th>
-            <td data-label="Ator">${esc(a.actor_email)}</td>
-            <td data-label="Ação"><span class="badge badge-muted">${esc(a.action)}</span></td>
-            <td data-label="Alvo" class="mono">${esc(a.target_type)}:${esc(a.target_id)}</td>
-            <td data-label="Hash SHA-256" class="mono">${esc(a.entry_hash.slice(0, 14))}...</td>
+            <td data-label="Actor">${esc(a.actor_email)}</td>
+            <td data-label="Action"><span class="badge badge-muted">${esc(a.action)}</span></td>
+            <td data-label="Target" class="mono">${esc(a.target_type)}:${esc(a.target_id)}</td>
+            <td data-label="SHA-256 Hash" class="mono">${esc(a.entry_hash.slice(0, 14))}...</td>
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="5">Nenhum registro na trilha de auditoria ainda.</td></tr>`;
+    : `<tr><td colspan="5">No entries in audit chain yet.</td></tr>`;
 
   return `
     <div class="page-header">
-      <h1 class="page-title">Auditoria Imutável &amp; Políticas da Organização</h1>
+      <h1 class="page-title">Immutable Audit Log &amp; Organization Policies</h1>
       <div class="cta-dock">
-        <button type="button" id="btn-refresh-shield" data-primary-cta="true">Atualizar Auditoria</button>
+        <button type="button" id="btn-refresh-shield" data-primary-cta="true">Refresh Audit</button>
       </div>
     </div>
     ${renderShieldSubTabsHtml()}
     <div class="stack-col">
       <section class="card stack-col">
-        <h2>Políticas de Segurança da Organização</h2>
+        <h2>Organization Security Policies</h2>
         <form id="org-sec-form" class="stack-col">
           <label class="check-row" for="org-sec-ip">
             <input id="org-sec-ip" type="checkbox" name="scrub_ip_addresses" ${s.scrub_ip_addresses ? "checked" : ""}>
-            <span>Anonimizar endereços IP globalmente (sobrescreve todos os projetos da org)</span>
+            <span>Scrub IP addresses globally (overrides all org projects)</span>
           </label>
           <label class="check-row" for="org-sec-mfa">
             <input id="org-sec-mfa" type="checkbox" name="require_mfa_for_admins" ${s.require_mfa_for_admins ? "checked" : ""}>
-            <span>Exigir MFA (TOTP ou Passkey) para Owners/Admins</span>
+            <span>Require MFA (TOTP or Passkey) for Owners/Admins</span>
           </label>
-          <label for="org-sec-throttle">Throttle Global de Eventos (0% a 100% descartados)
+          <label for="org-sec-throttle">Global Event Throttle (0% to 100% dropped)
             <input id="org-sec-throttle" name="event_throttle_rate" type="number" min="0" max="100" value="${s.event_throttle_rate ?? 0}">
           </label>
-          <div><button type="submit">Salvar Políticas da Organização</button></div>
+          <div><button type="submit">Save Organization Policies</button></div>
         </form>
       </section>
 
       <section class="card stack-col">
         <div class="row-gap">
-          <h2>Trilha de Auditoria SHA-256 Hash Chain</h2>
-          <button type="button" id="btn-verify-audit">Verificar Integridade</button>
+          <h2>SHA-256 Hash-Chained Audit Trail</h2>
+          <button type="button" id="btn-verify-audit">Verify Integrity</button>
           ${
             ver
-              ? `<span class="badge badge-${ver.valid ? "ok" : "error"}">${ver.valid ? "Válida" : "Violada"} (${ver.checked_entries} entradas)</span>`
+              ? `<span class="badge badge-${ver.valid ? "ok" : "error"}">${ver.valid ? "Valid" : "Tampered"} (${ver.checked_entries} entries)</span>`
               : ""
           }
         </div>
@@ -1632,7 +1636,7 @@ function renderShieldAuditSubTab(): string {
         <div tabindex="0" role="region" aria-labelledby="aud-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="aud-cap" class="hp-field">Audit Log Chain</caption>
-            <thead><tr><th>Data/Hora</th><th>Ator</th><th>Ação</th><th>Alvo</th><th>Hash SHA-256</th></tr></thead>
+            <thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Target</th><th>SHA-256 Hash</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
@@ -1643,7 +1647,7 @@ function renderShieldAuditSubTab(): string {
 function renderShieldTab(): string {
   if (state.shieldSubTab === "mfa") return renderShieldMfaSubTab();
   if (state.shieldSubTab === "audit") return renderShieldAuditSubTab();
-  const origin = location.origin;
+  const origin = publicOrigin();
   const firstProj = state.projects[0];
   const sampleDsn = firstProj?.dsn_public_key
     ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
@@ -1671,11 +1675,11 @@ function renderShieldTab(): string {
             <td data-label="Reason">${esc(q.reason)}</td>
             <td data-label="Score" class="tabular">${q.risk_score}</td>
             <td data-label="Expires" class="tabular">${esc(q.expires_at.slice(0, 19).replace("T", " "))}</td>
-            <td data-label="Action"><button type="button" class="btn-danger" data-del-quarantine="${q.id}">Liberar</button></td>
+            <td data-label="Action"><button type="button" class="btn-danger" data-del-quarantine="${q.id}">Release</button></td>
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="6">Nenhuma sessão ou IP em quarentena ativa.</td></tr>`;
+    : `<tr><td colspan="6">No active browser sessions or IPs in quarantine.</td></tr>`;
 
   const evRows = state.shieldEvents.length
     ? state.shieldEvents
@@ -1692,7 +1696,7 @@ function renderShieldTab(): string {
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="5">Nenhum evento Anti-REA, Log-IDS ou vazamento detectado ainda.</td></tr>`;
+    : `<tr><td colspan="5">No Anti-REA, Log-IDS, or secret leak events detected yet.</td></tr>`;
 
   const snipBrowser = `<script src="${origin}/sdk/bugfinder-shield.js"></script>
 <script>
@@ -1738,7 +1742,7 @@ app.use(async (req, res, next) => {
   next();
 });`;
 
-  const snipPhp = `// Laravel / RoleLane Shield + SourceMap & Canary Guard
+  const snipPhp = `// Laravel / PHP Shield + SourceMap & Canary Guard
 if (str_ends_with($request->path(), '.js.map') || in_array('/' . ltrim($request->path(), '/'), ['/.env', '/.git/config'], true)) {
     Http::withToken(config('services.bugfinder.api_token'))->timeout(1)->post(
         '${origin}/api/${pid}/shield/',
@@ -1756,74 +1760,74 @@ if sys.gettrace() is not None:
     <div class="page-header">
       <h1 class="page-title">Anti-REA Shield &amp; Mini-IDS</h1>
       <div class="row-gap">
-        <button type="button" id="btn-shield-settings">Configurar Shield do Projeto</button>
+        <button type="button" id="btn-shield-settings">Configure Project Shield</button>
         <div class="cta-dock">
-          <button type="button" id="btn-refresh-shield" data-primary-cta="true">Atualizar Escudo</button>
+          <button type="button" id="btn-refresh-shield" data-primary-cta="true">Refresh Shield</button>
         </div>
       </div>
     </div>
     ${renderShieldSubTabsHtml()}
 
     <div class="toolbar">
-      <label for="shield-project-filter">Projeto
+      <label for="shield-project-filter">Project
         <select id="shield-project-filter" name="shield_project_id">
-          <option value="" ${state.shieldProjectFilter === null ? "selected" : ""}>Todos os Projetos</option>
+          <option value="" ${state.shieldProjectFilter === null ? "selected" : ""}>All Projects</option>
           ${projOpts}
         </select>
       </label>
     </div>
 
     <div class="kpi-grid">
-      <div class="card"><div class="kpi-label">Ameaças (24h)</div><div class="kpi-value tabular">${s.events_24h}</div></div>
-      <div class="card"><div class="kpi-label">Alta / Crítica</div><div class="kpi-value tabular">${s.high_critical_24h}</div></div>
-      <div class="card"><div class="kpi-label">Segredos Interceptados</div><div class="kpi-value tabular">${s.secret_leaks_24h}</div></div>
-      <div class="card"><div class="kpi-label">Quarentenas Ativas</div><div class="kpi-value tabular">${s.active_quarantines}</div></div>
+      <div class="card"><div class="kpi-label">Threats (24h)</div><div class="kpi-value tabular">${s.events_24h}</div></div>
+      <div class="card"><div class="kpi-label">High / Critical</div><div class="kpi-value tabular">${s.high_critical_24h}</div></div>
+      <div class="card"><div class="kpi-label">Secret Leaks Caught</div><div class="kpi-value tabular">${s.secret_leaks_24h}</div></div>
+      <div class="card"><div class="kpi-label">Active Quarantines</div><div class="kpi-value tabular">${s.active_quarantines}</div></div>
     </div>
 
     <div class="stack-col">
       <section class="card stack-col">
-        <h2>Quarentena Ativa (CGNAT-Safe: Sessões Browser / IPs Verificados Backend)</h2>
+        <h2>Active Quarantine (CGNAT-Safe: Browser Sessions / Verified Backend IPs)</h2>
         <div tabindex="0" role="region" aria-labelledby="sh-q-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="sh-q-cap" class="hp-field">Active quarantine entries</caption>
-            <thead><tr><th>Tipo</th><th>HMAC</th><th>Motivo</th><th>Score</th><th>Expira</th><th>Ação</th></tr></thead>
+            <thead><tr><th>Type</th><th>HMAC</th><th>Reason</th><th>Score</th><th>Expires</th><th>Action</th></tr></thead>
             <tbody>${qRows}</tbody>
           </table>
         </div>
       </section>
 
       <section class="card stack-col">
-        <h2>Eventos Anti-REA, Log-IDS &amp; Secret Leak Radar</h2>
+        <h2>Anti-REA, Log-IDS &amp; Secret Leak Radar Events</h2>
         <div tabindex="0" role="region" aria-labelledby="sh-ev-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="sh-ev-cap" class="hp-field">Security events</caption>
-            <thead><tr><th>Sinal</th><th>Categoria</th><th>Severidade / Score</th><th>Fonte &amp; Rota</th><th>Ação / Hora</th></tr></thead>
+            <thead><tr><th>Signal</th><th>Category</th><th>Severity / Score</th><th>Source &amp; Path</th><th>Action / Time</th></tr></thead>
             <tbody>${evRows}</tbody>
           </table>
         </div>
       </section>
 
       <section class="card stack-col">
-        <h2>Proteções Prontas para o App Monitorado (1-Clique)</h2>
+        <h2>1-Click Drop-In App Protections</h2>
         <div>
           <p><strong>1. Browser Anti-REA Shield (~3 KB gzip, zero-dep, CDP/Hook/Canary Guard):</strong></p>
           <pre class="snippet-box">${esc(snipBrowser)}</pre>
-          <button type="button" data-copy-text="${esc(snipBrowser)}">Copiar Snippet Browser</button>
+          <button type="button" data-copy-text="${esc(snipBrowser)}">Copy Browser Snippet</button>
         </div>
         <div>
           <p><strong>2. Node / Express Middleware (Blocklist ETag + SourceMap &amp; Canary Trap):</strong></p>
           <pre class="snippet-box">${esc(snipNode)}</pre>
-          <button type="button" data-copy-text="${esc(snipNode)}">Copiar Middleware Node</button>
+          <button type="button" data-copy-text="${esc(snipNode)}">Copy Node Middleware</button>
         </div>
         <div>
-          <p><strong>3. Laravel / PHP Middleware (RoleLane):</strong></p>
+          <p><strong>3. Laravel / PHP Middleware:</strong></p>
           <pre class="snippet-box">${esc(snipPhp)}</pre>
-          <button type="button" data-copy-text="${esc(snipPhp)}">Copiar Middleware PHP</button>
+          <button type="button" data-copy-text="${esc(snipPhp)}">Copy PHP Middleware</button>
         </div>
         <div>
           <p><strong>4. Python / FastAPI Debugger &amp; Anti-REA Guard:</strong></p>
           <pre class="snippet-box">${esc(snipPython)}</pre>
-          <button type="button" data-copy-text="${esc(snipPython)}">Copiar Snippet Python</button>
+          <button type="button" data-copy-text="${esc(snipPython)}">Copy Python Snippet</button>
         </div>
       </section>
     </div>`;
@@ -1839,8 +1843,8 @@ function renderSelfCheckBanner(): string {
     summary.status === "error" ? "selfcheck-strip-error" : "selfcheck-strip-warn";
   const label =
     summary.status === "error"
-      ? `Auto-Check detectou ${summary.unackErrors} erro(s) interno(s) ou falha crítica`
-      : `Auto-Check: ${summary.missingCount} item(ns) recomendado(s) pendente(s)`;
+      ? `Auto-Check detected ${summary.unackErrors} internal error(s) or critical failure`
+      : `Auto-Check: ${summary.missingCount} recommended setup item(s) pending`;
 
   return `
     <div class="selfcheck-strip ${stripClass}" role="status">
@@ -1848,14 +1852,14 @@ function renderSelfCheckBanner(): string {
         <span class="badge badge-${esc(summary.badgeClass)}">${esc(summary.badgeText)}</span>
         <strong>${esc(label)}</strong>
       </div>
-      <button type="button" id="btn-open-selfcheck" data-tab="selfcheck">Abrir Auto-Check</button>
+      <button type="button" id="btn-open-selfcheck" data-tab="selfcheck">Open Auto-Check</button>
     </div>`;
 }
 
 function renderSelfCheckTab(): string {
   const rep = state.selfCheck;
   const summary = getEffectiveSelfStatus();
-  const origin = location.origin;
+  const origin = publicOrigin();
   const firstProj = state.projects[0];
   const sampleDsn = firstProj?.dsn_public_key
     ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
@@ -1930,7 +1934,7 @@ function renderSelfCheckTab(): string {
     ? `
       <section class="card stack-col">
         <div class="row-gap">
-          <h2>Resultado do Auto-Teste E2E</h2>
+          <h2>E2E Self-Test Result</h2>
           <span class="badge badge-${state.lastProbe.ok ? "ok" : "error"}">${state.lastProbe.ok ? "ALL PASSED" : "FAILED"}</span>
         </div>
         <div class="probe-list">
@@ -1960,15 +1964,15 @@ function renderSelfCheckTab(): string {
     <div class="page-header">
       <h1 class="page-title">Auto-Check &amp; Self-Diagnostics</h1>
       <div class="row-gap">
-        <button type="button" id="btn-refresh-selfcheck">Atualizar Diagnóstico</button>
+        <button type="button" id="btn-refresh-selfcheck">Refresh Diagnostics</button>
         ${
           totalErrCount > 0 || (rep?.unacknowledged_error_count ?? 0) > 0
-            ? `<button type="button" id="btn-ack-selfcheck" class="btn-danger">Reconhecer / Limpar Erros</button>`
+            ? `<button type="button" id="btn-ack-selfcheck" class="btn-danger">Acknowledge / Clear Errors</button>`
             : ""
         }
         <div class="cta-dock">
           <button type="button" id="btn-run-self-probe" data-primary-cta="true" ${state.probeRunning ? "disabled" : ""}>
-            ${state.probeRunning ? "Executando Auto-Teste..." : "Rodar Auto-Teste E2E"}
+            ${state.probeRunning ? "Running E2E Self-Test..." : "Run E2E Self-Test"}
           </button>
         </div>
       </div>
@@ -1976,19 +1980,19 @@ function renderSelfCheckTab(): string {
 
     <div class="kpi-grid">
       <div class="card">
-        <div class="kpi-label">Status Geral</div>
+        <div class="kpi-label">Overall Status</div>
         <div class="kpi-value"><span class="badge badge-${esc(summary.badgeClass)}">${esc(summary.badgeText)}</span></div>
       </div>
       <div class="card">
-        <div class="kpi-label">Erros Internos</div>
+        <div class="kpi-label">Internal Errors</div>
         <div class="kpi-value tabular">${summary.unackErrors}</div>
       </div>
       <div class="card">
-        <div class="kpi-label">Itens Faltando</div>
+        <div class="kpi-label">Pending Items</div>
         <div class="kpi-value tabular">${summary.missingCount}</div>
       </div>
       <div class="card">
-        <div class="kpi-label">RAM / Disco (${esc(rep?.engine || "sqlite")})</div>
+        <div class="kpi-label">RAM / Disk (${esc(rep?.engine || "sqlite")})</div>
         <div class="kpi-value tabular">${esc(rssMb)} MB / ${esc(dbMb)} MiB</div>
       </div>
     </div>
@@ -1997,48 +2001,48 @@ function renderSelfCheckTab(): string {
       ${probeHtml}
 
       <section class="card stack-col">
-        <h2>Erros Internos do Próprio App</h2>
+        <h2>Internal Application Errors</h2>
         <div tabindex="0" role="region" aria-labelledby="self-err-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="self-err-cap" class="hp-field">Internal application errors</caption>
-            <thead><tr><th>Fonte</th><th>Componente</th><th>Severidade</th><th>Mensagem &amp; Detalhe</th><th>Qtd / Hora</th></tr></thead>
+            <thead><tr><th>Source</th><th>Component</th><th>Severity</th><th>Message &amp; Detail</th><th>Count / Time</th></tr></thead>
             <tbody>${errRows}</tbody>
           </table>
         </div>
       </section>
 
       <section class="card stack-col">
-        <h2>Checklist de Auto-Check (Sistema &amp; O que está faltando)</h2>
+        <h2>Auto-Check Diagnostics (System &amp; Setup Readiness)</h2>
         <div tabindex="0" role="region" aria-labelledby="self-chk-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="self-chk-cap" class="hp-field">System readiness diagnostics</caption>
-            <thead><tr><th>Verificação</th><th>Categoria</th><th>Status</th><th>Detalhe</th><th>Como Resolver</th></tr></thead>
+            <thead><tr><th>Check</th><th>Category</th><th>Status</th><th>Detail</th><th>Remediation</th></tr></thead>
             <tbody>${checkRows}</tbody>
           </table>
         </div>
       </section>
 
       <section class="card stack-col">
-        <h2>Instalação em 1 Comando (Servidor + SDK do Projeto)</h2>
+        <h2>One-Command Install (Server + Project SDK)</h2>
         <div>
-          <p><strong>1. Instalar binário + serviço systemd --user + auto-check:</strong></p>
+          <p><strong>1. Install binary + systemd --user service + auto-check:</strong></p>
           <pre class="snippet-box">${esc(cmdServiceInstall)}</pre>
-          <button type="button" data-copy-text="${esc(cmdServiceInstall)}">Copiar Instalação Serviço</button>
+          <button type="button" data-copy-text="${esc(cmdServiceInstall)}">Copy Service Install</button>
         </div>
         <div>
-          <p><strong>2. Subir em Docker isolado (limite 32 MB RAM):</strong></p>
+          <p><strong>2. Run in hardened Docker container (32 MB RAM limit):</strong></p>
           <pre class="snippet-box">${esc(cmdDockerInstall)}</pre>
-          <button type="button" data-copy-text="${esc(cmdDockerInstall)}">Copiar Comando Docker</button>
+          <button type="button" data-copy-text="${esc(cmdDockerInstall)}">Copy Docker Command</button>
         </div>
         <div>
-          <p><strong>3. Browser Mini-SDK (&lt;3 KB zero-dep, com captura de erros + logs):</strong></p>
+          <p><strong>3. Browser Mini-SDK (&lt;3 KB zero-dep, errors + structured logs):</strong></p>
           <pre class="snippet-box">${esc(cmdMiniSdk)}</pre>
-          <button type="button" data-copy-text="${esc(cmdMiniSdk)}">Copiar Snippet Browser</button>
+          <button type="button" data-copy-text="${esc(cmdMiniSdk)}">Copy Browser Snippet</button>
         </div>
         <div>
-          <p><strong>4. .env para Sentry SDKs / RoleLane / GlitchTip:</strong></p>
+          <p><strong>4. .env for Official Sentry SDKs / GlitchTip Drop-In:</strong></p>
           <pre class="snippet-box">${esc(cmdSentryEnv)}</pre>
-          <button type="button" data-copy-text="${esc(cmdSentryEnv)}">Copiar Variáveis .env</button>
+          <button type="button" data-copy-text="${esc(cmdSentryEnv)}">Copy .env Variables</button>
         </div>
       </section>
     </div>`;
@@ -2180,7 +2184,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
 
     <dialog id="dlg-reauth" class="bf-dialog" closedby="any" aria-labelledby="dlg-reauth-title">
       <div class="dialog-head">
-        <h2 id="dlg-reauth-title">Confirmação de Identidade (Step-Up)</h2>
+        <h2 id="dlg-reauth-title">Step-Up Identity Confirmation</h2>
         <button type="button" id="dlg-reauth-close">Close</button>
       </div>
       <div id="dlg-reauth-body"></div>
@@ -2188,7 +2192,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
 
     <dialog id="dlg-connect-app" class="bf-dialog bf-dialog-wide" closedby="any" aria-labelledby="dlg-connect-title">
       <div class="dialog-head">
-        <h2 id="dlg-connect-title">Conectar App em 1 Clique</h2>
+        <h2 id="dlg-connect-title">1-Click Connect App</h2>
         <button type="button" id="dlg-connect-close">Close</button>
       </div>
       <div id="dlg-connect-body"></div>
@@ -2412,7 +2416,7 @@ function populateTraceDialog(): void {
 
 async function performPasskeyLogin(challengeToken?: string): Promise<void> {
   if (!window.PublicKeyCredential || !navigator.credentials) {
-    showToast("WebAuthn Passkeys não suportado neste navegador");
+    showToast("WebAuthn Passkeys are not supported in this browser");
     return;
   }
   const emailVal = (document.getElementById("login-email") as HTMLInputElement | null)?.value?.trim();
@@ -2424,7 +2428,7 @@ async function performPasskeyLogin(challengeToken?: string): Promise<void> {
     }
   });
   if (!begin.ok || !begin.data) {
-    showToast(begin.error || "Falha ao iniciar login com Passkey");
+    showToast(begin.error || "Failed to start Passkey login");
     return;
   }
   try {
@@ -2440,7 +2444,7 @@ async function performPasskeyLogin(challengeToken?: string): Promise<void> {
     };
     const cred = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
     if (!cred) {
-      showToast("Autenticação com Passkey cancelada");
+      showToast("Passkey authentication canceled");
       return;
     }
     const resp = cred.response as AuthenticatorAssertionResponse;
@@ -2455,13 +2459,13 @@ async function performPasskeyLogin(challengeToken?: string): Promise<void> {
       }
     });
     if (!fin.ok) {
-      showToast(fin.error || "Passkey recusada");
+      showToast(fin.error || "Passkey rejected");
       return;
     }
     state.mfaChallenge = null;
     await boot();
   } catch (err: any) {
-    showToast(err?.message ? String(err.message) : "Erro ao validar Passkey");
+    showToast(err?.message ? String(err.message) : "Error verifying Passkey");
   }
 }
 
@@ -2484,7 +2488,7 @@ function bindAuthHandlers(): void {
         { method: "POST", body: Object.fromEntries(fd.entries()) }
       );
       if (!res.ok) {
-        showToast(res.error || "Falha ao aceitar convite");
+        showToast(res.error || "Failed accepting invitation");
         return;
       }
       state.inviteToken = null;
@@ -2569,7 +2573,7 @@ function bindAuthHandlers(): void {
       if (fd.get("recovery_code")) payload.recovery_code = String(fd.get("recovery_code"));
       const res = await apiFetch<any>("/api/auth/mfa/verify", { method: "POST", body: payload });
       if (!res.ok) {
-        showToast(res.error || "Código 2FA inválido");
+        showToast(res.error || "Invalid 2FA code");
         return;
       }
       state.mfaChallenge = null;
@@ -2687,14 +2691,14 @@ function openReauthDialog(onSuccess: () => Promise<void> | void): void {
   if (!dlg || !body) return;
   body.innerHTML = `
     <form id="reauth-form" class="stack-col">
-      <p>Esta ação sensível requer confirmação recente da sua senha ou código 2FA (válida por 10 minutos).</p>
-      <label for="reauth-pw">Senha Atual
-        <input id="reauth-pw" name="password" type="password" autocomplete="current-password" placeholder="Sua senha">
+      <p>This sensitive action requires recent confirmation of your password or 2FA code (valid for 10 minutes).</p>
+      <label for="reauth-pw">Current Password
+        <input id="reauth-pw" name="password" type="password" autocomplete="current-password" placeholder="Your password">
       </label>
-      <label for="reauth-totp">Ou código TOTP (6 dígitos)
+      <label for="reauth-totp">Or TOTP Code (6 digits)
         <input id="reauth-totp" name="totp_code" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="123456">
       </label>
-      <button type="submit" autofocus>Confirmar Identidade</button>
+      <button type="submit" autofocus>Confirm Identity</button>
     </form>`;
 
   const form = document.getElementById("reauth-form") as HTMLFormElement | null;
@@ -2711,7 +2715,7 @@ function openReauthDialog(onSuccess: () => Promise<void> | void): void {
       }
     });
     if (!res.ok) {
-      showToast(res.error || "Falha na confirmação de identidade");
+      showToast(res.error || "Identity confirmation failed");
       return;
     }
     dlg.close();
@@ -2732,7 +2736,7 @@ function bindCopyButtons(scope: ParentNode): void {
 const CONNECT_STACK_TABS: ReadonlyArray<{ id: string; label: string }> = [
   { id: "web", label: "HTML / Web (1 Tag)" },
   { id: "cli", label: "CLI init" },
-  { id: "wrap", label: "Sem Código (wrap/pipe)" },
+  { id: "wrap", label: "Zero Code (wrap/pipe)" },
   { id: "node", label: "Node / Next / Vite" },
   { id: "python", label: "Python" },
   { id: "php", label: "PHP / Laravel" },
@@ -2743,7 +2747,7 @@ function buildConnectSnippet(
   proj: Project,
   stack: string
 ): { heading: string; note: string; code: string; dsn: string } {
-  const origin = location.origin;
+  const origin = publicOrigin();
   const key = proj.dsn_public_key || "<PUBLIC_KEY>";
   const dsn = `${origin.replace("://", `://${key}@`)}/${proj.id}`;
   const tunnelPath = proj.tunnel_slug ? `${origin}/t/${proj.tunnel_slug}` : "";
@@ -2769,55 +2773,55 @@ function buildConnectSnippet(
 
   if (stack === "cli") {
     return {
-      heading: "Configure automaticamente no terminal (1 comando)",
-      note: "Detecta Next.js, Vite, Node, Laravel, PHP, Python, Go, Rust ou HTML, grava .env (0600) e injeta o conector zero-dep.",
+      heading: "Auto-configure in terminal (1 command)",
+      note: "Detects Next.js, Vite, Node, Laravel, PHP, Python, Go, Rust, or HTML, writes .env (0600), and installs a zero-dep stdlib connector.",
       dsn,
-      code: `# Execute dentro da pasta do seu projeto (zero pacotes extras):\nbugfinder init --dsn "${dsn}"\n\n# Opcional: usar @sentry/* / sentry-sdk oficial em vez do conector stdlib:\nbugfinder init --dsn "${dsn}" --sdk sentry`
+      code: `# Run inside your project directory (zero external packages):\nbugfinder init --dsn "${dsn}"\n\n# Optional: use official @sentry/* / sentry-sdk instead of stdlib connector:\nbugfinder init --dsn "${dsn}" --sdk sentry`
     };
   }
   if (stack === "wrap") {
     return {
-      heading: "Zero alterações no código (wrap / pipe)",
-      note: "Encapsula stdout/stderr, agrupa tracebacks em Issues, remove segredos localmente e mantém exit code original.",
+      heading: "Zero code changes (wrap / pipe)",
+      note: "Wraps stdout/stderr, groups tracebacks into Issues, scrubs secrets locally, and preserves the original exit code.",
       dsn,
-      code: `# Envolver qualquer servidor, script ou worker:\nbugfinder wrap --dsn "${dsn}" -- node server.js\n\n# Ou capturar de cron / pipeline shell:\n./meu-job.sh 2>&1 | bugfinder pipe --dsn "${dsn}" --service meu-job`
+      code: `# Wrap any server, worker, or CLI script:\nbugfinder wrap --dsn "${dsn}" -- node server.js\n\n# Or pipe from cron / systemd / shell pipelines:\n./my-job.sh 2>&1 | bugfinder pipe --dsn "${dsn}" --service my-job`
     };
   }
   if (stack === "node") {
     return {
       heading: "Node.js / Next.js / Vite",
-      note: "Cole a tag no <head> do front (index.html / app/layout.tsx) e use o conector zero-dep no backend.",
+      note: "Paste the script tag in your frontend <head> (index.html / app/layout.tsx) and load the zero-dep backend connector.",
       dsn,
-      code: `// 1) Browser (index.html ou Next <head>):\n${webTag}\n\n// 2) Backend Node 18+ (rode: bugfinder init --dsn "${dsn}"):\nimport "./bugfinder.mjs"; // ou use @sentry/node com SENTRY_DSN`
+      code: `// 1) Browser (index.html or Next <head>):\n${webTag}\n\n// 2) Backend Node 18+ (run: bugfinder init --dsn "${dsn}"):\nimport "./bugfinder.mjs"; // or use @sentry/node with SENTRY_DSN`
     };
   }
   if (stack === "python") {
     return {
       heading: "Python (FastAPI / Django / Flask / Scripts)",
-      note: "Use o conector zero-dep da stdlib (`import bugfinder_client`) ou `sentry-sdk` oficial.",
+      note: "Use the zero-dep stdlib connector (`import bugfinder_client`) or official `sentry-sdk`.",
       dsn,
-      code: `# Gera bugfinder_client.py + .env (0 dependencias pip):\nbugfinder init --dsn "${dsn}" --stack python\n\n# Ou com sentry-sdk oficial:\nimport sentry_sdk\nsentry_sdk.init(dsn="${dsn}", environment="production")`
+      code: `# Generates bugfinder_client.py + .env (0 pip dependencies):\nbugfinder init --dsn "${dsn}" --stack python\n\n# Or with official sentry-sdk:\nimport sentry_sdk\nsentry_sdk.init(dsn="${dsn}", environment="production")`
     };
   }
   if (stack === "php") {
     return {
-      heading: "PHP / Laravel (Drop-in GlitchTip + RoleLane)",
-      note: "Compatível com GlitchTipClient, sentry-laravel ou bugfinder.php sem dependências externas.",
+      heading: "PHP / Laravel (Drop-in GlitchTip + Sentry)",
+      note: "Compatible with GlitchTipClient, sentry-laravel, or standalone bugfinder.php without Composer dependencies.",
       dsn,
-      code: `# .env (ou rode: bugfinder init --dsn "${dsn}" --stack laravel)\nGLITCHTIP_ENABLED=true\nGLITCHTIP_DSN=${dsn}\nGLITCHTIP_API_URL=${origin}\nGLITCHTIP_ORGANIZATION=${state.orgSlug}\n\n# PHP puro sem Composer:\nrequire_once __DIR__ . '/bugfinder.php';`
+      code: `# .env (or run: bugfinder init --dsn "${dsn}" --stack laravel)\nGLITCHTIP_ENABLED=true\nGLITCHTIP_DSN=${dsn}\nGLITCHTIP_API_URL=${origin}\nGLITCHTIP_ORGANIZATION=${state.orgSlug}\n\n# Pure PHP without Composer:\nrequire_once __DIR__ . '/bugfinder.php';`
     };
   }
   if (stack === "otlp") {
     return {
       heading: "Go, Rust & OpenTelemetry OTLP/HTTP + Docker Sidecar",
-      note: "Envie logs JSON/Protobuf direto para /otlp/v1/logs ou envolva seu binário com `bugfinder wrap`.",
+      note: "Send OTLP JSON/Protobuf logs directly to /otlp/v1/logs or wrap your binary with `bugfinder wrap`.",
       dsn,
-      code: `# Envio direto OTLP HTTP/JSON:\ncurl -X POST "${origin}/api/${proj.id}/otlp/v1/logs" \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"resourceLogs":[]}'\n\n# Go / Rust CLI wrapper sem alterações de código:\nbugfinder wrap --dsn "${dsn}" -- ./target/release/app`
+      code: `# Direct OTLP HTTP/JSON ingest:\ncurl -X POST "${origin}/api/${proj.id}/otlp/v1/logs" \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"resourceLogs":[]}'\n\n# Go / Rust CLI wrapper with zero code edits:\nbugfinder wrap --dsn "${dsn}" -- ./target/release/app`
     };
   }
   return {
-    heading: "Cole esta 1 tag dentro do <head> (0 JS inline, Compatível com CSP)",
-    note: "Auto-inicializa erros globais, rejeições Promise e breadcrumbs de clique automaticamente via data-*.",
+    heading: "Paste this 1 tag inside <head> (0 inline JS, CSP compatible)",
+    note: "Auto-initializes global errors, Promise rejections, and click breadcrumbs via data-* attributes.",
     dsn,
     code: webTag
   };
@@ -2829,11 +2833,11 @@ function updateConnectLiveDom(): void {
   const connected = state.connectLiveState === "connected";
   box.className = connected ? "connect-live-bar connect-live-ok" : "connect-live-bar";
   const msg = connected
-    ? `Conectado! Evento recebido ao vivo (${state.connectLiveDetail || "OK"})`
-    : "Aguardando primeiro evento em tempo real via SSE...";
+    ? `Connected! Live event received (${state.connectLiveDetail || "OK"})`
+    : "Waiting for first real-time event via SSE...";
   box.innerHTML = `
     <div class="row-gap">
-      <span class="badge ${connected ? "badge-ok" : "badge-warn"}">${connected ? "Conectado" : "Aguardando"}</span>
+      <span class="badge ${connected ? "badge-ok" : "badge-warn"}">${connected ? "Connected" : "Waiting"}</span>
       <span>${esc(msg)}</span>
     </div>`;
 }
@@ -2848,7 +2852,7 @@ function startConnectSse(projId: number): void {
       const parsed = JSON.parse(ev.data);
       if (parsed.project_id && Number(parsed.project_id) !== projId) return;
       state.connectLiveState = "connected";
-      const label = parsed.title_or_body || parsed.level || "evento";
+      const label = parsed.title_or_body || parsed.level || "event";
       state.connectLiveDetail = `${String(label).slice(0, 72)} · ${new Date().toLocaleTimeString()}`;
       updateConnectLiveDom();
       if (state.tab === "issues") {
@@ -2867,12 +2871,12 @@ function renderConnectAppBody(): void {
   const proj =
     state.projects.find((p) => p.id === state.connectProjectId) || state.projects[0] || null;
   if (!proj) {
-    bodyEl.innerHTML = `<p>Crie um projeto primeiro na aba Projects &amp; SDK.</p>`;
+    bodyEl.innerHTML = `<p>Create a project first in the Projects &amp; SDK tab.</p>`;
     return;
   }
   state.connectProjectId = proj.id;
   if (titleEl) {
-    titleEl.textContent = `Conectar App — ${proj.name}`;
+    titleEl.textContent = `Connect App — ${proj.name}`;
   }
 
   const info = buildConnectSnippet(proj, state.connectStackTab);
@@ -2889,7 +2893,7 @@ function renderConnectAppBody(): void {
         <div class="connect-toggle-grid">
           <label class="check-row" for="chk-connect-tunnel">
             <input id="chk-connect-tunnel" type="checkbox" ${state.connectOptTunnel ? "checked" : ""}>
-            <span>Tunnel Anti-AdBlock ${proj.tunnel_slug ? `(/t/${esc(proj.tunnel_slug)})` : "(ativar ao marcar)"}</span>
+            <span>Anti-AdBlock Tunnel ${proj.tunnel_slug ? `(/t/${esc(proj.tunnel_slug)})` : "(enable on check)"}</span>
           </label>
           <label class="check-row" for="chk-connect-shield">
             <input id="chk-connect-shield" type="checkbox" ${state.connectOptShield ? "checked" : ""}>
@@ -2897,34 +2901,34 @@ function renderConnectAppBody(): void {
           </label>
           <label class="check-row" for="chk-connect-fetch">
             <input id="chk-connect-fetch" type="checkbox" ${state.connectOptFetch ? "checked" : ""}>
-            <span>Capturar fetch 5xx + console.error</span>
+            <span>Capture fetch 5xx + console.error</span>
           </label>
           <label class="check-row" for="chk-connect-sri">
             <input id="chk-connect-sri" type="checkbox" ${state.connectOptSri ? "checked" : ""} ${
               state.sdkMeta?.mini_sdk_sri ? "" : "disabled"
             }>
-            <span>Integridade SRI (sha384)</span>
+            <span>SRI Integrity (sha384)</span>
           </label>
         </div>`
       : "";
 
   const isConnected = state.connectLiveState === "connected";
   const liveMsg = isConnected
-    ? `Conectado! Evento recebido ao vivo (${state.connectLiveDetail || "OK"})`
-    : "Aguardando primeiro evento em tempo real via SSE...";
+    ? `Connected! Live event received (${state.connectLiveDetail || "OK"})`
+    : "Waiting for first real-time event via SSE...";
 
   bodyEl.innerHTML = `
     <div class="stack-col">
       <div class="row-gap">
         <span class="badge badge-muted">${esc(proj.platform)}</span>
         <span class="mono">DSN: ${esc(info.dsn)}</span>
-        <button type="button" data-copy-text="${esc(info.dsn)}">Copiar DSN</button>
+        <button type="button" data-copy-text="${esc(info.dsn)}">Copy DSN</button>
       </div>
-      <div class="subtabs" role="tablist" aria-label="Stack de integração">${tabsHtml}</div>
+      <div class="subtabs" role="tablist" aria-label="Integration Stack">${tabsHtml}</div>
       ${togglesHtml}
       <div class="connect-snippet-head">
         <strong>${esc(info.heading)}</strong>
-        <button type="button" data-copy-text="${esc(info.code)}">Copiar Snippet</button>
+        <button type="button" data-copy-text="${esc(info.code)}">Copy Snippet</button>
       </div>
       <p>${esc(info.note)}</p>
       <pre class="snippet-box">${esc(info.code)}</pre>
@@ -2933,7 +2937,7 @@ function renderConnectAppBody(): void {
       }" role="status" aria-live="polite">
         <div class="row-gap">
           <span class="badge ${isConnected ? "badge-ok" : "badge-warn"}">${
-            isConnected ? "Conectado" : "Aguardando"
+            isConnected ? "Connected" : "Waiting"
           }</span>
           <span>${esc(liveMsg)}</span>
         </div>
@@ -2941,7 +2945,7 @@ function renderConnectAppBody(): void {
       <div class="row-gap">
         <button type="button" id="btn-connect-test-event" data-primary-cta="true" ${
           state.connectSendingTest ? "disabled" : ""
-        }>${state.connectSendingTest ? "Enviando evento..." : "Enviar Evento de Teste Agora"}</button>
+        }>${state.connectSendingTest ? "Sending test event..." : "Send Test Event Now"}</button>
       </div>
     </div>`;
 
@@ -2966,11 +2970,11 @@ function renderConnectAppBody(): void {
         await loadCurrentTabData();
         const refreshed = state.projects.find((p) => p.id === proj.id);
         state.connectOptTunnel = Boolean(refreshed?.tunnel_slug);
-        showToast("Tunnel Anti-AdBlock ativado");
+        showToast("Anti-AdBlock tunnel enabled");
         renderMainPane();
       } else {
         state.connectOptTunnel = false;
-        showToast(res.error || "Falha ao ativar tunnel");
+        showToast(res.error || "Failed enabling tunnel");
       }
     } else {
       state.connectOptTunnel = chk.checked;
@@ -2998,7 +3002,7 @@ function renderConnectAppBody(): void {
     const btn = document.getElementById("btn-connect-test-event") as HTMLButtonElement | null;
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "Enviando evento...";
+      btn.textContent = "Sending test event...";
     }
     const res = await apiFetch<{ ok: boolean; event_id?: string }>(
       `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/test-event/`,
@@ -3006,14 +3010,14 @@ function renderConnectAppBody(): void {
     );
     state.connectSendingTest = false;
     if (!res.ok) {
-      showToast(res.error || "Falha ao enviar evento de teste");
+      showToast(res.error || "Failed sending test event");
       renderConnectAppBody();
       return;
     }
-    showToast("Evento de teste enviado!");
+    showToast("Test event sent!");
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "Enviar Evento de Teste Agora";
+      btn.textContent = "Send Test Event Now";
     }
   });
 }
@@ -3025,7 +3029,7 @@ async function openConnectAppModal(projectId?: number): Promise<void> {
   const target =
     state.projects.find((p) => p.id === projectId) || state.projects[0] || null;
   if (!target) {
-    showToast("Crie um projeto primeiro");
+    showToast("Create a project first");
     await switchTab("projects");
     return;
   }
@@ -3286,7 +3290,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
         `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/${encodeURIComponent(id)}/`,
         { method: "DELETE" }
       );
-      showToast(res.ok ? "Convite revogado" : res.error || "Falha ao revogar convite");
+      showToast(res.ok ? "Invitation revoked" : res.error || "Failed revoking invitation");
       await loadCurrentTabData();
       renderMainPane();
     });
@@ -3305,7 +3309,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
   // Auto-Check tab handlers
   document.getElementById("btn-refresh-selfcheck")?.addEventListener("click", async () => {
     await refreshSelfCheck();
-    showToast("Diagnóstico atualizado");
+    showToast("Diagnostics refreshed");
     syncSelfCheckSlots();
   });
 
@@ -3320,9 +3324,9 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     if (res.ok && res.data) {
       state.lastProbe = res.data;
       state.selfCheck = res.data.report;
-      showToast(res.data.ok ? "Auto-Teste E2E concluído com sucesso" : "Auto-Teste E2E detectou falhas");
+      showToast(res.data.ok ? "E2E self-test passed" : "E2E self-test reported failures");
     } else {
-      showToast(res.error || "Falha ao executar Auto-Teste E2E");
+      showToast(res.error || "Failed running E2E self-test");
     }
     syncSelfCheckSlots();
   });
@@ -3335,9 +3339,9 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     );
     if (res.ok && res.data) {
       state.selfCheck = res.data;
-      showToast("Erros internos reconhecidos e limpos");
+      showToast("Internal errors acknowledged & cleared");
     } else {
-      showToast(res.error || "Falha ao limpar erros internos");
+      showToast(res.error || "Failed clearing internal errors");
     }
     syncSelfCheckSlots();
   });
@@ -3354,7 +3358,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
   document.getElementById("btn-refresh-shield")?.addEventListener("click", async () => {
     await loadCurrentTabData();
     renderMainPane();
-    showToast("Segurança atualizada");
+    showToast("Security status refreshed");
   });
 
   document.getElementById("btn-totp-enroll")?.addEventListener("click", async () => {
@@ -3363,7 +3367,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
       { method: "POST", body: {} }
     );
     if (!res.ok || !res.data) {
-      showToast(res.error || "Falha ao gerar QR 2FA");
+      showToast(res.error || "Failed generating 2FA QR code");
       return;
     }
     state.totpEnrollData = res.data;
@@ -3380,12 +3384,12 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
       { method: "POST", body: { code } }
     );
     if (!res.ok || !res.data) {
-      showToast(res.error || "Código 2FA inválido");
+      showToast(res.error || "Invalid 2FA code");
       return;
     }
     state.totpEnrollData = null;
     state.recoveryCodes = res.data.recovery_codes;
-    showToast("Autenticação 2FA ativada com sucesso!");
+    showToast("2FA authentication enabled!");
     await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
     renderMainPane();
   });
@@ -3398,11 +3402,11 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
         return;
       }
       if (!res.ok) {
-        showToast(res.error || "Falha ao desativar 2FA");
+        showToast(res.error || "Failed disabling 2FA");
         return;
       }
       state.recoveryCodes = null;
-      showToast("2FA desativado");
+      showToast("2FA disabled");
       await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
       renderMainPane();
     };
@@ -3420,11 +3424,11 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
         return;
       }
       if (!res.ok || !res.data) {
-        showToast(res.error || "Falha ao regenerar códigos");
+        showToast(res.error || "Failed regenerating recovery codes");
         return;
       }
       state.recoveryCodes = res.data.recovery_codes;
-      showToast("Novos códigos de recuperação gerados");
+      showToast("New recovery codes generated");
       await loadCurrentTabData();
       renderMainPane();
     };
@@ -3435,13 +3439,13 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
   passkeyRegForm?.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!window.PublicKeyCredential || !navigator.credentials) {
-      showToast("Passkeys WebAuthn não suportado neste navegador");
+      showToast("WebAuthn Passkeys are not supported in this browser");
       return;
     }
     const name = (document.getElementById("passkey-name-input") as HTMLInputElement | null)?.value?.trim() || "Security Passkey";
     const begin = await apiFetch<any>("/api/auth/passkey/register/begin", { method: "POST", body: {} });
     if (!begin.ok || !begin.data) {
-      showToast(begin.error || "Falha ao iniciar registro de Passkey");
+      showToast(begin.error || "Failed starting Passkey registration");
       return;
     }
     try {
@@ -3460,7 +3464,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
       };
       const cred = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
       if (!cred) {
-        showToast("Cadastro de Passkey cancelado");
+        showToast("Passkey registration canceled");
         return;
       }
       const resp = cred.response as AuthenticatorAttestationResponse;
@@ -3473,14 +3477,14 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
         }
       });
       if (!fin.ok) {
-        showToast(fin.error || "Falha ao salvar Passkey");
+        showToast(fin.error || "Failed saving Passkey");
         return;
       }
-      showToast("Passkey registrada!");
+      showToast("Passkey registered!");
       await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
       renderMainPane();
     } catch (err: any) {
-      showToast(err?.message ? String(err.message) : "Erro ao registrar Passkey");
+      showToast(err?.message ? String(err.message) : "Error registering Passkey");
     }
   });
 
@@ -3493,7 +3497,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
           openReauthDialog(sendDel);
           return;
         }
-        showToast(res.ok ? "Passkey removida" : res.error || "Falha ao remover Passkey");
+        showToast(res.ok ? "Passkey removed" : res.error || "Failed removing Passkey");
         await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
         renderMainPane();
       };
@@ -3510,12 +3514,12 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
       body: Object.fromEntries(fd.entries())
     });
     if (!res.ok) {
-      showToast(res.error || "Falha ao atualizar senha");
+      showToast(res.error || "Failed updating password");
       return;
     }
     if (res.data?.csrf_token) setCsrfToken(res.data.csrf_token);
     pwChangeForm.reset();
-    showToast("Senha alterada e outras sessões encerradas");
+    showToast("Password changed and other sessions revoked");
     await loadCurrentTabData();
     renderMainPane();
   });
@@ -3524,7 +3528,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     btn.addEventListener("click", async () => {
       const id = Number(btn.dataset.revokeSession);
       const res = await apiFetch(`/api/auth/sessions/${id}`, { method: "DELETE" });
-      showToast(res.ok ? "Sessão revogada" : res.error || "Falha ao revogar sessão");
+      showToast(res.ok ? "Session revoked" : res.error || "Failed revoking session");
       await loadCurrentTabData();
       renderMainPane();
     });
@@ -3532,7 +3536,7 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
 
   document.getElementById("btn-revoke-other-sessions")?.addEventListener("click", async () => {
     const res = await apiFetch("/api/auth/sessions/revoke-others", { method: "POST", body: {} });
-    showToast(res.ok ? "Outras sessões encerradas" : res.error || "Falha ao encerrar sessões");
+    showToast(res.ok ? "Other sessions revoked" : res.error || "Failed revoking sessions");
     await loadCurrentTabData();
     renderMainPane();
   });
@@ -3558,11 +3562,11 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
         return;
       }
       if (!res.ok || !res.data) {
-        showToast(res.error || "Falha ao salvar políticas da organização");
+        showToast(res.error || "Failed saving organization policies");
         return;
       }
       state.orgSecurity = res.data;
-      showToast("Políticas de segurança salvas");
+      showToast("Security policies saved");
       await loadCurrentTabData();
       renderMainPane();
     };
@@ -3576,9 +3580,9 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
     if (res.ok && res.data) {
       state.auditVerify = res.data;
       renderMainPane();
-      showToast(res.data.valid ? "Cadeia SHA-256 íntegra e válida" : "Violação detectada na trilha de auditoria!");
+      showToast(res.data.valid ? "SHA-256 chain valid & intact" : "Tampering detected in audit trail!");
     } else {
-      showToast(res.error || "Falha ao verificar integridade");
+      showToast(res.error || "Failed verifying integrity");
     }
   });
 
@@ -3602,10 +3606,10 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
         { method: "DELETE" }
       );
       if (!res.ok) {
-        showToast(res.error || "Falha ao liberar quarentena");
+        showToast(res.error || "Failed releasing quarantine");
         return;
       }
-      showToast("Quarentena liberada");
+      showToast("Quarantine released");
       await loadCurrentTabData();
       renderMainPane();
     });
@@ -3784,7 +3788,7 @@ function openProjectSettingsDialog(projectId: number): void {
 function renderProjectKeysDialogBody(proj: Project): void {
   const bodyEl = document.getElementById("dlg-proj-keys-body");
   if (!bodyEl) return;
-  const origin = location.origin;
+  const origin = publicOrigin();
 
   const keyRows = state.activeProjectKeys.length
     ? state.activeProjectKeys
@@ -3978,7 +3982,7 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
     body.innerHTML = `
       <form id="create-res-form" class="stack-col">
         <label for="cr-proj-name">Project Name
-          <input id="cr-proj-name" name="name" type="text" required autocomplete="off" placeholder="RoleLane Web" autofocus>
+          <input id="cr-proj-name" name="name" type="text" required autocomplete="off" placeholder="Acme Web" autofocus>
         </label>
         <label for="cr-proj-plat">Platform
           <select id="cr-proj-plat" name="platform">
@@ -4031,13 +4035,13 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
         <button type="submit">Add Member</button>
       </form>`;
   } else if (kind === "invite") {
-    title.textContent = "Gerar Link de Convite Expirável (72h)";
+    title.textContent = "Generate Expiring Invite Link (72h)";
     body.innerHTML = `
       <form id="create-res-form" class="stack-col">
-        <label for="cr-inv-email">Email do Convidado
-          <input id="cr-inv-email" name="email" type="email" required autocomplete="email" spellcheck="false" placeholder="novo.dev@empresa.com" autofocus>
+        <label for="cr-inv-email">Invitee Email
+          <input id="cr-inv-email" name="email" type="email" required autocomplete="email" spellcheck="false" placeholder="new.dev@company.com" autofocus>
         </label>
-        <label for="cr-inv-role">Permissão (Role)
+        <label for="cr-inv-role">Permission (Role)
           <select id="cr-inv-role" name="role">
             <option value="member" selected>member</option>
             <option value="admin">admin</option>
@@ -4046,10 +4050,10 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
             <option value="owner">owner</option>
           </select>
         </label>
-        <button type="submit">Gerar Link de 72h</button>
+        <button type="submit">Generate 72h Link</button>
       </form>`;
   } else if (kind === "token") {
-    title.textContent = "Gerar API Token com Escopos & Expiração";
+    title.textContent = "Generate Scoped & Expiring API Token";
     const defScopes = roleDefaultScopes("member");
     const scopeCheckboxes = ALL_TOKEN_SCOPES.map(
       (sc) => `
@@ -4060,10 +4064,10 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
     ).join("");
     body.innerHTML = `
       <form id="create-res-form" class="stack-col">
-        <label for="cr-tok-name">Nome do Token
+        <label for="cr-tok-name">Token Name
           <input id="cr-tok-name" name="name" type="text" required autocomplete="off" placeholder="CI SourceMaps / MCP Read" value="CI Token" autofocus>
         </label>
-        <label for="cr-tok-role">Nível de Acesso (Role)
+        <label for="cr-tok-role">Access Level (Role)
           <select id="cr-tok-role" name="role">
             <option value="member" selected>member</option>
             <option value="viewer">viewer</option>
@@ -4072,19 +4076,19 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
             <option value="owner">owner</option>
           </select>
         </label>
-        <label for="cr-tok-exp">Expiração
+        <label for="cr-tok-exp">Expiration
           <select id="cr-tok-exp" name="expires_in_days">
-            <option value="30">30 dias</option>
-            <option value="90" selected>90 dias</option>
-            <option value="365">365 dias</option>
-            <option value="0">Sem expiração</option>
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="365">365 days</option>
+            <option value="0">No expiration</option>
           </select>
         </label>
         <div class="stack-col">
-          <strong>Escopos permitidos</strong>
+          <strong>Allowed Scopes</strong>
           <div class="scope-grid">${scopeCheckboxes}</div>
         </div>
-        <button type="submit">Gerar API Token</button>
+        <button type="submit">Generate API Token</button>
       </form>`;
     const tokRoleSel = document.getElementById("cr-tok-role") as HTMLSelectElement | null;
     tokRoleSel?.addEventListener("change", () => {
@@ -4254,7 +4258,7 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
         state.lastCreatedToken = res.data.token;
       }
       if (kind === "invite" && res.data?.invite_url) {
-        state.lastInviteUrl = `${location.origin}${res.data.invite_url}`;
+        state.lastInviteUrl = `${publicOrigin()}${res.data.invite_url}`;
       }
       dlg.close();
       await loadCurrentTabData();
@@ -4267,9 +4271,9 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
           : kind === "member"
           ? "Member added"
           : kind === "invite"
-          ? "Link de convite (72h) gerado"
+          ? "72h invite link generated"
           : kind === "token"
-          ? "API Token gerado com escopos"
+          ? "Scoped API token generated"
           : "Alert rule saved"
       );
     };

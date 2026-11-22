@@ -770,7 +770,7 @@ pub async fn ingest_tunnel(
     }
 }
 
-/// Drop-in Sentry/GlitchTip `/api/:project_id/store/` used by RoleLane `GlitchTipClient.php`.
+/// Drop-in Sentry/GlitchTip `/api/:project_id/store/` endpoint.
 pub async fn ingest_store(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i64>,

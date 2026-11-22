@@ -19,6 +19,7 @@ export interface SdkMeta {
   version: string;
   mini_sdk_sri: string;
   shield_sdk_sri: string;
+  public_url?: string | null;
 }
 
 export interface Organization {
