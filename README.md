@@ -48,17 +48,61 @@ Apply `migrations/postgres/001_init_rls.sql` as the migrator role; runtime queri
 
 ---
 
+## Plugue em qualquer app em 30 segundos
+
+### Opção 1 — Navegador em 1 Tag `<script>` (0 JS inline, Compatível com CSP + SRI)
+Copie esta única tag da aba **Projects -> Conectar App** para dentro do `<head>` de qualquer app web (HTML, Vite, Next, React, Vue):
+```html
+<script
+  src="https://monitor.seudominio.com/sdk/bugfinder-mini.js"
+  data-dsn="https://<KEY>@monitor.seudominio.com/1"
+  data-shield="detect"
+  integrity="sha384-<SRI_DA_UI>"
+  crossorigin="anonymous"
+  async></script>
+```
+Para capturar também `fetch` com status `>=500` e `console.error`, basta adicionar `data-capture-fetch="true" data-capture-console="error"`.
+
+### Opção 2 — Zero Código no Terminal (`wrap` e `pipe`)
+```bash
+# Captura erros/tracebacks de stderr, envia saída normal como logs, remove segredos e preserva exit code
+bugfinder wrap --dsn "http://<KEY>@127.0.0.1:8080/1" -- node server.js
+
+# Ou capture direto de qualquer pipeline / systemd / cron
+./seu-job.sh 2>&1 | bugfinder pipe --dsn "http://<KEY>@127.0.0.1:8080/1" --service backup-job
+```
+
+### Opção 3 — Setup Automático (`bugfinder init`)
+```bash
+# Detecta Next/Vite/Node/Laravel/PHP/Python/Go/Rust, grava .env (0600) + .env.example e cria conector stdlib zero-dep
+bugfinder init --dsn "http://<KEY>@127.0.0.1:8080/1"
+```
+
+### Opção 4 — Sidecar Docker Compose (5 linhas)
+```yaml
+services:
+  bugfinder:
+    image: ghcr.io/murilofelisberto90/bugfinder:latest
+    command: ["--headless", "--bind", "0.0.0.0:8080", "--data", "/data"]
+    mem_limit: 32m
+```
+
+---
+
 ## Tracking Everything & Sending Structured Logs
 
 ### A. Zero-Dep Browser Mini-SDK (`< 3 KB`, served from `/sdk/bugfinder-mini.js`)
 ```html
-<script src="http://127.0.0.1:8080/sdk/bugfinder-mini.js"></script>
-<script>
-  BugFinder.init({ dsn: "http://<KEY>@127.0.0.1:8080/1", environment: "production", release: "1.0.0" });
-  BugFinder.logger.info("Checkout loaded", { items: 2 });
-</script>
+<!-- Recommended 1-tag auto-init (or call BugFinder.init({ ... }) manually) -->
+<script
+  src="http://127.0.0.1:8080/sdk/bugfinder-mini.js"
+  data-dsn="http://<KEY>@127.0.0.1:8080/1"
+  data-env="production"
+  data-release="1.0.0"
+  crossorigin="anonymous"
+  async></script>
 ```
-Captures `window.onerror`, `unhandledrejection`, click breadcrumbs, and sends **Sentry Envelope NDJSON** (`event` + `log` v2).
+Captures `window.onerror`, `unhandledrejection`, click breadcrumbs, opt-in HTTP `5xx` fetch failures & `console.error`, and sends **Sentry Envelope NDJSON** (`event` + `log` v2) with optional 1-tag Anti-REA Shield bootstrap (`data-shield="detect"`).
 
 ### B. Official Sentry SDKs (`@sentry/browser`, `@sentry/node`, `sentry-sdk`, `sentry-laravel`)
 Point any Sentry SDK `dsn` (or `tunnel: "/t/<tunnel_slug>"` to bypass ad-blockers) directly to Bug-Finder. Supports:

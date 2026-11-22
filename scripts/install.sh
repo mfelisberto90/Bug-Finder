@@ -289,6 +289,11 @@ echo "  Data:   ${DATA_DIR}"
 echo "  Config: ${ENV_FILE}"
 echo "  Start:  ${PREFIX}/bugfinder --headless --bind ${BIND_ADDR} --data ${DATA_DIR}"
 echo "  App UI: ${PREFIX}/bugfinder --app --data ${DATA_DIR}"
+echo ""
+echo "Quick 30s App Onboarding (run inside your app directory):"
+echo "  1) Auto-configure .env + connector: bugfinder init --dsn <YOUR_DSN>"
+echo "  2) Zero-code crash & log wrapper:   bugfinder wrap --dsn <YOUR_DSN> -- <your-app-command>"
+echo "  3) Browser 1-tag snippet:           Open the Web UI -> Projects -> 'Conectar App'"
 if [[ ":${PATH}:" != *":${PREFIX}:"* ]]; then
   echo "  Note:   Add ${PREFIX} to your PATH: export PATH=\"${PREFIX}:\$PATH\""
 fi

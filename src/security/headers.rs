@@ -179,6 +179,30 @@ pub fn validate_same_origin(headers: &HeaderMap, config: &AppConfig) -> bool {
     true
 }
 
+pub fn is_cross_origin_public_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/sdk/bugfinder-mini.js" | "/sdk/bugfinder-shield.js" | "/v1/logs" | "/api/v1/logs"
+    ) {
+        return true;
+    }
+    if path.starts_with("/t/") && path.len() > 3 {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix("/api/") {
+        if let Some((pid_str, sub)) = rest.split_once('/') {
+            if pid_str.parse::<i64>().ok().map_or(false, |id| id > 0) {
+                let norm = sub.trim_end_matches('/');
+                return matches!(
+                    norm,
+                    "envelope" | "store" | "security" | "shield" | "otlp/v1/logs"
+                );
+            }
+        }
+    }
+    false
+}
+
 pub fn inject_csp_nonce_into_html(html: &str, nonce: &str) -> String {
     // Re-inject fresh per-request nonce into Vite-built <script, <link rel="stylesheet", <style tags
     let nonce_attr = format!(" nonce=\"{nonce}\"");
@@ -338,7 +362,11 @@ pub async fn security_headers_middleware(
     );
     h.insert(
         "cross-origin-resource-policy",
-        HeaderValue::from_static("same-origin"),
+        HeaderValue::from_static(if is_cross_origin_public_path(&path) {
+            "cross-origin"
+        } else {
+            "same-origin"
+        }),
     );
     h.insert(
         "permissions-policy",
@@ -394,5 +422,25 @@ mod tests {
         assert!(is_allowed_desktop_host("localhost:3000"));
         assert!(is_allowed_desktop_host("[::1]:8080"));
         assert!(!is_allowed_desktop_host("evil.attacker.com:8080"));
+    }
+
+    #[test]
+    fn cross_origin_corp_policy_is_strictly_scoped() {
+        assert!(is_cross_origin_public_path("/sdk/bugfinder-mini.js"));
+        assert!(is_cross_origin_public_path("/sdk/bugfinder-shield.js"));
+        assert!(is_cross_origin_public_path("/api/1/envelope/"));
+        assert!(is_cross_origin_public_path("/api/42/store"));
+        assert!(is_cross_origin_public_path("/api/7/shield/"));
+        assert!(is_cross_origin_public_path("/t/tunnel123"));
+        assert!(is_cross_origin_public_path("/v1/logs"));
+
+        // Dashboard, auth, and API v0 MUST remain same-origin
+        assert!(!is_cross_origin_public_path("/"));
+        assert!(!is_cross_origin_public_path("/assets/app.js"));
+        assert!(!is_cross_origin_public_path("/api/auth/me"));
+        assert!(!is_cross_origin_public_path("/api/0/organizations/acme/issues/"));
+        assert!(!is_cross_origin_public_path("/api/0/sdk-meta/"));
+        assert!(!is_cross_origin_public_path("/api/0/envelope/"));
+        assert!(!is_cross_origin_public_path("/metrics"));
     }
 }

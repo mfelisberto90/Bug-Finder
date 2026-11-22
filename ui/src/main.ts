@@ -25,6 +25,7 @@ import {
   type PublicInvitationInfo,
   type QuarantineItem,
   type ReleaseHealth,
+  type SdkMeta,
   type SecurityEventItem,
   type SelfCheckReport,
   type SelfProbeResult,
@@ -114,6 +115,16 @@ interface AppStateModel {
   lastProbe: SelfProbeResult | null;
   localSelfErrors: LocalSelfError[];
   probeRunning: boolean;
+  sdkMeta: SdkMeta | null;
+  connectProjectId: number | null;
+  connectStackTab: string;
+  connectOptTunnel: boolean;
+  connectOptShield: boolean;
+  connectOptFetch: boolean;
+  connectOptSri: boolean;
+  connectLiveState: "waiting" | "connected";
+  connectLiveDetail: string;
+  connectSendingTest: boolean;
 }
 
 const ISSUES_PAGE_SIZE = 25;
@@ -181,10 +192,21 @@ const state: AppStateModel = {
   selfCheck: null,
   lastProbe: null,
   localSelfErrors: [],
-  probeRunning: false
+  probeRunning: false,
+  sdkMeta: null,
+  connectProjectId: null,
+  connectStackTab: "web",
+  connectOptTunnel: false,
+  connectOptShield: false,
+  connectOptFetch: false,
+  connectOptSri: true,
+  connectLiveState: "waiting",
+  connectLiveDetail: "",
+  connectSendingTest: false
 };
 
 let sseSource: EventSource | null = null;
+let connectSse: EventSource | null = null;
 let mountedMode: MountedMode = "none";
 let localErrSeq = 1;
 let toastSeq = 1;
@@ -274,12 +296,30 @@ function showToast(msg: string): void {
   }, 3200);
 }
 
+function stopConnectSse(): void {
+  if (connectSse) {
+    connectSse.close();
+    connectSse = null;
+  }
+}
+
+function syncShellInert(): void {
+  const shell = document.getElementById("shell-root");
+  if (!shell) return;
+  const hasOpen = document.querySelectorAll("#dialogs-root dialog[open]").length > 0;
+  (shell as HTMLElement & { inert: boolean }).inert = hasOpen;
+}
+
 function wireDialogBehavior(dlg: HTMLDialogElement): void {
   if (dlg.dataset.bfWired === "1") return;
   dlg.dataset.bfWired = "1";
 
   dlg.addEventListener("close", () => {
     dlg.returnValue = "";
+    if (dlg.id === "dlg-connect-app") {
+      stopConnectSse();
+    }
+    syncShellInert();
   });
 
   // Safari fallback alongside declarative closedby="any": require both press and release outside dialog box
@@ -306,14 +346,24 @@ function openDialog(dlg: HTMLDialogElement): void {
   if (!dlg.open) {
     dlg.showModal();
   }
+  syncShellInert();
 }
 
 function closeAllDialogs(): void {
+  stopConnectSse();
   document.querySelectorAll<HTMLDialogElement>("#dialogs-root dialog[open]").forEach((d) => {
     try {
       d.close();
     } catch {}
   });
+  syncShellInert();
+}
+
+async function refreshSdkMeta(): Promise<void> {
+  const res = await apiFetch<SdkMeta>("/api/0/sdk-meta/");
+  if (res.ok && res.data) {
+    state.sdkMeta = res.data;
+  }
 }
 
 async function refreshSelfCheck(): Promise<void> {
@@ -469,7 +519,7 @@ async function boot(): Promise<void> {
     }
     setCsrfToken(me.data.csrf_token || "");
     state.loading = false;
-    await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+    await Promise.all([loadCurrentTabData(), refreshSelfCheck(), refreshSdkMeta()]);
     render();
     return;
   }
@@ -535,9 +585,12 @@ async function fetchLogsPage(append: boolean): Promise<void> {
 
 async function loadCurrentTabData(): Promise<void> {
   if (!state.orgSlug) return;
-  const projRes = await apiFetch<Project[]>(
-    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/projects/`
-  );
+  const [projRes] = await Promise.all([
+    apiFetch<Project[]>(
+      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/projects/`
+    ),
+    state.sdkMeta ? Promise.resolve() : refreshSdkMeta()
+  ]);
   if (projRes.ok && projRes.data) state.projects = projRes.data;
 
   if (state.tab === "issues") {
@@ -910,7 +963,11 @@ function renderIssuesTab(): string {
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="6">No issues matching filter. Send a test event from the Projects tab or CLI.</td></tr>`;
+    : `<tr><td colspan="6"><div class="row-gap"><span>No issues matching filter.</span>${
+        state.projects.length
+          ? `<button type="button" id="btn-empty-connect-app">Conectar App em 1 Clique</button>`
+          : `<button type="button" id="btn-empty-go-projects">Criar Projeto primeiro</button>`
+      }</div></td></tr>`;
 
   return `
     <div class="page-header">
@@ -1182,6 +1239,7 @@ function renderProjectsTab(): string {
           </div>
           <div class="mono">DSN: ${esc(dsn)}</div>
           <div class="row-gap">
+            <button type="button" data-connect-app="${p.id}">Conectar App</button>
             <button type="button" data-copy-text="${esc(dsn)}">Copy DSN</button>
             <button type="button" data-open-proj-settings="${p.id}">Filters &amp; Scrubbing</button>
             <button type="button" data-open-proj-keys="${p.id}">DSN Keys</button>
@@ -1291,19 +1349,20 @@ function renderProjectsTab(): string {
     </section>
 
     <section class="card">
-      <h2>Drop-in SDK Quickstart (Errors + Structured Logs + RoleLane)</h2>
-      <p>1. Browser Mini-SDK (&lt;3 KB zero-dep):</p>
-      <pre class="snippet-box">&lt;script src="${esc(origin)}/sdk/bugfinder-mini.js"&gt;&lt;/script&gt;
-&lt;script&gt;
-  BugFinder.init({ dsn: "${esc(sampleDsn)}", environment: "production", release: "1.0.0" });
-  BugFinder.logger.info("Checkout loaded", { cart_items: 2 });
-&lt;/script&gt;</pre>
-      <p>2. Official Sentry SDK (@sentry/browser / @sentry/node / sentry-sdk) &amp; RoleLane .env:</p>
+      <h2>Drop-in SDK Quickstart (1-Tag Browser + Zero-Dep CLI + RoleLane)</h2>
+      <p>1. Browser 1-Tag Auto-Init (&lt; 4 KB, CSP + SRI Ready, zero inline JS):</p>
+      <pre class="snippet-box">&lt;script src="${esc(origin)}/sdk/bugfinder-mini.js" data-dsn="${esc(sampleDsn)}"${
+        state.sdkMeta?.mini_sdk_sri ? ` integrity="${esc(state.sdkMeta.mini_sdk_sri)}"` : ""
+      } crossorigin="anonymous" async&gt;&lt;/script&gt;</pre>
+      <p>2. Terminal Zero-Dep CLI (Auto-Config + Process Wrapper):</p>
+      <pre class="snippet-box">bugfinder init --dsn "${esc(sampleDsn)}"
+bugfinder wrap --dsn "${esc(sampleDsn)}" -- node server.js</pre>
+      <p>3. Official Sentry SDKs (@sentry/browser / @sentry/node / sentry-sdk) &amp; RoleLane .env:</p>
       <pre class="snippet-box">GLITCHTIP_ENABLED=true
 GLITCHTIP_DSN=${esc(sampleDsn)}
 GLITCHTIP_API_URL=${esc(origin)}
 GLITCHTIP_ORGANIZATION=${esc(state.orgSlug)}</pre>
-      <p>3. OpenTelemetry OTLP/HTTP Logs + Terminal Tail + MCP Agent:</p>
+      <p>4. OpenTelemetry OTLP/HTTP Logs + Terminal Tail + MCP Agent:</p>
       <pre class="snippet-box">POST ${esc(origin)}/api/${firstProj ? firstProj.id : 1}/otlp/v1/logs  (Authorization: Bearer ${esc(firstProj?.dsn_public_key || "<KEY>")})
 bugfinder tail --url ${esc(origin)} --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;
 bugfinder mcp --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;</pre>
@@ -2125,6 +2184,14 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
         <button type="button" id="dlg-reauth-close">Close</button>
       </div>
       <div id="dlg-reauth-body"></div>
+    </dialog>
+
+    <dialog id="dlg-connect-app" class="bf-dialog bf-dialog-wide" closedby="any" aria-labelledby="dlg-connect-title">
+      <div class="dialog-head">
+        <h2 id="dlg-connect-title">Conectar App em 1 Clique</h2>
+        <button type="button" id="dlg-connect-close">Close</button>
+      </div>
+      <div id="dlg-connect-body"></div>
     </dialog>`;
 
   bindChromeHandlers();
@@ -2581,6 +2648,9 @@ function bindChromeHandlers(): void {
   document.getElementById("dlg-reauth-close")?.addEventListener("click", () => {
     (document.getElementById("dlg-reauth") as HTMLDialogElement | null)?.close();
   });
+  document.getElementById("dlg-connect-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-connect-app") as HTMLDialogElement | null)?.close();
+  });
 
   document.getElementById("btn-apply-filters")?.addEventListener("click", async () => {
     const sel = document.getElementById("filter-status-sel") as HTMLSelectElement | null;
@@ -2659,11 +2729,329 @@ function bindCopyButtons(scope: ParentNode): void {
   });
 }
 
+const CONNECT_STACK_TABS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "web", label: "HTML / Web (1 Tag)" },
+  { id: "cli", label: "CLI init" },
+  { id: "wrap", label: "Sem Código (wrap/pipe)" },
+  { id: "node", label: "Node / Next / Vite" },
+  { id: "python", label: "Python" },
+  { id: "php", label: "PHP / Laravel" },
+  { id: "otlp", label: "Go / Rust / OTLP" }
+];
+
+function buildConnectSnippet(
+  proj: Project,
+  stack: string
+): { heading: string; note: string; code: string; dsn: string } {
+  const origin = location.origin;
+  const key = proj.dsn_public_key || "<PUBLIC_KEY>";
+  const dsn = `${origin.replace("://", `://${key}@`)}/${proj.id}`;
+  const tunnelPath = proj.tunnel_slug ? `${origin}/t/${proj.tunnel_slug}` : "";
+
+  const attrs: string[] = [`src="${origin}/sdk/bugfinder-mini.js"`, `data-dsn="${dsn}"`];
+  if (state.connectOptTunnel && tunnelPath) {
+    attrs.push(`data-tunnel="${tunnelPath}"`);
+  }
+  if (state.connectOptShield) {
+    attrs.push(`data-shield="detect"`);
+    if (state.connectOptSri && state.sdkMeta?.shield_sdk_sri) {
+      attrs.push(`data-shield-sri="${state.sdkMeta.shield_sdk_sri}"`);
+    }
+  }
+  if (state.connectOptFetch) {
+    attrs.push(`data-capture-fetch="true"`, `data-capture-console="error"`);
+  }
+  if (state.connectOptSri && state.sdkMeta?.mini_sdk_sri) {
+    attrs.push(`integrity="${state.sdkMeta.mini_sdk_sri}"`);
+  }
+  attrs.push(`crossorigin="anonymous"`, `async`);
+  const webTag = `<script\n  ${attrs.join("\n  ")}></script>`;
+
+  if (stack === "cli") {
+    return {
+      heading: "Configure automaticamente no terminal (1 comando)",
+      note: "Detecta Next.js, Vite, Node, Laravel, PHP, Python, Go, Rust ou HTML, grava .env (0600) e injeta o conector zero-dep.",
+      dsn,
+      code: `# Execute dentro da pasta do seu projeto (zero pacotes extras):\nbugfinder init --dsn "${dsn}"\n\n# Opcional: usar @sentry/* / sentry-sdk oficial em vez do conector stdlib:\nbugfinder init --dsn "${dsn}" --sdk sentry`
+    };
+  }
+  if (stack === "wrap") {
+    return {
+      heading: "Zero alterações no código (wrap / pipe)",
+      note: "Encapsula stdout/stderr, agrupa tracebacks em Issues, remove segredos localmente e mantém exit code original.",
+      dsn,
+      code: `# Envolver qualquer servidor, script ou worker:\nbugfinder wrap --dsn "${dsn}" -- node server.js\n\n# Ou capturar de cron / pipeline shell:\n./meu-job.sh 2>&1 | bugfinder pipe --dsn "${dsn}" --service meu-job`
+    };
+  }
+  if (stack === "node") {
+    return {
+      heading: "Node.js / Next.js / Vite",
+      note: "Cole a tag no <head> do front (index.html / app/layout.tsx) e use o conector zero-dep no backend.",
+      dsn,
+      code: `// 1) Browser (index.html ou Next <head>):\n${webTag}\n\n// 2) Backend Node 18+ (rode: bugfinder init --dsn "${dsn}"):\nimport "./bugfinder.mjs"; // ou use @sentry/node com SENTRY_DSN`
+    };
+  }
+  if (stack === "python") {
+    return {
+      heading: "Python (FastAPI / Django / Flask / Scripts)",
+      note: "Use o conector zero-dep da stdlib (`import bugfinder_client`) ou `sentry-sdk` oficial.",
+      dsn,
+      code: `# Gera bugfinder_client.py + .env (0 dependencias pip):\nbugfinder init --dsn "${dsn}" --stack python\n\n# Ou com sentry-sdk oficial:\nimport sentry_sdk\nsentry_sdk.init(dsn="${dsn}", environment="production")`
+    };
+  }
+  if (stack === "php") {
+    return {
+      heading: "PHP / Laravel (Drop-in GlitchTip + RoleLane)",
+      note: "Compatível com GlitchTipClient, sentry-laravel ou bugfinder.php sem dependências externas.",
+      dsn,
+      code: `# .env (ou rode: bugfinder init --dsn "${dsn}" --stack laravel)\nGLITCHTIP_ENABLED=true\nGLITCHTIP_DSN=${dsn}\nGLITCHTIP_API_URL=${origin}\nGLITCHTIP_ORGANIZATION=${state.orgSlug}\n\n# PHP puro sem Composer:\nrequire_once __DIR__ . '/bugfinder.php';`
+    };
+  }
+  if (stack === "otlp") {
+    return {
+      heading: "Go, Rust & OpenTelemetry OTLP/HTTP + Docker Sidecar",
+      note: "Envie logs JSON/Protobuf direto para /otlp/v1/logs ou envolva seu binário com `bugfinder wrap`.",
+      dsn,
+      code: `# Envio direto OTLP HTTP/JSON:\ncurl -X POST "${origin}/api/${proj.id}/otlp/v1/logs" \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"resourceLogs":[]}'\n\n# Go / Rust CLI wrapper sem alterações de código:\nbugfinder wrap --dsn "${dsn}" -- ./target/release/app`
+    };
+  }
+  return {
+    heading: "Cole esta 1 tag dentro do <head> (0 JS inline, Compatível com CSP)",
+    note: "Auto-inicializa erros globais, rejeições Promise e breadcrumbs de clique automaticamente via data-*.",
+    dsn,
+    code: webTag
+  };
+}
+
+function updateConnectLiveDom(): void {
+  const box = document.getElementById("connect-live-status");
+  if (!box) return;
+  const connected = state.connectLiveState === "connected";
+  box.className = connected ? "connect-live-bar connect-live-ok" : "connect-live-bar";
+  const msg = connected
+    ? `Conectado! Evento recebido ao vivo (${state.connectLiveDetail || "OK"})`
+    : "Aguardando primeiro evento em tempo real via SSE...";
+  box.innerHTML = `
+    <div class="row-gap">
+      <span class="badge ${connected ? "badge-ok" : "badge-warn"}">${connected ? "Conectado" : "Aguardando"}</span>
+      <span>${esc(msg)}</span>
+    </div>`;
+}
+
+function startConnectSse(projId: number): void {
+  stopConnectSse();
+  if (!state.orgSlug) return;
+  const url = `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/logs/stream?project=${projId}`;
+  connectSse = new EventSource(url);
+  const handleEv = (ev: MessageEvent) => {
+    try {
+      const parsed = JSON.parse(ev.data);
+      if (parsed.project_id && Number(parsed.project_id) !== projId) return;
+      state.connectLiveState = "connected";
+      const label = parsed.title_or_body || parsed.level || "evento";
+      state.connectLiveDetail = `${String(label).slice(0, 72)} · ${new Date().toLocaleTimeString()}`;
+      updateConnectLiveDom();
+      if (state.tab === "issues") {
+        void fetchIssuesPage(false).then(() => renderMainPane());
+      }
+    } catch {}
+  };
+  connectSse.addEventListener("issue", handleEv);
+  connectSse.addEventListener("log", handleEv);
+}
+
+function renderConnectAppBody(): void {
+  const bodyEl = document.getElementById("dlg-connect-body");
+  const titleEl = document.getElementById("dlg-connect-title");
+  if (!bodyEl) return;
+  const proj =
+    state.projects.find((p) => p.id === state.connectProjectId) || state.projects[0] || null;
+  if (!proj) {
+    bodyEl.innerHTML = `<p>Crie um projeto primeiro na aba Projects &amp; SDK.</p>`;
+    return;
+  }
+  state.connectProjectId = proj.id;
+  if (titleEl) {
+    titleEl.textContent = `Conectar App — ${proj.name}`;
+  }
+
+  const info = buildConnectSnippet(proj, state.connectStackTab);
+  const tabsHtml = CONNECT_STACK_TABS.map(
+    (t) =>
+      `<button type="button" class="subtab-btn" role="tab" aria-selected="${
+        state.connectStackTab === t.id ? "true" : "false"
+      }" data-connect-tab="${t.id}">${esc(t.label)}</button>`
+  ).join("");
+
+  const togglesHtml =
+    state.connectStackTab === "web" || state.connectStackTab === "node"
+      ? `
+        <div class="connect-toggle-grid">
+          <label class="check-row" for="chk-connect-tunnel">
+            <input id="chk-connect-tunnel" type="checkbox" ${state.connectOptTunnel ? "checked" : ""}>
+            <span>Tunnel Anti-AdBlock ${proj.tunnel_slug ? `(/t/${esc(proj.tunnel_slug)})` : "(ativar ao marcar)"}</span>
+          </label>
+          <label class="check-row" for="chk-connect-shield">
+            <input id="chk-connect-shield" type="checkbox" ${state.connectOptShield ? "checked" : ""}>
+            <span>Anti-REA Shield (detect)</span>
+          </label>
+          <label class="check-row" for="chk-connect-fetch">
+            <input id="chk-connect-fetch" type="checkbox" ${state.connectOptFetch ? "checked" : ""}>
+            <span>Capturar fetch 5xx + console.error</span>
+          </label>
+          <label class="check-row" for="chk-connect-sri">
+            <input id="chk-connect-sri" type="checkbox" ${state.connectOptSri ? "checked" : ""} ${
+              state.sdkMeta?.mini_sdk_sri ? "" : "disabled"
+            }>
+            <span>Integridade SRI (sha384)</span>
+          </label>
+        </div>`
+      : "";
+
+  const isConnected = state.connectLiveState === "connected";
+  const liveMsg = isConnected
+    ? `Conectado! Evento recebido ao vivo (${state.connectLiveDetail || "OK"})`
+    : "Aguardando primeiro evento em tempo real via SSE...";
+
+  bodyEl.innerHTML = `
+    <div class="stack-col">
+      <div class="row-gap">
+        <span class="badge badge-muted">${esc(proj.platform)}</span>
+        <span class="mono">DSN: ${esc(info.dsn)}</span>
+        <button type="button" data-copy-text="${esc(info.dsn)}">Copiar DSN</button>
+      </div>
+      <div class="subtabs" role="tablist" aria-label="Stack de integração">${tabsHtml}</div>
+      ${togglesHtml}
+      <div class="connect-snippet-head">
+        <strong>${esc(info.heading)}</strong>
+        <button type="button" data-copy-text="${esc(info.code)}">Copiar Snippet</button>
+      </div>
+      <p>${esc(info.note)}</p>
+      <pre class="snippet-box">${esc(info.code)}</pre>
+      <div id="connect-live-status" class="${
+        isConnected ? "connect-live-bar connect-live-ok" : "connect-live-bar"
+      }" role="status" aria-live="polite">
+        <div class="row-gap">
+          <span class="badge ${isConnected ? "badge-ok" : "badge-warn"}">${
+            isConnected ? "Conectado" : "Aguardando"
+          }</span>
+          <span>${esc(liveMsg)}</span>
+        </div>
+      </div>
+      <div class="row-gap">
+        <button type="button" id="btn-connect-test-event" data-primary-cta="true" ${
+          state.connectSendingTest ? "disabled" : ""
+        }>${state.connectSendingTest ? "Enviando evento..." : "Enviar Evento de Teste Agora"}</button>
+      </div>
+    </div>`;
+
+  bindCopyButtons(bodyEl);
+
+  bodyEl.querySelectorAll<HTMLButtonElement>("[data-connect-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.connectStackTab = btn.dataset.connectTab || "web";
+      renderConnectAppBody();
+    });
+  });
+
+  document.getElementById("chk-connect-tunnel")?.addEventListener("change", async (e) => {
+    const chk = e.currentTarget as HTMLInputElement;
+    if (chk.checked && !proj.tunnel_slug) {
+      chk.disabled = true;
+      const res = await apiFetch<{ tunnel_slug?: string }>(
+        `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/tunnel/`,
+        { method: "POST", body: {} }
+      );
+      if (res.ok) {
+        await loadCurrentTabData();
+        const refreshed = state.projects.find((p) => p.id === proj.id);
+        state.connectOptTunnel = Boolean(refreshed?.tunnel_slug);
+        showToast("Tunnel Anti-AdBlock ativado");
+        renderMainPane();
+      } else {
+        state.connectOptTunnel = false;
+        showToast(res.error || "Falha ao ativar tunnel");
+      }
+    } else {
+      state.connectOptTunnel = chk.checked;
+    }
+    renderConnectAppBody();
+  });
+
+  document.getElementById("chk-connect-shield")?.addEventListener("change", (e) => {
+    state.connectOptShield = (e.currentTarget as HTMLInputElement).checked;
+    renderConnectAppBody();
+  });
+
+  document.getElementById("chk-connect-fetch")?.addEventListener("change", (e) => {
+    state.connectOptFetch = (e.currentTarget as HTMLInputElement).checked;
+    renderConnectAppBody();
+  });
+
+  document.getElementById("chk-connect-sri")?.addEventListener("change", (e) => {
+    state.connectOptSri = (e.currentTarget as HTMLInputElement).checked;
+    renderConnectAppBody();
+  });
+
+  document.getElementById("btn-connect-test-event")?.addEventListener("click", async () => {
+    state.connectSendingTest = true;
+    const btn = document.getElementById("btn-connect-test-event") as HTMLButtonElement | null;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Enviando evento...";
+    }
+    const res = await apiFetch<{ ok: boolean; event_id?: string }>(
+      `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/test-event/`,
+      { method: "POST", body: {} }
+    );
+    state.connectSendingTest = false;
+    if (!res.ok) {
+      showToast(res.error || "Falha ao enviar evento de teste");
+      renderConnectAppBody();
+      return;
+    }
+    showToast("Evento de teste enviado!");
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Enviar Evento de Teste Agora";
+    }
+  });
+}
+
+async function openConnectAppModal(projectId?: number): Promise<void> {
+  if (!state.sdkMeta) {
+    await refreshSdkMeta();
+  }
+  const target =
+    state.projects.find((p) => p.id === projectId) || state.projects[0] || null;
+  if (!target) {
+    showToast("Crie um projeto primeiro");
+    await switchTab("projects");
+    return;
+  }
+  state.connectProjectId = target.id;
+  state.connectOptTunnel = Boolean(target.tunnel_slug);
+  state.connectLiveState = "waiting";
+  state.connectLiveDetail = "";
+  state.connectSendingTest = false;
+  renderConnectAppBody();
+  startConnectSse(target.id);
+  const dlg = document.getElementById("dlg-connect-app") as HTMLDialogElement | null;
+  if (dlg) openDialog(dlg);
+}
+
 function bindMainPaneHandlers(mainPane: HTMLElement): void {
   bindCopyButtons(mainPane);
   bindTraceOpenButtons(mainPane);
 
   // Issues tab handlers
+  document.getElementById("btn-empty-connect-app")?.addEventListener("click", () => {
+    void openConnectAppModal(state.projects[0]?.id);
+  });
+  document.getElementById("btn-empty-go-projects")?.addEventListener("click", () => {
+    void switchTab("projects");
+  });
+
   document.getElementById("btn-refresh-issues")?.addEventListener("click", async () => {
     const inp = document.getElementById("issue-search-input") as HTMLInputElement | null;
     if (inp) state.issueSearch = inp.value;
@@ -2825,6 +3213,12 @@ function bindMainPaneHandlers(mainPane: HTMLElement): void {
   mainPane.querySelectorAll<HTMLButtonElement>("[data-open-proj-settings]").forEach((btn) => {
     btn.addEventListener("click", () => {
       openProjectSettingsDialog(Number(btn.dataset.openProjSettings));
+    });
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-connect-app]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      void openConnectAppModal(Number(btn.dataset.connectApp));
     });
   });
 
