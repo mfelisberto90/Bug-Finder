@@ -3486,3 +3486,314 @@ async fn alerts_telegram_discord_and_oidc_flow_test() {
     let _ = std::net::TcpStream::connect(("127.0.0.1", idp_port));
     let _ = idp_thread.join();
 }
+
+#[tokio::test]
+async fn onboarding_corp_sri_test_event_and_cli_wrap_pipe_test() {
+    use base64::Engine as _;
+
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+
+    // 1. Cross-Origin-Resource-Policy scoping + CORS + exact SHA-384 SRI match
+    let (mini_st, mini_hdrs, mini_bytes) =
+        send_raw(&router, "GET", "/sdk/bugfinder-mini.js", &[], Vec::new()).await;
+    assert_eq!(mini_st, StatusCode::OK);
+    assert_eq!(
+        mini_hdrs
+            .get("cross-origin-resource-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin")
+    );
+    assert_eq!(
+        mini_hdrs
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    let mini_txt = String::from_utf8_lossy(&mini_bytes);
+    assert!(
+        mini_txt.contains("document.currentScript"),
+        "mini SDK should include 1-tag currentScript auto-boot"
+    );
+
+    let (shield_st, shield_hdrs, shield_bytes) =
+        send_raw(&router, "GET", "/sdk/bugfinder-shield.js", &[], Vec::new()).await;
+    assert_eq!(shield_st, StatusCode::OK);
+    assert_eq!(
+        shield_hdrs
+            .get("cross-origin-resource-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin")
+    );
+    assert_eq!(
+        shield_hdrs
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+
+    // Non-SDK / authenticated dashboard paths must remain strictly same-origin
+    for private_path in [
+        "/",
+        "/api/auth/me",
+        "/api/0/sdk-meta/",
+        "/api/0/organizations/alpha/issues/",
+    ] {
+        let (_, hdrs, _) = send_raw(
+            &router,
+            "GET",
+            private_path,
+            &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            hdrs.get("cross-origin-resource-policy")
+                .and_then(|v| v.to_str().ok()),
+            Some("same-origin"),
+            "private path {private_path} leaked cross-origin CORP"
+        );
+    }
+
+    // Verify unauthenticated access to sdk-meta fails closed with 401
+    let (unauth_meta_st, _, _) =
+        send_raw(&router, "GET", "/api/0/sdk-meta/", &[], Vec::new()).await;
+    assert_eq!(unauth_meta_st, StatusCode::UNAUTHORIZED);
+
+    let (meta_st, _, meta_raw) = send_raw(
+        &router,
+        "GET",
+        "/api/0/sdk-meta/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(meta_st, StatusCode::OK);
+    let meta_json: Value = serde_json::from_slice(&meta_raw).unwrap();
+
+    let calc_sri = |bytes: &[u8]| -> String {
+        let d = ring::digest::digest(&ring::digest::SHA384, bytes);
+        format!(
+            "sha384-{}",
+            base64::engine::general_purpose::STANDARD.encode(d.as_ref())
+        )
+    };
+    assert_eq!(
+        meta_json["mini_sdk_sri"].as_str(),
+        Some(calc_sri(&mini_bytes).as_str())
+    );
+    assert_eq!(
+        meta_json["shield_sdk_sri"].as_str(),
+        Some(calc_sri(&shield_bytes).as_str())
+    );
+
+    // 2. Test-event endpoint auth, RBAC, 404, 202, and rate limit
+    let (unauth_ev_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/rolelane/test-event/",
+        &[],
+        json!({}),
+    )
+    .await;
+    assert_eq!(unauth_ev_st, StatusCode::UNAUTHORIZED);
+
+    let (tok_st, _, tok_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+        ],
+        json!({ "name": "ViewerRO", "role": "viewer", "scopes": ["event:read", "event:write"] }),
+    )
+    .await;
+    assert_eq!(tok_st, StatusCode::CREATED);
+    let viewer_tok = tok_body["token"].as_str().unwrap().to_string();
+    let viewer_auth = format!("Bearer {viewer_tok}");
+
+    let (forb_ev_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/rolelane/test-event/",
+        &[(header::AUTHORIZATION.as_str(), viewer_auth.as_str())],
+        json!({}),
+    )
+    .await;
+    assert_eq!(forb_ev_st, StatusCode::FORBIDDEN);
+
+    let (nf_ev_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/nonexistent/test-event/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(nf_ev_st, StatusCode::NOT_FOUND);
+
+    let (ok_ev_st, _, ok_ev_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/rolelane/test-event/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(ok_ev_st, StatusCode::ACCEPTED);
+    assert_eq!(ok_ev_body["ok"].as_bool(), Some(true));
+    assert_eq!(ok_ev_body["project_id"].as_i64(), Some(project_id));
+
+    // Rate limit check (1 slot consumed by 404 lookup + 1 by 202 above -> 8 remaining of 10 allowed; 11th hits 429)
+    for _ in 0..8 {
+        let (st, _, _) = send_json(
+            &router,
+            "POST",
+            "/api/0/projects/alpha/rolelane/test-event/",
+            &[
+                (header::COOKIE.as_str(), owner_cookie.as_str()),
+                ("x-csrf-token", owner_csrf.as_str()),
+            ],
+            json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+    }
+    let (rl_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/rolelane/test-event/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(rl_st, StatusCode::TOO_MANY_REQUESTS);
+
+    // 3. Spin up real live TCP Axum server to verify CLI `wrap` & `pipe` end-to-end
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_router = router.clone();
+    let srv_handle = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            srv_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let live_dsn = format!("http://{dsn_key}@127.0.0.1:{}/{project_id}", addr.port());
+
+    let wrap_dsn = live_dsn.clone();
+    let wrap_code = tokio::task::spawn_blocking(move || {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo '0 errors found' >&2; echo 'Authorization: Bearer tok_wrap_secret_999' >&2; echo 'Traceback (most recent call last):' >&2; echo 'RuntimeError: boom' >&2; exit 7".to_string(),
+        ];
+        bugfinder::cli_integrate::run_wrap_cli(
+            &wrap_dsn,
+            Some("worker-svc"),
+            "production",
+            false,
+            None,
+            &cmd,
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(wrap_code, 7, "wrap must forward exact child exit code");
+
+    let pipe_dsn = live_dsn.clone();
+    tokio::task::spawn_blocking(move || {
+        let input = "\
+0 errors reported\n\
+completed with no error\n\
+127.0.0.1 - \"GET /api/errors 200 10ms\"\n\
+ErrorHandler initialized\n\
+metric: error_count=0\n\
+PHP Fatal error: Call to undefined foo()\n";
+        bugfinder::cli_integrate::run_pipe_reader(
+            std::io::Cursor::new(input.as_bytes()),
+            &pipe_dsn,
+            Some("php-cron"),
+            "production",
+        )
+        .unwrap();
+    })
+    .await
+    .unwrap();
+
+    state.batch_writer.flush_now().await;
+
+    // Fetch issues & logs and assert zero false positives + zero secret leaks
+    let (iss_st, _, iss_raw) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?limit=50",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(iss_st, StatusCode::OK);
+    let issues: Vec<Value> = serde_json::from_slice(&iss_raw).unwrap();
+    let titles: Vec<String> = issues
+        .iter()
+        .filter_map(|i| i["title"].as_str().map(ToString::to_string))
+        .collect();
+    assert_eq!(
+        issues.len(),
+        3,
+        "Expected exactly 3 issues (test-event + wrap RuntimeError + pipe PHP Fatal), got: {titles:?}"
+    );
+    assert!(titles.iter().any(|t| t.contains("BugFinderOnboardingTest")));
+    assert!(titles.iter().any(|t| t.contains("RuntimeError: boom")));
+    assert!(titles.iter().any(|t| t.contains("PHP Fatal error: Call to undefined foo()")));
+    assert!(
+        !titles.iter().any(|t| t.contains("0 errors") || t.contains("ErrorHandler")),
+        "Benign lines must never create Issues: {titles:?}"
+    );
+
+    let (logs_st, _, logs_raw) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/logs/?limit=100",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(logs_st, StatusCode::OK);
+    let logs_txt = String::from_utf8_lossy(&logs_raw);
+    assert!(
+        !logs_txt.contains("tok_wrap_secret_999"),
+        "wrap CLI must scrub secrets locally before sending over the wire"
+    );
+    for it in &issues {
+        let iid = it["id"].as_i64().unwrap();
+        let (_, _, ev_raw) = send_raw(
+            &router,
+            "GET",
+            &format!("/api/0/organizations/alpha/issues/{iid}/events/latest/"),
+            &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+            Vec::new(),
+        )
+        .await;
+        let ev_txt = String::from_utf8_lossy(&ev_raw);
+        assert!(
+            !ev_txt.contains("tok_wrap_secret_999"),
+            "stored event breadcrumbs must never leak scrubbed token"
+        );
+    }
+
+    srv_handle.abort();
+}

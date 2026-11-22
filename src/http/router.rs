@@ -8,10 +8,13 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use flate2::read::GzDecoder;
+use ring::digest::{digest, SHA384};
 use serde_json::json;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod embedded_ui {
     include!(concat!(env!("OUT_DIR"), "/embedded_ui.rs"));
@@ -127,26 +130,51 @@ fn serve_precompressed_bytes(
     resp
 }
 
+fn gunzip_sri_sha384(gz: &[u8]) -> String {
+    let mut dec = GzDecoder::new(gz);
+    let mut raw = Vec::with_capacity(gz.len() * 3);
+    dec.read_to_end(&mut raw).expect("embedded SDK gzip valid");
+    let d = digest(&SHA384, &raw);
+    format!("sha384-{}", STANDARD.encode(d.as_ref()))
+}
+
+pub fn sdk_sri_hashes() -> (&'static str, &'static str) {
+    static SRI: OnceLock<(String, String)> = OnceLock::new();
+    let pair = SRI.get_or_init(|| {
+        (
+            gunzip_sri_sha384(embedded_ui::MINI_SDK_JS_GZ),
+            gunzip_sri_sha384(embedded_ui::SHIELD_SDK_JS_GZ),
+        )
+    });
+    (&pair.0, &pair.1)
+}
+
 async fn mini_sdk_js(headers: HeaderMap) -> Response {
-    serve_precompressed_bytes(
+    let mut resp = serve_precompressed_bytes(
         &headers,
         embedded_ui::MINI_SDK_JS_GZ,
         true,
         "application/javascript; charset=utf-8",
         embedded_ui::MINI_SDK_ETAG,
         Some("public, max-age=300"),
-    )
+    );
+    resp.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
 }
 
 async fn shield_sdk_js(headers: HeaderMap) -> Response {
-    serve_precompressed_bytes(
+    let mut resp = serve_precompressed_bytes(
         &headers,
         embedded_ui::SHIELD_SDK_JS_GZ,
         true,
         "application/javascript; charset=utf-8",
         embedded_ui::SHIELD_SDK_ETAG,
         Some("public, max-age=300"),
-    )
+    );
+    resp.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
 }
 
 async fn prometheus_metrics(
@@ -315,8 +343,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/0/organizations/:org/self-check/probe/", post(api_v0::run_self_check_probe))
         .route("/api/0/organizations/:org/self-check/ack/", post(api_v0::ack_self_check_errors))
         .route("/api/0/organizations/", get(api_v0::list_organizations))
+        .route("/api/0/sdk-meta/", get(api_v0::get_sdk_meta))
         .route("/api/0/organizations/:org/projects/", get(api_v0::list_projects).post(api_v0::create_project))
         .route("/api/0/projects/:org/:proj/settings/", put(api_v0::update_project_settings))
+        .route("/api/0/projects/:org/:proj/test-event/", post(api_v0::send_project_test_event))
         .route("/api/0/projects/:org/:proj/keys/", get(api_v0::list_project_keys).post(api_v0::create_project_key))
         .route(
             "/api/0/projects/:org/:proj/keys/:key_id/",

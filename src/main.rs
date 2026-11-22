@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use bugfinder::cli_integrate::{run_init_cli, run_pipe_cli, run_wrap_cli};
 use bugfinder::config::{parse_cli_args, AppConfig, CliCommand};
 use bugfinder::http::router::build_router;
 use bugfinder::mcp::{run_mcp_stdio, run_synthetic_test, run_tail_cli};
@@ -38,6 +39,9 @@ fn main() -> ExitCode {
                 "Bug-Finder v{}\n\n\
                  USAGE:\n  \
                    bugfinder [--headless | --app] [--bind ADDR] [--data DIR] [--db URL]\n  \
+                   bugfinder init --dsn DSN [--dir PATH] [--stack auto|web|node|next|vite|python|laravel|go|rust] [--sdk zero-dep|sentry]\n  \
+                   bugfinder wrap --dsn DSN [--service NAME] [--heartbeat-url URL] -- CMD...\n  \
+                   bugfinder pipe --dsn DSN [--service NAME]\n  \
                    bugfinder migrate [--data DIR] [--db URL]\n  \
                    bugfinder backup --out FILE [--data DIR]\n  \
                    bugfinder doctor [--url URL] [--data DIR] [--db URL] [--json]\n  \
@@ -186,6 +190,53 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("test-log error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        CliCommand::Init {
+            dir,
+            dsn,
+            stack,
+            sdk,
+            dry_run,
+            force,
+            no_test,
+        } => match run_init_cli(&dir, &dsn, &stack, &sdk, dry_run, force, no_test) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("init error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        CliCommand::Wrap {
+            dsn,
+            service,
+            env_name,
+            capture_stdout,
+            heartbeat_url,
+            cmd,
+        } => match run_wrap_cli(
+            &dsn,
+            service.as_deref(),
+            &env_name,
+            capture_stdout,
+            heartbeat_url.as_deref(),
+            &cmd,
+        ) {
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(e) => {
+                eprintln!("wrap error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        CliCommand::Pipe {
+            dsn,
+            service,
+            env_name,
+        } => match run_pipe_cli(&dsn, service.as_deref(), &env_name) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("pipe error: {e}");
                 ExitCode::FAILURE
             }
         },

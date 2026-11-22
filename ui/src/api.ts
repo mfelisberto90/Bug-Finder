@@ -15,6 +15,12 @@ export interface AuthStatus {
   oidc_name?: string;
 }
 
+export interface SdkMeta {
+  version: string;
+  mini_sdk_sri: string;
+  shield_sdk_sri: string;
+}
+
 export interface Organization {
   id: number;
   slug: string;

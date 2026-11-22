@@ -1,9 +1,13 @@
 (function (root) {
   "use strict";
 
+  var origFetch = typeof root.fetch === "function" ? root.fetch : null;
+  var curScript = typeof document !== "undefined" ? document.currentScript : null;
+
   var cfg = {
     endpoint: "",
     dsnKey: "",
+    rawDsn: "",
     release: "",
     environment: "production",
     maxBreadcrumbs: 50,
@@ -12,8 +16,22 @@
     breadcrumbs: [],
     logBuffer: [],
     flushTimer: null,
-    initialized: false
+    initialized: false,
+    fetchWrapped: false,
+    consoleWrapped: false,
+    inConsole: false
   };
+
+  function isOwnTelemetryUrl(rawUrl) {
+    try {
+      var s = String(rawUrl || "");
+      if (!s) return false;
+      if (cfg.endpoint && s.indexOf(cfg.endpoint) !== -1) return true;
+      return /\/api\/\d+\/(?:envelope|store|security|shield|otlp\/v1\/logs)\b/.test(s);
+    } catch (_) {
+      return false;
+    }
+  }
 
   function parseDsn(dsn) {
     try {
@@ -85,8 +103,8 @@
           : body;
         if (navigator.sendBeacon(url, blob)) return;
       }
-      if (typeof fetch === "function") {
-        fetch(url, {
+      if (origFetch) {
+        origFetch.call(root, url, {
           method: "POST",
           body: body,
           keepalive: true,
@@ -189,6 +207,86 @@
     }
   }
 
+  function installFetchCapture() {
+    if (cfg.fetchWrapped || !origFetch || typeof root.fetch !== "function") return;
+    cfg.fetchWrapped = true;
+    root.fetch = function (input, initOpts) {
+      var urlStr = typeof input === "string" ? input : (input && input.url) || "";
+      if (isOwnTelemetryUrl(urlStr)) {
+        return origFetch.apply(root, arguments);
+      }
+      var method = ((initOpts && initOpts.method) || (input && input.method) || "GET").toUpperCase();
+      var safePath = urlStr.split("?")[0].slice(0, 200);
+      return origFetch.apply(root, arguments).then(
+        function (resp) {
+          addBreadcrumb({
+            type: "http",
+            category: "fetch",
+            level: resp && resp.status >= 500 ? "error" : "info",
+            message: method + " " + safePath + " -> " + (resp ? resp.status : 0)
+          });
+          if (resp && resp.status >= 500) {
+            captureException(new Error("HTTP " + resp.status + " on " + method + " " + safePath), {
+              http_status: resp.status,
+              http_method: method
+            });
+          }
+          return resp;
+        },
+        function (err) {
+          if (err && err.name === "AbortError") {
+            throw err;
+          }
+          addBreadcrumb({
+            type: "http",
+            category: "fetch",
+            level: "error",
+            message: method + " " + safePath + " failed"
+          });
+          captureException(err instanceof Error ? err : new Error("Network failure on " + method + " " + safePath));
+          throw err;
+        }
+      );
+    };
+  }
+
+  function installConsoleCapture(modeStr) {
+    if (cfg.consoleWrapped || typeof console === "undefined") return;
+    cfg.consoleWrapped = true;
+    var parts = String(modeStr || "").toLowerCase().split(",");
+    var capWarn = parts.indexOf("warn") !== -1;
+    var origErr = typeof console.error === "function" ? console.error.bind(console) : null;
+    var origWarn = capWarn && typeof console.warn === "function" ? console.warn.bind(console) : null;
+    function formatArgs(args) {
+      var out = [];
+      for (var i = 0; i < args.length; i++) {
+        var a = args[i];
+        out.push(a instanceof Error ? a.name + ": " + a.message : typeof a === "object" ? "[object]" : String(a));
+      }
+      return out.join(" ").slice(0, 800);
+    }
+    if (origErr) {
+      console.error = function () {
+        if (!cfg.inConsole) {
+          cfg.inConsole = true;
+          try { pushLog("error", formatArgs(arguments), { source: "console.error" }); } catch (_) {}
+          cfg.inConsole = false;
+        }
+        return origErr.apply(console, arguments);
+      };
+    }
+    if (origWarn) {
+      console.warn = function () {
+        if (!cfg.inConsole) {
+          cfg.inConsole = true;
+          try { pushLog("warn", formatArgs(arguments), { source: "console.warn" }); } catch (_) {}
+          cfg.inConsole = false;
+        }
+        return origWarn.apply(console, arguments);
+      };
+    }
+  }
+
   function init(options) {
     options = options || {};
     cfg.rawDsn = options.dsn || "";
@@ -205,6 +303,9 @@
     cfg.release = options.release || "";
     cfg.environment = options.environment || "production";
     cfg.maxBreadcrumbs = options.maxBreadcrumbs || 50;
+
+    if (options.captureFetch) installFetchCapture();
+    if (options.captureConsole) installConsoleCapture(options.captureConsole);
 
     if (typeof window !== "undefined" && !cfg.initialized) {
       cfg.initialized = true;
@@ -247,4 +348,45 @@
       fatal: function (m, a) { pushLog("fatal", m, a); }
     }
   };
+
+  // Zero-inline 1-tag auto-boot via <script src=".../sdk/bugfinder-mini.js" data-dsn="..." async>
+  try {
+    if (curScript && curScript.dataset) {
+      var ds = curScript.dataset;
+      if (ds.dsn || ds.tunnel) {
+        var capFetch = ds.captureFetch === "true";
+        init({
+          dsn: ds.dsn || "",
+          tunnel: ds.tunnel || "",
+          environment: ds.env || "production",
+          release: ds.release || "",
+          captureFetch: capFetch,
+          captureConsole: ds.captureConsole || ""
+        });
+        var shieldMode = ds.shield || "";
+        if (
+          (shieldMode === "detect" || shieldMode === "defend" || shieldMode === "lockdown") &&
+          curScript.src &&
+          typeof document !== "undefined"
+        ) {
+          var sTag = document.createElement("script");
+          sTag.src = new URL("/sdk/bugfinder-shield.js", curScript.src).toString();
+          sTag.async = true;
+          if (curScript.nonce) sTag.nonce = curScript.nonce;
+          if (curScript.crossOrigin) sTag.crossOrigin = "anonymous";
+          if (ds.shieldSri) sTag.integrity = ds.shieldSri;
+          sTag.onload = function () {
+            if (root.BugFinderShield && typeof root.BugFinderShield.init === "function") {
+              root.BugFinderShield.init({
+                dsn: ds.dsn || "",
+                mode: shieldMode,
+                allowFetchPatching: capFetch
+              });
+            }
+          };
+          (document.head || document.documentElement).appendChild(sTag);
+        }
+      }
+    }
+  } catch (_) {}
 })(typeof globalThis !== "undefined" ? globalThis : window);

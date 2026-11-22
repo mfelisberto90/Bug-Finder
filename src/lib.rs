@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod alerts;
+pub mod cli_integrate;
 pub mod config;
 pub mod domain;
 pub mod http;

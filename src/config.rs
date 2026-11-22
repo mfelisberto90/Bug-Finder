@@ -29,6 +29,28 @@ pub enum CliCommand {
     },
     TestEvent { dsn: String },
     TestLog { dsn: String },
+    Init {
+        dir: PathBuf,
+        dsn: String,
+        stack: String,
+        sdk: String,
+        dry_run: bool,
+        force: bool,
+        no_test: bool,
+    },
+    Wrap {
+        dsn: String,
+        service: Option<String>,
+        env_name: String,
+        capture_stdout: bool,
+        heartbeat_url: Option<String>,
+        cmd: Vec<String>,
+    },
+    Pipe {
+        dsn: String,
+        service: Option<String>,
+        env_name: String,
+    },
     Version,
     Help,
 }
@@ -694,6 +716,121 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 };
                 return Ok(ParsedArgs {
                     command,
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "init" => {
+                let mut dir = PathBuf::from(".");
+                let mut dsn = env::var("BUGFINDER_DSN").unwrap_or_default();
+                let mut stack = "auto".to_string();
+                let mut sdk = "zero-dep".to_string();
+                let mut dry_run = false;
+                let mut force = false;
+                let mut no_test = false;
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--dir" => { j += 1; dir = PathBuf::from(args.get(j).ok_or("--dir requires value")?); }
+                        "--dsn" => { j += 1; dsn = args.get(j).cloned().ok_or("--dsn requires value")?; }
+                        "--stack" => { j += 1; stack = args.get(j).cloned().ok_or("--stack requires value")?; }
+                        "--sdk" => { j += 1; sdk = args.get(j).cloned().ok_or("--sdk requires value")?; }
+                        "--dry-run" => dry_run = true,
+                        "--force" => force = true,
+                        "--no-test" => no_test = true,
+                        other => return Err(format!("Unknown init option: {other}")),
+                    }
+                    j += 1;
+                }
+                if dsn.trim().is_empty() {
+                    return Err("init requires --dsn <url> (or BUGFINDER_DSN env var)".into());
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Init {
+                        dir,
+                        dsn,
+                        stack,
+                        sdk,
+                        dry_run,
+                        force,
+                        no_test,
+                    },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "wrap" => {
+                let mut dsn = env::var("BUGFINDER_DSN").unwrap_or_default();
+                let mut service = None;
+                let mut env_name = "production".to_string();
+                let mut capture_stdout = false;
+                let mut heartbeat_url = None;
+                let mut cmd = Vec::new();
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--" => {
+                            cmd.extend(args[j + 1..].iter().cloned());
+                            break;
+                        }
+                        "--dsn" => { j += 1; dsn = args.get(j).cloned().ok_or("--dsn requires value")?; }
+                        "--service" => { j += 1; service = Some(args.get(j).cloned().ok_or("--service requires value")?); }
+                        "--env" => { j += 1; env_name = args.get(j).cloned().ok_or("--env requires value")?; }
+                        "--capture-stdout" => capture_stdout = true,
+                        "--heartbeat-url" => { j += 1; heartbeat_url = Some(args.get(j).cloned().ok_or("--heartbeat-url requires value")?); }
+                        other if !other.starts_with('-') => {
+                            cmd.extend(args[j..].iter().cloned());
+                            break;
+                        }
+                        other => return Err(format!("Unknown wrap option: {other}")),
+                    }
+                    j += 1;
+                }
+                if dsn.trim().is_empty() {
+                    return Err("wrap requires --dsn <url> (or BUGFINDER_DSN env var)".into());
+                }
+                if cmd.is_empty() {
+                    return Err("wrap requires a command after '--'".into());
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Wrap {
+                        dsn,
+                        service,
+                        env_name,
+                        capture_stdout,
+                        heartbeat_url,
+                        cmd,
+                    },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "pipe" => {
+                let mut dsn = env::var("BUGFINDER_DSN").unwrap_or_default();
+                let mut service = None;
+                let mut env_name = "production".to_string();
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--dsn" => { j += 1; dsn = args.get(j).cloned().ok_or("--dsn requires value")?; }
+                        "--service" => { j += 1; service = Some(args.get(j).cloned().ok_or("--service requires value")?); }
+                        "--env" => { j += 1; env_name = args.get(j).cloned().ok_or("--env requires value")?; }
+                        other => return Err(format!("Unknown pipe option: {other}")),
+                    }
+                    j += 1;
+                }
+                if dsn.trim().is_empty() {
+                    return Err("pipe requires --dsn <url> (or BUGFINDER_DSN env var)".into());
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Pipe {
+                        dsn,
+                        service,
+                        env_name,
+                    },
                     bind_override: None,
                     data_override: None,
                     db_override: None,

@@ -2725,3 +2725,154 @@ pub async fn revoke_invitation(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
 }
+
+pub async fn get_sdk_meta(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    if let Err(r) = authenticate_api_tenant(&state, &headers, &method, None).await {
+        return r;
+    }
+    let (mini_sri, shield_sri) = crate::http::router::sdk_sri_hashes();
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "mini_sdk_sri": mini_sri,
+        "shield_sdk_sri": shield_sri,
+    }))
+    .into_response()
+}
+
+pub async fn send_project_test_event(
+    State(state): State<Arc<AppState>>,
+    Path((org, proj)): Path<(String, String)>,
+    headers: HeaderMap,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_scope(&ctx, "event:write") {
+        return r;
+    }
+    if !ctx.role.can_mutate_issues() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Viewers cannot send test events" })),
+        )
+            .into_response();
+    }
+    let client_ip = resolve_client_ip(&headers, IpAddr::V4(Ipv4Addr::LOCALHOST), &state.config);
+    let bucket_key = format!("{}:{}", ctx.organization_id, client_ip);
+    let dec = state.rate_limiter.check_and_record(
+        "project_test_event",
+        &bucket_key,
+        10,
+        Duration::from_secs(60),
+    );
+    if !dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many test events; wait a moment", "retry_after": dec.retry_after_sec })),
+        )
+            .into_response();
+    }
+
+    let projects = match state.storage.list_projects(&ctx).await {
+        Ok(list) => list,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    };
+    let Some(project) = projects.into_iter().find(|p| p.slug == proj) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Project not found" }))).into_response();
+    };
+
+    let event_id = uuid::Uuid::new_v4().simple().to_string();
+    let now_s = chrono::Utc::now().timestamp() as f64;
+    let payload = json!({
+        "event_id": event_id,
+        "timestamp": now_s,
+        "platform": if project.platform.is_empty() { "other" } else { project.platform.as_str() },
+        "level": "info",
+        "environment": "onboarding",
+        "culprit": "bugfinder::wizard::test_event",
+        "exception": {
+            "values": [{
+                "type": "BugFinderOnboardingTest",
+                "value": format!("Connection verified for {}", project.name),
+                "stacktrace": {
+                    "frames": [{
+                        "filename": "onboarding/wizard.rs",
+                        "function": "send_project_test_event",
+                        "lineno": 1,
+                        "in_app": true
+                    }]
+                }
+            }]
+        }
+    });
+    let meta = crate::domain::fingerprint::extract_issue_metadata(&payload);
+    let payload_json = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let received_ms = now_ms();
+    let auth = ProjectAuthInfo {
+        project_id: project.id,
+        organization_id: ctx.organization_id,
+        organization_slug: ctx.organization_slug.clone(),
+        project_slug: project.slug.clone(),
+        first_event_at: project.first_event_at,
+        rate_limit_per_min: 1000,
+        filters: project.filters,
+        org_scrub_ip_addresses: false,
+        org_event_throttle_rate: 0,
+    };
+
+    let live_ev = LiveStreamEvent {
+        organization_id: ctx.organization_id,
+        project_id: project.id,
+        kind: "issue".into(),
+        level: meta.level.clone(),
+        title_or_body: meta.title.clone(),
+        service: project.slug.clone(),
+        environment: meta.environment.clone(),
+        trace_id: meta.trace_id.clone(),
+        timestamp_ms: received_ms,
+        payload: json!({
+            "event_id": event_id,
+            "culprit": meta.culprit,
+            "release": meta.release,
+        }),
+    };
+
+    if state
+        .batch_writer
+        .try_enqueue(crate::storage::IngestWriteItem::Event {
+            auth,
+            meta,
+            payload_json,
+            received_ms,
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Ingestion queue saturated" })),
+        )
+            .into_response();
+    }
+
+    state
+        .metrics
+        .ingest_events_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = state.live_tx.send(live_ev);
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "event_id": event_id,
+            "project_id": project.id,
+        })),
+    )
+        .into_response()
+}
