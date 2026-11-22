@@ -9,6 +9,12 @@ export interface UserInfo {
   reauth_fresh?: boolean;
 }
 
+export interface AuthStatus {
+  needs_setup: boolean;
+  oidc_enabled?: boolean;
+  oidc_name?: string;
+}
+
 export interface Organization {
   id: number;
   slug: string;

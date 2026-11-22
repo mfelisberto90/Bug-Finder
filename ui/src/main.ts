@@ -7,6 +7,7 @@ import {
   type ActiveSessionItem,
   type AlertRule,
   type ApiTokenItem,
+  type AuthStatus,
   type AuditLogItem,
   type AuditVerifyResult,
   type InvitationItem,
@@ -58,6 +59,8 @@ const ALL_TOKEN_SCOPES = [
 interface AppStateModel {
   loading: boolean;
   needsSetup: boolean;
+  oidcEnabled: boolean;
+  oidcName: string;
   user: UserInfo | null;
   orgSlug: string;
   orgs: Organization[];
@@ -124,6 +127,8 @@ function parseInviteTokenFromUrl(): string | null {
 const state: AppStateModel = {
   loading: true,
   needsSetup: false,
+  oidcEnabled: false,
+  oidcName: "",
   user: null,
   orgSlug: "",
   orgs: [],
@@ -468,8 +473,10 @@ async function boot(): Promise<void> {
     render();
     return;
   }
-  const st = await apiFetch<{ needs_setup: boolean }>("/api/auth/status");
+  const st = await apiFetch<AuthStatus>("/api/auth/status");
   state.needsSetup = Boolean(st.data?.needs_setup);
+  state.oidcEnabled = Boolean(st.data?.oidc_enabled);
+  state.oidcName = st.data?.oidc_name || "";
   state.loading = false;
   render();
 }
@@ -865,6 +872,11 @@ function renderAuthScreen(): string {
         </form>
         <div class="divider-row">ou</div>
         <button type="button" id="btn-passkey-login">Entrar com Passkey</button>
+        ${
+          state.oidcEnabled
+            ? `<a class="nav-link" href="/api/auth/oidc/login">Sign in with ${esc(state.oidcName || "SSO")}</a>`
+            : ""
+        }
       </section>
     </main>
     <div id="auth-selfcheck-slot">${errBanner}</div>`;
@@ -1081,7 +1093,17 @@ function renderUptimeTab(): string {
   const alertRows = state.alerts.length
     ? state.alerts
         .map((a) => {
-          const target = a.channel_type === "email" ? a.email_to : a.target_url;
+          const target =
+            a.channel_type === "email"
+              ? a.email_to
+              : a.channel_type === "telegram"
+              ? a.target_url.replace(/^telegram:/, "")
+              : a.target_url;
+          const secretBadge = a.has_secret
+            ? a.channel_type === "telegram"
+              ? ' <span class="badge badge-muted">BOT AEAD</span>'
+              : ' <span class="badge badge-muted">HMAC</span>'
+            : "";
           const trig =
             a.trigger_type === "threshold"
               ? `${a.trigger_type} (>=${a.threshold_count}/${a.window_sec}s)`
@@ -1090,7 +1112,7 @@ function renderUptimeTab(): string {
           <tr>
             <th scope="row">${esc(a.name)}</th>
             <td data-label="Trigger">${esc(trig)}</td>
-            <td data-label="Channel">${esc(a.channel_type)}${a.has_secret ? ' <span class="badge badge-muted">HMAC</span>' : ""}</td>
+            <td data-label="Channel">${esc(a.channel_type)}${secretBadge}</td>
             <td data-label="Target" class="mono">${esc(target)}</td>
             <td data-label="Actions">
               <div class="row-gap">
@@ -3710,7 +3732,8 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
           <select id="cr-al-channel" name="channel_type">
             <option value="webhook">Webhook (JSON + HMAC)</option>
             <option value="slack">Slack Webhook</option>
-            <option value="discord">Discord Webhook</option>
+            <option value="discord">Discord Webhook (Rich Embeds)</option>
+            <option value="telegram">Telegram Bot (Chat ID + Bot Token)</option>
             <option value="email">Email (SMTP)</option>
           </select>
         </label>
@@ -3720,6 +3743,14 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
           </label>
           <label for="cr-al-secret">Webhook HMAC Secret (optional)
             <input id="cr-al-secret" name="webhook_secret" type="password" autocomplete="new-password" placeholder="Optional X-BugFinder-Signature secret">
+          </label>
+        </div>
+        <div id="cr-al-telegram-wrap" class="stack-col is-hidden">
+          <label for="cr-al-tg-chat">Telegram Chat ID or @channel
+            <input id="cr-al-tg-chat" name="tg_chat_id" type="text" autocomplete="off" spellcheck="false" pattern="^(@[A-Za-z][A-Za-z0-9_]{4,31}|-?[0-9]{5,20})$" placeholder="-1001234567890 or @ops_alerts">
+          </label>
+          <label for="cr-al-tg-token">Bot Token (encrypted at rest)
+            <input id="cr-al-tg-token" name="tg_bot_token" type="password" autocomplete="new-password" placeholder="123456789:AAH... (from @BotFather)">
           </label>
         </div>
         <div id="cr-al-email-wrap" class="stack-col is-hidden">
@@ -3740,14 +3771,29 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
 
     const chSel = document.getElementById("cr-al-channel") as HTMLSelectElement | null;
     const webWrap = document.getElementById("cr-al-webhook-wrap");
+    const tgWrap = document.getElementById("cr-al-telegram-wrap");
     const emailWrap = document.getElementById("cr-al-email-wrap");
     const urlInput = document.getElementById("cr-al-url") as HTMLInputElement | null;
+    const tgChatInput = document.getElementById("cr-al-tg-chat") as HTMLInputElement | null;
+    const tgTokenInput = document.getElementById("cr-al-tg-token") as HTMLInputElement | null;
     const emailInput = document.getElementById("cr-al-email") as HTMLInputElement | null;
     const syncChannel = () => {
-      const isEmail = chSel?.value === "email";
-      webWrap?.classList.toggle("is-hidden", isEmail);
+      const ch = chSel?.value || "webhook";
+      const isEmail = ch === "email";
+      const isTg = ch === "telegram";
+      const isWeb = !isEmail && !isTg;
+      webWrap?.classList.toggle("is-hidden", !isWeb);
+      tgWrap?.classList.toggle("is-hidden", !isTg);
       emailWrap?.classList.toggle("is-hidden", !isEmail);
-      if (urlInput) urlInput.required = !isEmail;
+      if (urlInput) {
+        urlInput.required = isWeb;
+        urlInput.placeholder =
+          ch === "discord"
+            ? "https://discord.com/api/webhooks/..."
+            : "https://hooks.slack.com/services/...";
+      }
+      if (tgChatInput) tgChatInput.required = isTg;
+      if (tgTokenInput) tgTokenInput.required = isTg;
       if (emailInput) emailInput.required = isEmail;
     };
     chSel?.addEventListener("change", syncChannel);
@@ -3763,12 +3809,18 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
     if (raw.threshold_count) raw.threshold_count = Number(raw.threshold_count);
     if (raw.window_sec) raw.window_sec = Number(raw.window_sec);
     if (kind === "alert") {
-      if (raw.channel_type === "email") {
+      if (raw.channel_type === "telegram") {
+        raw.target_url = String(raw.tg_chat_id || "").trim();
+        raw.webhook_secret = String(raw.tg_bot_token || "").trim();
+        delete raw.email_to;
+      } else if (raw.channel_type === "email") {
         delete raw.target_url;
         delete raw.webhook_secret;
       } else {
         delete raw.email_to;
       }
+      delete raw.tg_chat_id;
+      delete raw.tg_bot_token;
     }
     if (kind === "token") {
       const checkedScopes = Array.from(

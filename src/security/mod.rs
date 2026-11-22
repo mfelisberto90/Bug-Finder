@@ -5,6 +5,7 @@ pub mod csv;
 pub mod headers;
 pub mod metrics;
 pub mod mfa;
+pub mod oidc;
 pub mod ratelimit;
 pub mod ssrf;
 pub mod webauthn;

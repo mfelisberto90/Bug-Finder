@@ -914,6 +914,50 @@ async fn postgres_rls_live_isolation_test() {
         app_backend.list_quarantine(&ctx1, None).await.unwrap().is_empty(),
         "Expired shield_quarantine row must be deleted by run_maintenance"
     );
+
+    // 10. Non-owner (`bugfinder_app`) startup with run_migrations=true succeeds via bugfinder_schema_meta checksum skip
+    let app_pg_skip_check = PostgresStorage::connect_with_key(&app_url, true, [0u8; 32])
+        .await
+        .expect("bugfinder_app startup with bugfinder_schema_meta skip must succeed");
+    drop(app_pg_skip_check);
+
+    // 11. Telegram alert rule under FORCE RLS + AEAD storage + tenant isolation
+    let tg_bot_tok = "999999:pg_mock_tg_token_01"; // gitleaks:allow
+    let tg_rule = app_backend
+        .create_alert_rule(
+            &ctx1,
+            &bugfinder::storage::NewAlertRule {
+                project_id: proj1.id,
+                name: "PG Telegram Critical".into(),
+                trigger_type: "new_issue".into(),
+                threshold_count: 1,
+                window_sec: 60,
+                cooldown_sec: 60,
+                channel_type: "telegram".into(),
+                target_url: "telegram:-100123456".into(),
+                webhook_secret: tg_bot_tok.into(),
+                email_to: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(tg_rule.channel_type, "telegram");
+    assert_eq!(tg_rule.target_url, "telegram:-100123456");
+    assert!(tg_rule.has_secret);
+
+    let rules_org1 = app_backend.list_alert_rules(&ctx1).await.unwrap();
+    assert!(rules_org1.iter().any(|r| r.id == tg_rule.id && r.channel_type == "telegram"));
+
+    let ctx2 = bugfinder::domain::models::TenantCtx::from_session(
+        org2_id,
+        "pg-org-2".into(),
+        2,
+        bugfinder::domain::models::UserRole::Owner,
+        None,
+        None,
+    );
+    let rules_org2 = app_backend.list_alert_rules(&ctx2).await.unwrap();
+    assert!(rules_org2.is_empty(), "Org2 MUST NOT see Org1 telegram alert rules under FORCE RLS");
 }
 
 #[tokio::test]
@@ -1855,6 +1899,7 @@ async fn security_rbac_scopes_revocation_and_session_only_test() {
         )
         .unwrap();
     }
+    state.api_token_cache.invalidate_org(proj_ctx.organization_id);
     let (exp_st, _, _) = send_raw(
         &router,
         "GET",
@@ -2748,4 +2793,696 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
     .await;
     assert_eq!(tamp_b["valid"], false);
     assert!(tamp_b["broken_at_id"].as_i64().is_some());
+}
+
+#[tokio::test]
+async fn perf_cache_invalidation_compression_etag_and_backup_test() {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let (dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (cookie, csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let hdrs = [
+        (header::COOKIE.as_str(), cookie.as_str()),
+        ("x-csrf-token", csrf.as_str()),
+    ];
+
+    // 1. Positive DSN cache hit + immediate synchronous invalidation when key is deactivated
+    let (ck_st, _, ck_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/rolelane/keys/",
+        &hdrs,
+        json!({ "label": "Temp Edge Key" }),
+    )
+    .await;
+    assert_eq!(ck_st, StatusCode::CREATED);
+    let temp_key_id = ck_body["id"].as_i64().unwrap();
+    let temp_pub_key = ck_body["public_key"].as_str().unwrap().to_string();
+
+    let (ev_ok_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/?sentry_key={temp_pub_key}"),
+        &[],
+        json!({ "message": "warm dsn cache", "level": "info" }),
+    )
+    .await;
+    assert_eq!(ev_ok_st, StatusCode::OK);
+    let temp_key_sha = sha256_hex(temp_pub_key.as_bytes());
+    assert!(
+        state.dsn_auth_cache.get(project_id, &temp_key_sha).is_some(),
+        "Expected valid DSN key to populate DsnAuthCache"
+    );
+
+    let (uk_st, _, _) = send_json(
+        &router,
+        "PUT",
+        &format!("/api/0/projects/alpha/rolelane/keys/{temp_key_id}/"),
+        &hdrs,
+        json!({ "rate_limit_per_min": 600, "is_active": false }),
+    )
+    .await;
+    assert_eq!(uk_st, StatusCode::OK);
+    assert!(
+        state.dsn_auth_cache.get(project_id, &temp_key_sha).is_none(),
+        "Deactivating key MUST invalidate DsnAuthCache synchronously"
+    );
+
+    let (ev_revoked_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/store/?sentry_key={temp_pub_key}"),
+        &[],
+        json!({ "message": "should fail immediately" }),
+    )
+    .await;
+    assert_eq!(ev_revoked_st, StatusCode::UNAUTHORIZED);
+
+    // 2. Positive API token cache hit + immediate synchronous invalidation on delete_api_token
+    let (tok_st, _, tok_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &hdrs,
+        json!({ "name": "Perf Cache Token", "role": "admin", "scopes": ["event:read"] }),
+    )
+    .await;
+    assert_eq!(tok_st, StatusCode::CREATED);
+    let tok_id = tok_body["meta"]["id"].as_i64().unwrap();
+    let raw_tok = tok_body["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {raw_tok}");
+
+    let (iss_tok_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::AUTHORIZATION.as_str(), bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(iss_tok_st, StatusCode::OK);
+    let tok_sha = sha256_hex(raw_tok.as_bytes());
+    let now_s = chrono::Utc::now().timestamp();
+    assert!(
+        state.api_token_cache.get(&tok_sha, Some("alpha"), now_s).is_some(),
+        "Expected valid Bearer token to populate ApiTokenCache"
+    );
+
+    let (del_tok_st, _, _) = send_raw(
+        &router,
+        "DELETE",
+        &format!("/api/0/api-tokens/{tok_id}/"),
+        &hdrs,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(del_tok_st, StatusCode::NO_CONTENT);
+
+    let (iss_tok_revoked_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::AUTHORIZATION.as_str(), bearer.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(iss_tok_revoked_st, StatusCode::UNAUTHORIZED);
+
+    // 3. Pre-compressed gzip assets + non-gzip fallback + ETag/304 + anti-BREACH exclusions
+    let (gz_sdk_st, gz_sdk_hdrs, gz_sdk_bytes) = send_raw(
+        &router,
+        "GET",
+        "/sdk/bugfinder-mini.js",
+        &[(header::ACCEPT_ENCODING.as_str(), "gzip, deflate")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(gz_sdk_st, StatusCode::OK);
+    assert_eq!(gz_sdk_hdrs.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+    assert!(gz_sdk_hdrs
+        .get(header::VARY)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Accept-Encoding"));
+    let sdk_etag = gz_sdk_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let mut gz_dec = GzDecoder::new(&gz_sdk_bytes[..]);
+    let mut sdk_decoded = Vec::new();
+    gz_dec.read_to_end(&mut sdk_decoded).unwrap();
+
+    let (raw_sdk_st, raw_sdk_hdrs, raw_sdk_bytes) = send_raw(
+        &router,
+        "GET",
+        "/sdk/bugfinder-mini.js",
+        &[],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(raw_sdk_st, StatusCode::OK);
+    assert!(raw_sdk_hdrs.get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(raw_sdk_bytes, sdk_decoded);
+
+    let (sdk_304_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/sdk/bugfinder-mini.js",
+        &[(header::IF_NONE_MATCH.as_str(), sdk_etag.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(sdk_304_st, StatusCode::NOT_MODIFIED);
+
+    // Anti-BREACH checks: index.html, /api/auth/me, and /api/0/api-tokens/ MUST NOT be gzipped
+    for no_gz_path in ["/", "/api/auth/me", "/api/0/api-tokens/"] {
+        let (st, h, _) = send_raw(
+            &router,
+            "GET",
+            no_gz_path,
+            &[
+                (header::COOKIE.as_str(), cookie.as_str()),
+                (header::ACCEPT_ENCODING.as_str(), "gzip"),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "GET {no_gz_path} failed");
+        assert!(
+            h.get(header::CONTENT_ENCODING).is_none(),
+            "BREACH regression: {no_gz_path} MUST NOT be compressed!"
+        );
+    }
+
+    // 4. Selective gzip (>2048B) + Weak ETag / 304 + coherent ETag busting on list_issues
+    for i in 0..20 {
+        let msg = format!(
+            "PerfBenchmarkError_{i:02}: synthetic verbose payload padding for deterministic >2KiB JSON list response #{i:02}"
+        );
+        let (st, _, _) = send_json(
+            &router,
+            "POST",
+            &format!("/api/{project_id}/store/?sentry_key={dsn_key}"),
+            &[],
+            json!({
+                "message": msg,
+                "level": "error",
+                "culprit": format!("src/worker/handler_{i:02}.rs::process_event")
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    state.batch_writer.flush_now().await;
+
+    let (iss_st, iss_hdrs, iss_gz_body) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?limit=25",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            (header::ACCEPT_ENCODING.as_str(), "gzip"),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(iss_st, StatusCode::OK);
+    assert_eq!(iss_hdrs.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+    assert_eq!(iss_hdrs.get("x-hits").unwrap(), "21"); // 1 warm info + 20 errors
+    let first_etag = iss_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    assert!(first_etag.starts_with("W/\"u-"), "unexpected ETag: {first_etag}");
+
+    let mut iss_dec = GzDecoder::new(&iss_gz_body[..]);
+    let mut iss_plain = Vec::new();
+    iss_dec.read_to_end(&mut iss_plain).unwrap();
+    let iss_json: Value = serde_json::from_slice(&iss_plain).unwrap();
+    let first_issue_id = iss_json[0]["id"].as_i64().unwrap();
+
+    // Conditional GET with matching ETag returns 304 without body
+    let (iss_304_st, iss_304_hdrs, iss_304_body) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?limit=25",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            (header::IF_NONE_MATCH.as_str(), first_etag.as_str()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(iss_304_st, StatusCode::NOT_MODIFIED);
+    assert_eq!(iss_304_hdrs.get("x-hits").unwrap(), "21");
+    assert!(iss_304_body.is_empty());
+
+    // Mutate status on first issue -> MUST bust watermark ETag immediately (no stale 304!)
+    let (res_st, _, _) = send_json(
+        &router,
+        "PUT",
+        &format!("/api/0/organizations/alpha/issues/{first_issue_id}/"),
+        &hdrs,
+        json!({ "status": "resolved" }),
+    )
+    .await;
+    assert_eq!(res_st, StatusCode::OK);
+
+    let (iss_after_st, iss_after_hdrs, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?limit=25",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            (header::IF_NONE_MATCH.as_str(), first_etag.as_str()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(iss_after_st, StatusCode::OK, "Resolving an issue must invalidate issues ETag immediately");
+    let second_etag = iss_after_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    assert_ne!(first_etag, second_etag);
+
+    // Filtered query ETag + 304
+    let (filt_st, filt_hdrs, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?query=is:unresolved&limit=25",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(filt_st, StatusCode::OK);
+    let filt_etag = filt_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    assert!(filt_etag.starts_with("W/\"f-"));
+    let (filt_304_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?query=is:unresolved&limit=25",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            (header::IF_NONE_MATCH.as_str(), filt_etag.as_str()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(filt_304_st, StatusCode::NOT_MODIFIED);
+
+    // 5. SQLite Online Backup API + PRAGMA integrity_check
+    let backup_path = dir.path().join("online_backup.db");
+    let copied_bytes = SqliteStorage::backup_to_file(&state.config.sqlite_path(), &backup_path).unwrap();
+    assert!(copied_bytes > 0);
+    let b_conn = rusqlite::Connection::open(&backup_path).unwrap();
+    let integrity: String = b_conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let issue_cnt: i64 = b_conn
+        .query_row("SELECT COUNT(*) FROM issues", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(issue_cnt, 21);
+}
+
+#[tokio::test]
+async fn alerts_telegram_discord_and_oidc_flow_test() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    // Spin up local mock OIDC IdP (Discovery + Ed25519 JWKS + /token)
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let ed_kp = Arc::new(Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap());
+    let pub_b64 = URL_SAFE_NO_PAD.encode(ed_kp.public_key().as_ref());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let idp_port = listener.local_addr().unwrap().port();
+    let issuer = format!("http://127.0.0.1:{idp_port}");
+    let stop_idp = Arc::new(AtomicBool::new(false));
+    let shared_claims: Arc<Mutex<(String, String)>> =
+        Arc::new(Mutex::new((String::new(), "owner@alpha.test".to_string())));
+
+    let stop_clone = stop_idp.clone();
+    let issuer_clone = issuer.clone();
+    let ed_clone = ed_kp.clone();
+    let pub_clone = pub_b64.clone();
+    let claims_clone = shared_claims.clone();
+
+    let idp_thread = std::thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or("");
+            let body_json = if first_line.starts_with("GET /.well-known/openid-configuration ") {
+                json!({
+                    "issuer": issuer_clone,
+                    "authorization_endpoint": format!("{issuer_clone}/authorize"),
+                    "token_endpoint": format!("{issuer_clone}/token"),
+                    "jwks_uri": format!("{issuer_clone}/jwks.json")
+                })
+                .to_string()
+            } else if first_line.starts_with("GET /jwks.json ") {
+                json!({
+                    "keys": [{
+                        "kid": "ed-test-1",
+                        "kty": "OKP",
+                        "alg": "EdDSA",
+                        "crv": "Ed25519",
+                        "x": pub_clone
+                    }]
+                })
+                .to_string()
+            } else if first_line.starts_with("POST /token ") {
+                let (nonce, email) = {
+                    let g = claims_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    g.clone()
+                };
+                let hdr = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"ed-test-1"}"#);
+                let exp = chrono::Utc::now().timestamp() + 300;
+                let pay = URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&json!({
+                        "iss": issuer_clone,
+                        "sub": "oidc-sub-001",
+                        "aud": "bf-test-client",
+                        "exp": exp,
+                        "nonce": nonce,
+                        "email": email,
+                        "email_verified": true
+                    }))
+                    .unwrap(),
+                );
+                let msg = format!("{hdr}.{pay}");
+                let sig = ed_clone.sign(msg.as_bytes());
+                let id_token = format!("{msg}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
+                json!({
+                    "access_token": "mock_oidc_at",
+                    "token_type": "Bearer",
+                    "id_token": id_token
+                })
+                .to_string()
+            } else {
+                json!({ "error": "not found" }).to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_json.len(),
+                body_json
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+
+    let dir = TempDir::new().unwrap();
+    let cfg = Arc::new(
+        AppConfig::from_env_and_overrides(
+            Some("127.0.0.1:0".into()),
+            Some(dir.path().to_path_buf()),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let storage: Arc<dyn StorageBackend> =
+        SqliteStorage::open_with_key(&cfg.sqlite_path(), cfg.app_key).unwrap();
+    let mut state = build_app_state(cfg, storage);
+    let oidc_cfg = bugfinder::config::OidcConfig {
+        issuer: issuer.clone(),
+        client_id: "bf-test-client".into(),
+        client_secret: "bf-test-secret".into(), // gitleaks:allow
+        display_name: "Corp SSO".into(),
+        redirect_uri: "http://127.0.0.1/api/auth/oidc/callback".into(),
+    };
+    Arc::get_mut(&mut state).unwrap().oidc_client = Some(Arc::new(
+        bugfinder::security::oidc::OidcClient::new_with_loopback_for_test(oidc_cfg),
+    ));
+    let router = build_router(state.clone());
+
+    // Initial setup
+    let (setup_st, _, setup_body) = send_json(
+        &router,
+        "POST",
+        "/api/auth/setup",
+        &[],
+        json!({
+            "org_name": "Org Alpha",
+            "org_slug": "alpha",
+            "email": "owner@alpha.test",
+            "name": "Alice",
+            "password": "StrongPassword123!",
+            "project_name": "RoleLane App",
+            "project_slug": "rolelane"
+        }),
+    )
+    .await;
+    assert_eq!(setup_st, StatusCode::CREATED);
+    let project_id = setup_body["project"]["id"].as_i64().unwrap();
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+    ];
+
+    // 1. Alert rules API: Telegram + Discord Rich Embeds + validation rejections
+    let (bad_tg_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/alerts/",
+        &owner_hdrs,
+        json!({
+            "project_id": project_id,
+            "name": "Bad TG",
+            "trigger_type": "new_issue",
+            "channel_type": "telegram",
+            "target_url": "not valid chat id!",
+            "webhook_secret": "999999:mock_tg_token_01" // gitleaks:allow
+        }),
+    )
+    .await;
+    assert_eq!(bad_tg_st, StatusCode::BAD_REQUEST);
+
+    let (no_tok_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/alerts/",
+        &owner_hdrs,
+        json!({
+            "project_id": project_id,
+            "name": "Missing TG Token",
+            "trigger_type": "new_issue",
+            "channel_type": "telegram",
+            "target_url": "-1001234567890",
+            "webhook_secret": ""
+        }),
+    )
+    .await;
+    assert_eq!(no_tok_st, StatusCode::BAD_REQUEST);
+
+    let tg_secret = "999999:mock_tg_token_01"; // gitleaks:allow
+    let (tg_st, _, tg_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/alerts/",
+        &owner_hdrs,
+        json!({
+            "project_id": project_id,
+            "name": "Ops Telegram",
+            "trigger_type": "new_issue",
+            "channel_type": "telegram",
+            "target_url": "-1001234567890",
+            "webhook_secret": tg_secret
+        }),
+    )
+    .await;
+    assert_eq!(tg_st, StatusCode::CREATED);
+    assert_eq!(tg_body["target_url"], "telegram:-1001234567890");
+    assert_eq!(tg_body["has_secret"], true);
+
+    let (dc_st, _, dc_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/alerts/",
+        &owner_hdrs,
+        json!({
+            "project_id": project_id,
+            "name": "Ops Discord",
+            "trigger_type": "new_issue",
+            "channel_type": "discord",
+            "target_url": "https://discord.com/api/webhooks/1/test"
+        }),
+    )
+    .await;
+    assert_eq!(dc_st, StatusCode::CREATED);
+    assert_eq!(dc_body["channel_type"], "discord");
+
+    let (_, _, list_alerts_raw) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/alerts/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    let list_alerts_str = String::from_utf8_lossy(&list_alerts_raw);
+    assert!(!list_alerts_str.contains(tg_secret), "Bot token leaked in GET alerts response!");
+    assert!(list_alerts_str.contains("telegram:-1001234567890"));
+
+    // 2. OIDC /api/auth/status + login + CSRF state check + callback + fail-closed provisioning
+    let (st_st, _, st_body) = send_json(&router, "GET", "/api/auth/status", &[], Value::Null).await;
+    assert_eq!(st_st, StatusCode::OK);
+    assert_eq!(st_body["oidc_enabled"], true);
+    assert_eq!(st_body["oidc_name"], "Corp SSO");
+
+    let (login_st, login_hdrs, _) = send_raw(&router, "GET", "/api/auth/oidc/login", &[], Vec::new()).await;
+    assert_eq!(login_st, StatusCode::FOUND);
+    let loc = login_hdrs.get(header::LOCATION).unwrap().to_str().unwrap();
+    assert!(loc.contains("code_challenge_method=S256"));
+    let tx_cookie_hdr = login_hdrs
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(tx_cookie_hdr.contains("HttpOnly"));
+    assert!(tx_cookie_hdr.contains("SameSite=Lax"));
+    let tx_cookie = tx_cookie_hdr.split(';').next().unwrap().to_string();
+
+    let query_part = loc.split('?').nth(1).unwrap();
+    let mut qp = std::collections::HashMap::new();
+    for pair in query_part.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            qp.insert(k.to_string(), v.to_string());
+        }
+    }
+    let state_param = qp.get("state").unwrap().clone();
+    let nonce_param = qp.get("nonce").unwrap().clone();
+    {
+        let mut g = shared_claims.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = nonce_param.clone();
+        g.1 = "owner@alpha.test".to_string();
+    }
+
+    // Tampered state rejects + clears cookie
+    let (bad_cb_st, bad_cb_hdrs, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/oidc/callback?state=TAMPERED&code=ok",
+        &[(header::COOKIE.as_str(), tx_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(bad_cb_st, StatusCode::BAD_REQUEST);
+    let cleared = bad_cb_hdrs
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cleared.contains("bf_oidc_tx=;"));
+    assert!(cleared.contains("Max-Age=0"));
+
+    // Valid callback mints session + clears bf_oidc_tx + appends audit log
+    let (cb_st, cb_hdrs, _) = send_raw(
+        &router,
+        "GET",
+        &format!("/api/auth/oidc/callback?state={state_param}&code=auth_code_123"),
+        &[(header::COOKIE.as_str(), tx_cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(cb_st, StatusCode::FOUND);
+    assert_eq!(cb_hdrs.get(header::LOCATION).unwrap(), "/");
+    let set_cookies: Vec<String> = cb_hdrs
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(ToString::to_string))
+        .collect();
+    let sess_hdr = set_cookies
+        .iter()
+        .find(|s| s.starts_with("bf_session="))
+        .expect("OIDC callback must set bf_session");
+    assert!(
+        set_cookies
+            .iter()
+            .any(|s| s.starts_with("bf_oidc_tx=;") && s.contains("Max-Age=0")),
+        "OIDC callback must clear bf_oidc_tx"
+    );
+    let sess_cookie = sess_hdr.split(';').next().unwrap().to_string();
+
+    let (me_st, _, me_body) = send_json(
+        &router,
+        "GET",
+        "/api/auth/me",
+        &[(header::COOKIE.as_str(), sess_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(me_st, StatusCode::OK);
+    assert_eq!(me_body["user"]["email"], "owner@alpha.test");
+
+    let (_, _, aud_list) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/audit-logs/",
+        &[(header::COOKIE.as_str(), sess_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert!(aud_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["action"] == "auth.oidc_login"));
+
+    // Unprovisioned SSO email fails closed with 403 Forbidden (no auto-provisioning)
+    let (l2_st, l2_hdrs, _) = send_raw(&router, "GET", "/api/auth/oidc/login", &[], Vec::new()).await;
+    assert_eq!(l2_st, StatusCode::FOUND);
+    let loc2 = l2_hdrs.get(header::LOCATION).unwrap().to_str().unwrap();
+    let tx2 = l2_hdrs
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let q2 = loc2.split('?').nth(1).unwrap();
+    let mut qp2 = std::collections::HashMap::new();
+    for pair in q2.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            qp2.insert(k.to_string(), v.to_string());
+        }
+    }
+    {
+        let mut g = shared_claims.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = qp2.get("nonce").unwrap().clone();
+        g.1 = "unprovisioned@alpha.test".to_string();
+    }
+    let (forb_st, _, _) = send_raw(
+        &router,
+        "GET",
+        &format!(
+            "/api/auth/oidc/callback?state={}&code=auth_code_456",
+            qp2.get("state").unwrap()
+        ),
+        &[(header::COOKIE.as_str(), tx2.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(forb_st, StatusCode::FORBIDDEN);
+
+    stop_idp.store(true, Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", idp_port));
+    let _ = idp_thread.join();
 }

@@ -1,7 +1,7 @@
 use crate::alerts::dispatcher::AlertDispatchJob;
 use crate::domain::fingerprint::{extract_issue_metadata, should_reopen_on_regression};
 use crate::domain::models::*;
-use crate::security::auth::{compute_audit_entry_hash, compute_lockout_seconds};
+use crate::security::auth::{compute_audit_entry_hash, compute_lockout_seconds, sha256_hex};
 use crate::security::crypto::{open_secret, seal_secret};
 use crate::storage::*;
 use async_trait::async_trait;
@@ -51,15 +51,37 @@ impl PostgresStorage {
             .map_err(|e| format!("Postgres connect error: {e}"))?;
 
         if run_migrations {
-            for stmt in split_pg_statements(PG_SCHEMA) {
-                let trimmed = stmt.trim();
-                if trimmed.is_empty() {
-                    continue;
+            let want_sha = sha256_hex(PG_SCHEMA.as_bytes());
+            let already_applied: Option<String> = sqlx::query_scalar(
+                "SELECT schema_sha256 FROM bugfinder_schema_meta WHERE id = 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+
+            if already_applied.as_deref() != Some(want_sha.as_str()) {
+                for stmt in split_pg_statements(PG_SCHEMA) {
+                    let trimmed = stmt.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    sqlx::query(trimmed)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| format!("PG migration stmt failed ({trimmed}): {e}"))?;
                 }
-                sqlx::query(trimmed)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| format!("PG migration stmt failed ({trimmed}): {e}"))?;
+                let now_sec = chrono::Utc::now().timestamp();
+                sqlx::query(
+                    "INSERT INTO bugfinder_schema_meta (id, schema_sha256, applied_at)
+                     VALUES (1, $1, $2)
+                     ON CONFLICT (id) DO UPDATE SET schema_sha256 = EXCLUDED.schema_sha256, applied_at = EXCLUDED.applied_at",
+                )
+                .bind(&want_sha)
+                .bind(now_sec)
+                .execute(&pool)
+                .await
+                .map_err(|e| format!("PG schema_meta update failed: {e}"))?;
             }
         }
 
@@ -287,29 +309,32 @@ async fn pg_insert_event_in_tx(
     payload_json: &[u8],
     received_ms: i64,
     store_full_blob: bool,
+    coalesce_aggregates: bool,
 ) -> Result<(i64, String, bool, bool), String> {
-    if auth.first_event_at.is_none() {
-        sqlx::query("UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL")
-            .bind(received_ms)
+    if !coalesce_aggregates {
+        if auth.first_event_at.is_none() {
+            sqlx::query("UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL")
+                .bind(received_ms)
+                .bind(auth.project_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(map_pg_err)?;
+        }
+
+        if let Some(rel) = &meta.release {
+            sqlx::query(
+                "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
+                 VALUES ($1, $2, $3, $4, $4)
+                 ON CONFLICT (project_id, version) DO UPDATE SET last_seen = GREATEST(releases.last_seen, EXCLUDED.last_seen)",
+            )
+            .bind(auth.organization_id)
             .bind(auth.project_id)
+            .bind(rel)
+            .bind(received_ms)
             .execute(&mut **tx)
             .await
             .map_err(map_pg_err)?;
-    }
-
-    if let Some(rel) = &meta.release {
-        sqlx::query(
-            "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
-             VALUES ($1, $2, $3, $4, $4)
-             ON CONFLICT (project_id, version) DO UPDATE SET last_seen = GREATEST(releases.last_seen, EXCLUDED.last_seen)",
-        )
-        .bind(auth.organization_id)
-        .bind(auth.project_id)
-        .bind(rel)
-        .bind(received_ms)
-        .execute(&mut **tx)
-        .await
-        .map_err(map_pg_err)?;
+        }
     }
 
     let dup: Option<Uuid> = sqlx::query_scalar(
@@ -453,18 +478,20 @@ async fn pg_insert_event_in_tx(
         .map_err(map_pg_err)?;
     }
 
-    let bucket_hour = (received_ms / 3_600_000) * 3_600_000;
-    sqlx::query(
-        "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
-         VALUES ($1, $2, $3, 'error', 1)
-         ON CONFLICT (project_id, bucket_hour, category) DO UPDATE SET quantity = hourly_stats.quantity + 1",
-    )
-    .bind(auth.organization_id)
-    .bind(auth.project_id)
-    .bind(bucket_hour)
-    .execute(&mut **tx)
-    .await
-    .map_err(map_pg_err)?;
+    if !coalesce_aggregates {
+        let bucket_hour = (received_ms / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
+             VALUES ($1, $2, $3, 'error', 1)
+             ON CONFLICT (project_id, bucket_hour, category) DO UPDATE SET quantity = hourly_stats.quantity + 1",
+        )
+        .bind(auth.organization_id)
+        .bind(auth.project_id)
+        .bind(bucket_hour)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_pg_err)?;
+    }
 
     Ok((issue_id, short_id, is_new, is_regression))
 }
@@ -968,13 +995,16 @@ impl StorageBackend for PostgresStorage {
         let tok_role = UserRole::from_db(&tok_role_s).unwrap_or(UserRole::Viewer);
         let mem_role = UserRole::from_db(&mem_role_s).unwrap_or(UserRole::Viewer);
         let eff_role = mem_role.min_role(tok_role);
-        Ok(Some(TenantCtx::from_token(
-            org_id,
-            found_slug,
-            uid,
-            eff_role,
-            &raw_scopes,
-        )))
+        Ok(Some(
+            TenantCtx::from_token(
+                org_id,
+                found_slug,
+                uid,
+                eff_role,
+                &raw_scopes,
+            )
+            .with_token_expires_at(exp),
+        ))
     }
 
     async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
@@ -1430,7 +1460,31 @@ impl StorageBackend for PostgresStorage {
         Ok(Some(tunnel_slug.to_string()))
     }
 
-    async fn list_issues(&self, ctx: &TenantCtx, p: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64), String> {
+    async fn issues_etag_watermark(&self, ctx: &TenantCtx, project_id: Option<i64>) -> Result<(i64, i64), String> {
+        let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        let (cnt, max_ls, sum_ev, res_cnt, ign_cnt): (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint,
+                    COALESCE(MAX(last_seen), 0)::bigint,
+                    COALESCE(SUM(event_count), 0)::bigint,
+                    COALESCE(SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END), 0)::bigint,
+                    COALESCE(SUM(CASE WHEN status = 'ignored' THEN 1 ELSE 0 END), 0)::bigint
+             FROM issues
+             WHERE ($1::bigint IS NULL OR project_id = $1)",
+        )
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+        let sig = if cnt == 0 {
+            0
+        } else {
+            crate::storage::compute_issues_watermark_sig(max_ls, sum_ev, res_cnt, ign_cnt)
+        };
+        Ok((cnt, sig))
+    }
+
+    async fn list_issues(&self, ctx: &TenantCtx, p: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64, i64), String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let order = match p.sort.as_str() {
             "freq" => "i.event_count DESC, i.last_seen DESC",
@@ -1441,32 +1495,16 @@ impl StorageBackend for PostgresStorage {
         let offset = p.offset.clamp(0, 100_000);
         let q_text = p.search_query.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM issues i
-             WHERE ($1::text IS NULL OR i.status = $1)
-               AND ($2::text IS NULL OR i.level = $2)
-               AND ($3::text IS NULL OR i.environment = $3)
-               AND ($4::text IS NULL OR i.last_release = $4 OR i.first_release = $4)
-               AND ($5::bigint IS NULL OR i.project_id = $5)
-               AND ($6::bigint IS NULL OR i.last_seen >= $6)
-               AND ($7::text IS NULL OR i.search_vec @@ plainto_tsquery('english', $7))",
-        )
-        .bind(&p.status)
-        .bind(&p.level)
-        .bind(&p.environment)
-        .bind(&p.release)
-        .bind(p.project_id)
-        .bind(p.since_ms)
-        .bind(q_text)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
-
         let sql = format!(
             "SELECT i.id, i.short_id, i.project_id, pr.slug AS project_slug, i.title, i.culprit, i.level,
                     i.issue_type, i.status, i.is_regression, i.resolved_in_release,
                     i.first_seen, i.last_seen, i.event_count, i.user_count,
-                    i.first_release, i.last_release, i.environment, i.metadata_json
+                    i.first_release, i.last_release, i.environment, i.metadata_json,
+                    COUNT(*) OVER()::bigint AS total_hits,
+                    COALESCE(MAX(i.last_seen) OVER(), 0)::bigint AS wm_max_ls,
+                    COALESCE(SUM(i.event_count) OVER(), 0)::bigint AS wm_sum_ev,
+                    COALESCE(SUM(CASE WHEN i.status = 'resolved' THEN 1 ELSE 0 END) OVER(), 0)::bigint AS wm_res_cnt,
+                    COALESCE(SUM(CASE WHEN i.status = 'ignored' THEN 1 ELSE 0 END) OVER(), 0)::bigint AS wm_ign_cnt
              FROM issues i
              JOIN projects pr ON pr.id = i.project_id
              WHERE ($1::text IS NULL OR i.status = $1)
@@ -1492,6 +1530,45 @@ impl StorageBackend for PostgresStorage {
             .fetch_all(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+
+        let (total, sig): (i64, i64) = if let Some(first) = rows.first() {
+            let tot = first.try_get::<i64, _>("total_hits").unwrap_or(0);
+            let s = if tot == 0 {
+                0
+            } else {
+                crate::storage::compute_issues_watermark_sig(
+                    first.try_get::<i64, _>("wm_max_ls").unwrap_or(0),
+                    first.try_get::<i64, _>("wm_sum_ev").unwrap_or(0),
+                    first.try_get::<i64, _>("wm_res_cnt").unwrap_or(0),
+                    first.try_get::<i64, _>("wm_ign_cnt").unwrap_or(0),
+                )
+            };
+            (tot, s)
+        } else if offset > 0 {
+            let tot: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM issues i
+                 WHERE ($1::text IS NULL OR i.status = $1)
+                   AND ($2::text IS NULL OR i.level = $2)
+                   AND ($3::text IS NULL OR i.environment = $3)
+                   AND ($4::text IS NULL OR i.last_release = $4 OR i.first_release = $4)
+                   AND ($5::bigint IS NULL OR i.project_id = $5)
+                   AND ($6::bigint IS NULL OR i.last_seen >= $6)
+                   AND ($7::text IS NULL OR i.search_vec @@ plainto_tsquery('english', $7))",
+            )
+            .bind(&p.status)
+            .bind(&p.level)
+            .bind(&p.environment)
+            .bind(&p.release)
+            .bind(p.project_id)
+            .bind(p.since_ms)
+            .bind(q_text)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            (tot, 0)
+        } else {
+            (0, 0)
+        };
         tx.commit().await.map_err(map_pg_err)?;
 
         Ok((
@@ -1499,6 +1576,7 @@ impl StorageBackend for PostgresStorage {
                 .map(|r| row_to_issue(r, &ctx.organization_slug))
                 .collect(),
             total,
+            sig,
         ))
     }
 
@@ -2777,6 +2855,11 @@ impl StorageBackend for PostgresStorage {
         let now_sec = chrono::Utc::now().timestamp();
         for (org_id, org_items) in by_org {
             let mut tx = self.begin_tenant(org_id).await?;
+            let mut first_event_proj: HashMap<i64, i64> = HashMap::new();
+            let mut releases_map: HashMap<(i64, String), i64> = HashMap::new();
+            let mut hourly_map: HashMap<(i64, i64, &'static str), i64> = HashMap::new();
+            let mut log_res_map: HashMap<(&'static str, String), i64> = HashMap::new();
+
             for item in org_items {
                 match item {
                     IngestWriteItem::Event { auth, meta, payload_json, received_ms } => {
@@ -2787,8 +2870,23 @@ impl StorageBackend for PostgresStorage {
                             received_ms,
                         );
                         let (issue_id, short_id, is_new, is_reg) =
-                            pg_insert_event_in_tx(&mut tx, &auth, &meta, &payload_json, received_ms, store_blob).await?;
+                            pg_insert_event_in_tx(&mut tx, &auth, &meta, &payload_json, received_ms, store_blob, true).await?;
                         if issue_id > 0 {
+                            if auth.first_event_at.is_none() {
+                                first_event_proj
+                                    .entry(auth.project_id)
+                                    .and_modify(|ts| *ts = (*ts).min(received_ms))
+                                    .or_insert(received_ms);
+                            }
+                            if let Some(ref rel) = meta.release {
+                                releases_map
+                                    .entry((auth.project_id, rel.clone()))
+                                    .and_modify(|ts| *ts = (*ts).max(received_ms))
+                                    .or_insert(received_ms);
+                            }
+                            let bh = (received_ms / 3_600_000) * 3_600_000;
+                            *hourly_map.entry((auth.project_id, bh, "error")).or_insert(0) += 1;
+
                             let jobs = pg_build_alert_jobs_for_event(
                                 &mut tx,
                                 &self.app_key,
@@ -2832,33 +2930,15 @@ impl StorageBackend for PostgresStorage {
 
                             for (rt, val) in [("service", &l.service), ("environment", &l.environment), ("host", &l.host)] {
                                 if !val.is_empty() {
-                                    sqlx::query(
-                                        "INSERT INTO log_resources (organization_id, resource_type, name, last_seen)
-                                         VALUES ($1,$2,$3,$4)
-                                         ON CONFLICT (organization_id, resource_type, name) DO UPDATE SET last_seen = GREATEST(log_resources.last_seen, EXCLUDED.last_seen)",
-                                    )
-                                    .bind(organization_id)
-                                    .bind(rt)
-                                    .bind(val)
-                                    .bind(l.timestamp_ms)
-                                    .execute(&mut *tx)
-                                    .await
-                                    .map_err(map_pg_err)?;
+                                    log_res_map
+                                        .entry((rt, val.clone()))
+                                        .and_modify(|ts| *ts = (*ts).max(l.timestamp_ms))
+                                        .or_insert(l.timestamp_ms);
                                 }
                             }
 
                             let bh = (l.timestamp_ms / 3_600_000) * 3_600_000;
-                            sqlx::query(
-                                "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
-                                 VALUES ($1,$2,$3,'log',1)
-                                 ON CONFLICT (project_id, bucket_hour, category) DO UPDATE SET quantity = hourly_stats.quantity + 1",
-                            )
-                            .bind(organization_id)
-                            .bind(project_id)
-                            .bind(bh)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(map_pg_err)?;
+                            *hourly_map.entry((project_id, bh, "log")).or_insert(0) += 1;
 
                             let mut fatal_alert_checked = false;
                             if let Some(min_lvl) = auto_promote_level {
@@ -2886,8 +2966,10 @@ impl StorageBackend for PostgresStorage {
                                         org_event_throttle_rate: 0,
                                     };
                                     let (issue_id, short_id, is_new, is_reg) =
-                                        pg_insert_event_in_tx(&mut tx, &synth_auth, &meta, &bytes, l.timestamp_ms, true).await?;
+                                        pg_insert_event_in_tx(&mut tx, &synth_auth, &meta, &bytes, l.timestamp_ms, true, true).await?;
                                     if issue_id > 0 {
+                                        let bh_err = (l.timestamp_ms / 3_600_000) * 3_600_000;
+                                        *hourly_map.entry((project_id, bh_err, "error")).or_insert(0) += 1;
                                         let jobs = pg_build_alert_jobs_for_event(
                                             &mut tx,
                                             &self.app_key,
@@ -2950,32 +3032,14 @@ impl StorageBackend for PostgresStorage {
                         .map_err(map_pg_err)?;
 
                         let bh = (tr.timestamp_ms / 3_600_000) * 3_600_000;
-                        sqlx::query(
-                            "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
-                             VALUES ($1,$2,$3,'transaction',1)
-                             ON CONFLICT (project_id, bucket_hour, category) DO UPDATE SET quantity = hourly_stats.quantity + 1",
-                        )
-                        .bind(organization_id)
-                        .bind(project_id)
-                        .bind(bh)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_pg_err)?;
+                        *hourly_map.entry((project_id, bh, "transaction")).or_insert(0) += 1;
                     }
                     IngestWriteItem::Session { organization_id, project_id, session, received_ms } => {
                         let bh = (received_ms / 3_600_000) * 3_600_000;
-                        sqlx::query(
-                            "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
-                             VALUES ($1,$2,$3,$4,$4)
-                             ON CONFLICT (project_id, version) DO UPDATE SET last_seen = GREATEST(releases.last_seen, EXCLUDED.last_seen)",
-                        )
-                        .bind(organization_id)
-                        .bind(project_id)
-                        .bind(&session.release)
-                        .bind(received_ms)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_pg_err)?;
+                        releases_map
+                            .entry((project_id, session.release.clone()))
+                            .and_modify(|ts| *ts = (*ts).max(received_ms))
+                            .or_insert(received_ms);
                         let (h, e, c, a) = match session.status.as_str() {
                             "crashed" => (0i64, 0, 1, 0),
                             "abnormal" => (0, 0, 0, 1),
@@ -3036,6 +3100,59 @@ impl StorageBackend for PostgresStorage {
                     }
                 }
             }
+
+            for (proj_id, first_ms) in first_event_proj {
+                sqlx::query("UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL")
+                    .bind(first_ms)
+                    .bind(proj_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_pg_err)?;
+            }
+            for ((proj_id, ver), ts_ms) in releases_map {
+                sqlx::query(
+                    "INSERT INTO releases (organization_id, project_id, version, first_seen, last_seen)
+                     VALUES ($1, $2, $3, $4, $4)
+                     ON CONFLICT (project_id, version) DO UPDATE SET last_seen = GREATEST(releases.last_seen, EXCLUDED.last_seen)",
+                )
+                .bind(org_id)
+                .bind(proj_id)
+                .bind(ver)
+                .bind(ts_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            }
+            for ((rt, name), ts_ms) in log_res_map {
+                sqlx::query(
+                    "INSERT INTO log_resources (organization_id, resource_type, name, last_seen)
+                     VALUES ($1,$2,$3,$4)
+                     ON CONFLICT (organization_id, resource_type, name) DO UPDATE SET last_seen = GREATEST(log_resources.last_seen, EXCLUDED.last_seen)",
+                )
+                .bind(org_id)
+                .bind(rt)
+                .bind(name)
+                .bind(ts_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            }
+            for ((proj_id, bh, cat), qty) in hourly_map {
+                sqlx::query(
+                    "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
+                     VALUES ($1,$2,$3,$4,$5)
+                     ON CONFLICT (project_id, bucket_hour, category) DO UPDATE SET quantity = hourly_stats.quantity + $5",
+                )
+                .bind(org_id)
+                .bind(proj_id)
+                .bind(bh)
+                .bind(cat)
+                .bind(qty)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            }
+
             tx.commit().await.map_err(map_pg_err)?;
         }
         Ok(alerts)

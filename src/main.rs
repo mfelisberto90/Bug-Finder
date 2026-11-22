@@ -9,6 +9,8 @@ use bugfinder::runtime::{
 };
 use bugfinder::selfcheck::{install_panic_hook, run_doctor_cli};
 use bugfinder::storage::batch_writer::spawn_alert_jobs;
+use bugfinder::storage::postgres::PostgresStorage;
+use bugfinder::storage::sqlite::SqliteStorage;
 use bugfinder::{build_app_state, build_storage};
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -36,6 +38,8 @@ fn main() -> ExitCode {
                 "Bug-Finder v{}\n\n\
                  USAGE:\n  \
                    bugfinder [--headless | --app] [--bind ADDR] [--data DIR] [--db URL]\n  \
+                   bugfinder migrate [--data DIR] [--db URL]\n  \
+                   bugfinder backup --out FILE [--data DIR]\n  \
                    bugfinder doctor [--url URL] [--data DIR] [--db URL] [--json]\n  \
                    bugfinder healthcheck [--url http://127.0.0.1:8080/api/health]\n  \
                    bugfinder tail --url URL --org SLUG --token TOKEN [--project ID] [--level LVL] [--query Q]\n  \
@@ -50,6 +54,81 @@ fn main() -> ExitCode {
         CliCommand::Version => {
             println!("bugfinder {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
+        }
+        CliCommand::Migrate => {
+            let cfg = match AppConfig::from_env_and_overrides(
+                None,
+                parsed.data_override,
+                parsed.db_override,
+                false,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("config error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if cfg.is_postgres() {
+                let rt = match build_compact_tokio_runtime() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("tokio init error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let url = cfg.database_url.as_deref().unwrap_or("").to_string();
+                let app_key = cfg.app_key;
+                match rt.block_on(async move { PostgresStorage::connect_with_key(&url, true, app_key).await }) {
+                    Ok(_) => {
+                        println!("PostgreSQL schema migrations verified/applied.");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("migrate error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                match SqliteStorage::open_with_key(&cfg.sqlite_path(), cfg.app_key) {
+                    Ok(_) => {
+                        println!("SQLite schema migrations verified/applied: {}", cfg.sqlite_path().display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("migrate error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
+        CliCommand::Backup { out_path } => {
+            let cfg = match AppConfig::from_env_and_overrides(
+                None,
+                parsed.data_override,
+                parsed.db_override,
+                false,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("config error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if cfg.is_postgres() {
+                eprintln!("backup subcommand is for SQLite databases; for PostgreSQL use pg_dump.");
+                return ExitCode::from(2);
+            }
+            let src_path = cfg.sqlite_path();
+            match SqliteStorage::backup_to_file(&src_path, &out_path) {
+                Ok(bytes) => {
+                    println!("Backup complete: {bytes} bytes -> {}", out_path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("backup error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         CliCommand::Doctor { url, json } => {
             let cfg = match AppConfig::from_env_and_overrides(
@@ -292,6 +371,7 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
             _ = desktop_exit => {}
         }
         shutdown_state.batch_writer.shutdown().await;
+        shutdown_state.storage.shutdown_checkpoint().await;
     };
 
     // Pin the server future cleanly so LTO does not bloat worker thread stack

@@ -618,7 +618,7 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
             },
         )
         .await
-        .map(|(rows, _)| !rows.is_empty())
+        .map(|(rows, _, _)| !rows.is_empty())
         .unwrap_or(false);
 
     let has_log = state
