@@ -23,6 +23,8 @@ export interface ProjectFilters {
   auto_promote_log_level: string | null;
   scrub_ip_addresses: boolean;
   scrub_emails: boolean;
+  safe_keys: string[];
+  sensitive_keys: string[];
 }
 
 export interface Project {
@@ -123,9 +125,31 @@ export interface AlertRule {
   project_id: number;
   name: string;
   trigger_type: string;
+  threshold_count: number;
+  window_sec: number;
+  cooldown_sec: number;
   channel_type: string;
   target_url: string;
+  has_secret: boolean;
   email_to: string;
+}
+
+export interface ProjectKeyItem {
+  id: number;
+  project_id: number;
+  label: string;
+  public_key: string;
+  rate_limit_per_min: number;
+  is_active: boolean;
+  created_at: number;
+}
+
+export interface MemberItem {
+  user_id: number;
+  email: string;
+  name: string;
+  role: string;
+  is_active: boolean;
 }
 
 export interface ApiTokenItem {

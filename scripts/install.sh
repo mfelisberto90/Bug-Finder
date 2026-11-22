@@ -129,12 +129,20 @@ write_secure_env_if_missing() {
     return 0
   fi
 
+  local env_mode="development"
+  if [[ "$INSTALL_SERVICE" -eq 1 || "$DOCKER_MODE" -eq 1 ]]; then
+    env_mode="production"
+  elif [[ "$BIND_ADDR" != 127.0.0.1:* && "$BIND_ADDR" != localhost:* && "$BIND_ADDR" != \[::1\]:* ]]; then
+    env_mode="production"
+  fi
+
   local key_hex
   key_hex="$(generate_app_key | tr -d '\n\r')"
   mkdir -p "$(dirname "$env_path")"
   (
     umask 077
     cat > "$env_path" <<EOF
+BUGFINDER_ENV=${env_mode}
 BUGFINDER_BIND=${BIND_ADDR}
 BUGFINDER_DATA_DIR=${target_data}
 BUGFINDER_APP_KEY=${key_hex}

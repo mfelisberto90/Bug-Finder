@@ -11,8 +11,27 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+static DUMMY_HASH: OnceLock<String> = OnceLock::new();
+
+fn dummy_scrypt_hash() -> String {
+    DUMMY_HASH
+        .get_or_init(|| {
+            use scrypt::{
+                password_hash::{PasswordHasher, SaltString},
+                Params, Scrypt,
+            };
+            let salt = SaltString::generate(&mut rand::thread_rng());
+            let params = Params::new(14, 8, 1, 32).expect("valid scrypt params");
+            Scrypt
+                .hash_password_customized(b"dummy-timing-guard", None, None, params, &salt)
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        })
+        .clone()
+}
 
 #[derive(Deserialize)]
 pub struct SetupRequest {
@@ -82,11 +101,35 @@ pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
 pub async fn auth_setup(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ext: axum::http::Extensions,
     Json(req): Json<SetupRequest>,
 ) -> Response {
     if req.website.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid submission" }))).into_response();
     }
+    let client_ip = ext
+        .get::<ClientIp>()
+        .map(|c| c.0.to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let setup_dec = state.rate_limiter.check_and_record(
+        "auth_setup_ip",
+        &client_ip,
+        10,
+        Duration::from_secs(60),
+    );
+    if !setup_dec.allowed {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Too many setup requests" }))).into_response();
+    }
+    match state.storage.needs_setup().await {
+        Ok(false) => {
+            return (StatusCode::CONFLICT, Json(json!({ "error": "Setup already completed" }))).into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        }
+        Ok(true) => {}
+    }
+
     if req.password.len() < 8 || req.password.len() > 256 || !req.email.contains('@') {
         return (
             StatusCode::BAD_REQUEST,
@@ -223,7 +266,8 @@ pub async fn auth_login(
     let user = match state.storage.find_user_for_login(&email_norm).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            // Persist strike counter before returning 401
+            // Equalize scrypt work & timing against account enumeration before recording strike
+            let _ = verify_password(req.password, dummy_scrypt_hash()).await;
             let _ = state.storage.record_login_failure(&lock_hmac, now_sec).await;
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid credentials" }))).into_response();
         }
@@ -286,9 +330,18 @@ pub async fn auth_logout(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(raw) = extract_cookie(&headers, "bf_session") {
-        let sha = sha256_hex(raw.as_bytes());
-        let _ = state.storage.delete_session(&sha).await;
+    if let Some(sess) = resolve_request_session(&state, &headers).await {
+        if !verify_csrf_for_session(&sess, &headers) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "Invalid CSRF token" })),
+            )
+                .into_response();
+        }
+        if let Some(raw) = extract_cookie(&headers, "bf_session") {
+            let sha = sha256_hex(raw.as_bytes());
+            let _ = state.storage.delete_session(&sha).await;
+        }
     }
     let cookie = build_session_cookie("", 0, &state, &headers);
     let mut resp = Json(json!({ "ok": true })).into_response();

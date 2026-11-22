@@ -269,6 +269,11 @@ impl SourceMapCache {
     }
 }
 
+pub fn strip_url_basename(raw: &str) -> &str {
+    let without_query = raw.split(&['?', '#'][..]).next().unwrap_or(raw);
+    without_query.rsplit('/').next().unwrap_or(without_query)
+}
+
 pub fn demangle_event_with_maps<F>(ev: &mut Value, mut fetch_map: F) -> bool
 where
     F: FnMut(Option<&str>, &str) -> Option<SourceMapV3>,
@@ -321,7 +326,7 @@ where
                 continue;
             };
 
-            let basename = filename.rsplit('/').next().unwrap_or(&filename);
+            let basename = strip_url_basename(&filename);
             let debug_id = debug_id_by_file
                 .get(&filename)
                 .or_else(|| debug_id_by_file.get(basename))
@@ -389,11 +394,12 @@ mod tests {
                     "type": "Error",
                     "value": "boom",
                     "stacktrace": {
-                        "frames": [{ "filename": "https://cdn.example.com/app.min.js", "lineno": 1, "colno": 0 }]
+                        "frames": [{ "filename": "https://cdn.example.com/app.min.js?v=99#top", "lineno": 1, "colno": 0 }]
                     }
                 }]
             }
         });
+        assert_eq!(strip_url_basename("https://cdn.example.com/app.min.js?v=99#top"), "app.min.js");
         let mapped = demangle_event_with_maps(&mut ev, |_, fname| {
             if fname == "app.min.js" { Some(sm.clone()) } else { None }
         });

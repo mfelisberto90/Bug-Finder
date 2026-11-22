@@ -614,6 +614,7 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
                 sort: "date".into(),
                 since_ms: None,
                 limit: 1,
+                offset: 0,
             },
         )
         .await

@@ -11,7 +11,8 @@
     tags: {},
     breadcrumbs: [],
     logBuffer: [],
-    flushTimer: null
+    flushTimer: null,
+    initialized: false
   };
 
   function parseDsn(dsn) {
@@ -63,7 +64,7 @@
       .reverse();
   }
 
-  function sendEnvelope(header, items) {
+  function sendEnvelope(header, items, preferBeacon) {
     if (!cfg.endpoint) return;
     var lines = [JSON.stringify(header)];
     for (var i = 0; i < items.length; i++) {
@@ -73,6 +74,17 @@
     var body = lines.join("\n") + "\n";
     var url = cfg.endpoint + (cfg.dsnKey ? "?sentry_key=" + encodeURIComponent(cfg.dsnKey) : "");
     try {
+      if (
+        preferBeacon &&
+        typeof navigator !== "undefined" &&
+        typeof navigator.sendBeacon === "function" &&
+        body.length <= 60000
+      ) {
+        var blob = typeof Blob === "function"
+          ? new Blob([body], { type: "text/plain;charset=UTF-8" })
+          : body;
+        if (navigator.sendBeacon(url, blob)) return;
+      }
       if (typeof fetch === "function") {
         fetch(url, {
           method: "POST",
@@ -121,7 +133,7 @@
   function captureMessage(msg, level) {
     var eid = uuidHex();
     sendEnvelope(
-      { event_id: eid, sent_at: new Date().toISOString(), sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+      { event_id: eid, sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
       [[{ type: "event" }, {
         event_id: eid,
         timestamp: Date.now() / 1000,
@@ -137,7 +149,7 @@
     return eid;
   }
 
-  function flushLogs() {
+  function flushLogs(preferBeacon) {
     if (cfg.flushTimer) {
       clearTimeout(cfg.flushTimer);
       cfg.flushTimer = null;
@@ -145,11 +157,12 @@
     if (!cfg.logBuffer.length) return;
     var batch = cfg.logBuffer.splice(0, 100);
     sendEnvelope(
-      { sent_at: new Date().toISOString(), sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+      { sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
       [[
         { type: "log", item_count: batch.length, content_type: "application/vnd.sentry.items.log+json" },
         { version: 2, items: batch }
-      ]]
+      ]],
+      Boolean(preferBeacon)
     );
   }
 
@@ -193,7 +206,8 @@
     cfg.environment = options.environment || "production";
     cfg.maxBreadcrumbs = options.maxBreadcrumbs || 50;
 
-    if (typeof window !== "undefined") {
+    if (typeof window !== "undefined" && !cfg.initialized) {
+      cfg.initialized = true;
       window.addEventListener("error", function (ev) {
         if (ev && ev.error) captureException(ev.error);
         else if (ev && ev.message) captureMessage(ev.message, "error");
@@ -212,7 +226,7 @@
           });
         }
       }, true);
-      window.addEventListener("pagehide", flushLogs);
+      window.addEventListener("pagehide", function () { flushLogs(true); });
     }
   }
 

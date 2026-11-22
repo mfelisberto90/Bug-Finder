@@ -1,3 +1,4 @@
+PRAGMA auto_vacuum = INCREMENTAL;
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;
@@ -317,3 +318,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(
     log_id UNINDEXED,
     organization_id UNINDEXED
 );
+
+CREATE TRIGGER IF NOT EXISTS trg_log_events_fts_del AFTER DELETE ON log_events BEGIN
+    DELETE FROM logs_fts WHERE log_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_issues_fts_del AFTER DELETE ON issues BEGIN
+    DELETE FROM issues_fts WHERE issue_id = OLD.id;
+END;

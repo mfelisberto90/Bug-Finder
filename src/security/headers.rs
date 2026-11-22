@@ -193,7 +193,22 @@ pub async fn security_headers_middleware(
     let has_session_cookie = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .map(|c| c.contains("bf_session="))
+        .and_then(|raw| {
+            raw.split(';').find_map(|part| {
+                let (k, v) = part.trim().split_once('=')?;
+                if k.trim() == "bf_session" {
+                    Some(v.trim())
+                } else {
+                    None
+                }
+            })
+        })
+        .map(|val| {
+            val.len() >= 32
+                && val
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
         .unwrap_or(false);
     let has_ingest_auth = headers.contains_key("x-sentry-auth")
         || headers.contains_key(header::AUTHORIZATION)

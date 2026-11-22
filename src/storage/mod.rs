@@ -43,6 +43,7 @@ pub struct IssueQueryParams {
     pub sort: String,
     pub since_ms: Option<i64>,
     pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +206,7 @@ pub trait StorageBackend: Send + Sync {
     async fn resolve_api_token(&self, token_sha256: &str, org_slug: Option<&str>) -> Result<Option<TenantCtx>, String>;
 
     async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String>;
+    async fn tunnel_slug_exists(&self, tunnel_slug: &str) -> Result<bool, String>;
     async fn resolve_tunnel(&self, tunnel_slug: &str, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String>;
 
     async fn list_user_organizations(&self, user_id: i64) -> Result<Vec<OrganizationDto>, String>;
@@ -301,6 +303,7 @@ pub trait StorageBackend: Send + Sync {
     async fn create_alert_rule(&self, ctx: &TenantCtx, rule: &NewAlertRule) -> Result<AlertRuleDto, String>;
     async fn delete_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<bool, String>;
     async fn get_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<AlertRuleDto>, String>;
+    async fn get_alert_rule_for_dispatch(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<(AlertRuleDto, String)>, String>;
 
     async fn list_api_tokens(&self, ctx: &TenantCtx) -> Result<Vec<ApiTokenDto>, String>;
     async fn create_api_token(

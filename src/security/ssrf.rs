@@ -18,7 +18,8 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
 
 fn is_blocked_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    ip.is_loopback()                      // 127.0.0.0/8
+    o[0] == 0                             // 0.0.0.0/8 ("this host on this network")
+        || ip.is_loopback()               // 127.0.0.0/8
         || ip.is_private()                // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
         || ip.is_link_local()             // 169.254.0.0/16 (cloud metadata)
         || ip.is_unspecified()            // 0.0.0.0/8
@@ -36,9 +37,25 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         return is_blocked_v4(mapped);
     }
     let seg = ip.segments();
+    let is_nat64 = seg[0] == 0x0064 && seg[1] == 0xff9b;
+    let is_ipv4_compat = seg[0..6] == [0; 6] && (seg[6] != 0 || seg[7] > 1);
+    let is_6to4_blocked = if seg[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        is_blocked_v4(embedded)
+    } else {
+        false
+    };
     ip.is_loopback()                  // ::1
         || ip.is_unspecified()        // ::
         || ip.is_multicast()
+        || is_nat64
+        || is_ipv4_compat
+        || is_6to4_blocked
         || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         || (seg[0] == 0x2001 && seg[1] == 0x0db8)
@@ -56,6 +73,9 @@ pub struct ValidatedTarget {
 /// loopback, link-local, metadata, and internal hostnames against SSRF.
 pub fn validate_webhook_url(raw: &str, allow_http_dev: bool) -> Result<ValidatedTarget, SsrfError> {
     let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(SsrfError("Invalid webhook URL characters".into()));
+    }
     let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
         ("https", r)
     } else if let Some(r) = trimmed.strip_prefix("http://") {
@@ -67,8 +87,8 @@ pub fn validate_webhook_url(raw: &str, allow_http_dev: bool) -> Result<Validated
         return Err(SsrfError("Webhook URL must start with https://".into()));
     };
 
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
+    let authority = rest.split(&['/', '?', '#'][..]).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
         return Err(SsrfError("Invalid webhook authority".into()));
     }
 
@@ -150,11 +170,21 @@ mod tests {
     fn ssrf_blocks_metadata_loopback_and_private_ranges() {
         assert!(validate_webhook_url("http://169.254.169.254/latest/meta-data", true).is_err());
         assert!(validate_webhook_url("https://127.0.0.1:8080/hook", false).is_err());
+        assert!(validate_webhook_url("https://0.1.2.3/hook", false).is_err());
         assert!(validate_webhook_url("https://10.0.0.5/hook", false).is_err());
         assert!(validate_webhook_url("https://[::ffff:127.0.0.1]/hook", false).is_err());
+        assert!(validate_webhook_url("https://[::127.0.0.1]/hook", false).is_err());
+        assert!(validate_webhook_url("https://[64:ff9b::127.0.0.1]/hook", false).is_err());
+        assert!(validate_webhook_url("https://[2002:7f00:0001::1]/hook", false).is_err());
+        assert!(validate_webhook_url("https://127.0.0.1?foo=bar", false).is_err());
+        assert!(validate_webhook_url("https://127.0.0.1#frag", false).is_err());
+        assert!(validate_webhook_url("https://user:pass@93.184.216.34/hook", false).is_err());
+        assert!(validate_webhook_url("https://93.184.216.34\\@127.0.0.1/hook", false).is_err());
+        assert!(validate_webhook_url("https://93.184.216.34/hook\n", false).is_ok()); // trimmed
+        assert!(validate_webhook_url("https://93.184.216.34/ho ok", false).is_err());
         assert!(validate_webhook_url("https://internal.service.local/hook", false).is_err());
         assert!(validate_webhook_url("http://hooks.example.com/hook", false).is_err());
-        let ok = validate_webhook_url("https://93.184.216.34/webhook", false).unwrap();
+        let ok = validate_webhook_url("https://93.184.216.34/webhook?a=1", false).unwrap();
         assert_eq!(ok.port, 443);
     }
 }

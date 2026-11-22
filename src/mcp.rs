@@ -151,6 +151,7 @@ pub async fn handle_mcp_request(
                         sort: "date".into(),
                         since_ms: None,
                         limit: args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 50),
+                        offset: 0,
                     };
                     let (issues, total) = storage
                         .list_issues(ctx, &iq)
@@ -221,6 +222,22 @@ pub async fn handle_mcp_request(
     }
 }
 
+pub fn percent_encode_query_component(raw: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
 pub fn run_tail_cli(
     base_url: &str,
     token: &str,
@@ -229,43 +246,65 @@ pub fn run_tail_cli(
     level: Option<&str>,
     query: Option<&str>,
 ) -> Result<(), String> {
+    let encoded_org = percent_encode_query_component(org);
     let mut url = format!(
-        "{}/api/0/organizations/{org}/logs/stream?",
+        "{}/api/0/organizations/{encoded_org}/logs/stream?",
         base_url.trim_end_matches('/')
     );
     if let Some(pid) = project {
         url.push_str(&format!("project={pid}&"));
     }
     if let Some(lvl) = level {
-        url.push_str(&format!("level={lvl}&"));
+        url.push_str(&format!("level={}&", percent_encode_query_component(lvl)));
     }
     if let Some(q) = query {
-        url.push_str(&format!("query={q}&"));
+        url.push_str(&format!("query={}&", percent_encode_query_component(q)));
     }
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .build();
-    let resp = agent
-        .get(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "text/event-stream")
-        .call()
-        .map_err(|e| format!("SSE connect failed: {e}"))?;
 
-    let reader = BufReader::new(resp.into_reader());
-    for line_res in reader.lines() {
-        let line = line_res.map_err(|e| format!("SSE read error: {e}"))?;
-        if let Some(data) = line.strip_prefix("data:") {
-            if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                let lvl = v.get("level").and_then(|x| x.as_str()).unwrap_or("info");
-                let svc = v.get("service").and_then(|x| x.as_str()).unwrap_or("-");
-                let msg = v.get("title_or_body").and_then(|x| x.as_str()).unwrap_or("");
-                let tid = v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("-");
-                println!("[{lvl}] [{svc}] [trace={tid}] {msg}");
+    let mut backoff_sec = 1u64;
+    loop {
+        match agent
+            .get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "text/event-stream")
+            .call()
+        {
+            Ok(resp) => {
+                backoff_sec = 1;
+                let reader = BufReader::new(resp.into_reader());
+                for line_res in reader.lines() {
+                    match line_res {
+                        Ok(line) => {
+                            if let Some(data) = line.strip_prefix("data:") {
+                                if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
+                                    let lvl = v.get("level").and_then(|x| x.as_str()).unwrap_or("info");
+                                    let svc = v.get("service").and_then(|x| x.as_str()).unwrap_or("-");
+                                    let msg = v.get("title_or_body").and_then(|x| x.as_str()).unwrap_or("");
+                                    let tid = v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("-");
+                                    println!("[{lvl}] [{svc}] [trace={tid}] {msg}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[tail] stream interrupted ({e}); reconnecting in {backoff_sec}s...");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(ureq::Error::Status(code, _)) if matches!(code, 401 | 403 | 404) => {
+                return Err(format!("SSE rejected with HTTP {code}"));
+            }
+            Err(e) => {
+                eprintln!("[tail] SSE connect failed ({e}); retrying in {backoff_sec}s...");
             }
         }
+        std::thread::sleep(Duration::from_secs(backoff_sec));
+        backoff_sec = (backoff_sec * 2).min(15);
     }
-    Ok(())
 }
 
 pub fn run_synthetic_test(dsn: &str, is_log: bool) -> Result<(), String> {
@@ -333,4 +372,18 @@ pub fn run_synthetic_test(dsn: &str, is_log: bool) -> Result<(), String> {
 
     println!("HTTP {} -> {}", resp.status(), resp.into_string().unwrap_or_default());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_tail_query_components_safely() {
+        assert_eq!(
+            percent_encode_query_component("payment failed & 100%"),
+            "payment%20failed%20%26%20100%25"
+        );
+        assert_eq!(percent_encode_query_component("acme-org_1.2"), "acme-org_1.2");
+    }
 }
