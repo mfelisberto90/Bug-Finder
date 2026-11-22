@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     Serve { desktop_app: bool },
+    Doctor {
+        url: Option<String>,
+        json: bool,
+    },
     Healthcheck { url: String },
     Tail {
         base_url: String,
@@ -24,6 +28,7 @@ pub enum CliCommand {
     TestEvent { dsn: String },
     TestLog { dsn: String },
     Version,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +328,18 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
     let mut desktop_app = false;
     let mut i = 1;
 
+    if matches!(
+        args.get(1).map(|s| s.as_str()),
+        Some("--help" | "-h" | "help")
+    ) {
+        return Ok(ParsedArgs {
+            command: CliCommand::Help,
+            bind_override: None,
+            data_override: None,
+            db_override: None,
+        });
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("--version") || args.get(1).map(|s| s.as_str()) == Some("-V") {
         return Ok(ParsedArgs {
             command: CliCommand::Version,
@@ -334,6 +351,38 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
 
     if let Some(sub) = args.get(1).map(|s| s.as_str()) {
         match sub {
+            "doctor" => {
+                let mut url = None;
+                let mut json = false;
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--url" => {
+                            j += 1;
+                            url = Some(args.get(j).cloned().ok_or("--url requires a value")?);
+                        }
+                        "--data" => {
+                            j += 1;
+                            data_override =
+                                Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
+                        }
+                        "--db" => {
+                            j += 1;
+                            db_override =
+                                Some(args.get(j).cloned().ok_or("--db requires a value")?);
+                        }
+                        "--json" => json = true,
+                        other => return Err(format!("Unknown doctor option: {other}")),
+                    }
+                    j += 1;
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Doctor { url, json },
+                    bind_override: None,
+                    data_override,
+                    db_override,
+                });
+            }
             "healthcheck" => {
                 let mut url = "http://127.0.0.1:8080/api/health".to_string();
                 let mut j = 2;
@@ -454,6 +503,14 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
             "--version" | "-V" => {
                 return Ok(ParsedArgs {
                     command: CliCommand::Version,
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "--help" | "-h" => {
+                return Ok(ParsedArgs {
+                    command: CliCommand::Help,
                     bind_override: None,
                     data_override: None,
                     db_override: None,

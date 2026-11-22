@@ -2655,6 +2655,54 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn db_size_bytes(&self) -> u64 {
-        0
+        sqlx::query_scalar::<_, i64>("SELECT COALESCE(pg_database_size(current_database()), 0)::bigint")
+            .fetch_one(&self.pool)
+            .await
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0)
+    }
+
+    async fn check_health(&self) -> Result<StorageHealthInfo, String> {
+        let _: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_pg_err)?;
+
+        let rolbypassrls: bool = sqlx::query_scalar(
+            "SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_pg_err)?
+        .unwrap_or(true);
+
+        let rls_row = sqlx::query(
+            "SELECT relrowsecurity, relforcerowsecurity
+             FROM pg_class
+             WHERE relname = 'issues' AND relnamespace = current_schema()::regnamespace",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_pg_err)?;
+
+        let (rel_rls, rel_force_rls) = match rls_row {
+            Some(row) => (
+                row.try_get::<bool, _>("relrowsecurity").unwrap_or(false),
+                row.try_get::<bool, _>("relforcerowsecurity").unwrap_or(false),
+            ),
+            None => (false, false),
+        };
+
+        let rls_verified = !rolbypassrls && rel_rls && rel_force_rls;
+        let detail = format!(
+            "PostgreSQL reachable (nobypassrls={}, issues_rls={}, issues_force_rls={})",
+            !rolbypassrls, rel_rls, rel_force_rls
+        );
+        Ok(StorageHealthInfo {
+            engine: "postgres".to_string(),
+            ok: true,
+            detail,
+            wal_or_rls_verified: rls_verified,
+        })
     }
 }

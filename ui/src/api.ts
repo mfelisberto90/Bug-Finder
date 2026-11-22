@@ -136,10 +136,82 @@ export interface ApiTokenItem {
   created_at: string;
 }
 
+export interface SelfCheckItem {
+  id: string;
+  status: "ok" | "warn" | "error";
+  category: string;
+  title: string;
+  detail: string;
+  fix: string | null;
+}
+
+export interface SelfErrorRecord {
+  id: number;
+  timestamp_ms: number;
+  source: string;
+  severity: string;
+  component: string;
+  message: string;
+  detail: string | null;
+  count: number;
+}
+
+export interface SelfCheckReport {
+  overall_status: "ok" | "warn" | "error";
+  version: string;
+  uptime_sec: number;
+  engine: string;
+  vm_rss_bytes: number | null;
+  db_size_bytes: number;
+  max_db_mb: number;
+  checks: SelfCheckItem[];
+  self_errors: SelfErrorRecord[];
+  unacknowledged_error_count: number;
+  missing_count: number;
+}
+
+export interface SelfProbeStep {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface SelfProbeResult {
+  ok: boolean;
+  steps: SelfProbeStep[];
+  report: SelfCheckReport;
+}
+
+export interface LocalSelfError {
+  id: number;
+  timestamp: string;
+  source: string;
+  severity: string;
+  component: string;
+  message: string;
+  detail?: string;
+}
+
+type TransportErrorHook = (info: { path: string; status: number; message: string }) => void;
+
 let csrfToken = "";
+let transportErrorHook: TransportErrorHook | null = null;
 
 export function setCsrfToken(tok: string): void {
   csrfToken = tok;
+}
+
+export function setTransportErrorHook(fn: TransportErrorHook): void {
+  transportErrorHook = fn;
+}
+
+function notifyTransportError(path: string, status: number, message: string): void {
+  if (!transportErrorHook || path.includes("/self-check/client-error/")) {
+    return;
+  }
+  try {
+    transportErrorHook({ path, status, message });
+  } catch {}
 }
 
 export async function apiFetch<T>(
@@ -154,12 +226,25 @@ export async function apiFetch<T>(
   if (method !== "GET" && method !== "HEAD" && csrfToken) {
     headers["X-CSRF-Token"] = csrfToken;
   }
-  const resp = await fetch(path, {
-    method,
-    headers,
-    credentials: "same-origin",
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined
-  });
+
+  let resp: Response;
+  try {
+    resp = await fetch(path, {
+      method,
+      headers,
+      credentials: "same-origin",
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined
+    });
+  } catch (err: any) {
+    const msg = err?.message ? String(err.message) : "Network error contacting Bug-Finder server";
+    notifyTransportError(path, 0, msg);
+    return {
+      ok: false,
+      status: 0,
+      data: null,
+      error: msg
+    };
+  }
 
   // Always consume the body stream before returning so Playwright networkidle never hangs
   const text = await resp.text().catch(() => "");
@@ -173,11 +258,15 @@ export async function apiFetch<T>(
   const hits = hitsRaw ? Number(hitsRaw) : undefined;
 
   if (!resp.ok) {
+    const errMsg = (parsed && parsed.error) || `HTTP ${resp.status}`;
+    if (resp.status >= 500) {
+      notifyTransportError(path, resp.status, `${method} ${path} -> ${errMsg}`);
+    }
     return {
       ok: false,
       status: resp.status,
       data: null,
-      error: (parsed && parsed.error) || `HTTP ${resp.status}`,
+      error: errMsg,
       hits
     };
   }

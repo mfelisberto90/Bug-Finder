@@ -13,6 +13,7 @@ pub struct AppMetrics {
     pub queue_depth: AtomicU64,
     pub batch_flushes_total: AtomicU64,
     pub alerts_sent_total: AtomicU64,
+    pub self_errors_total: AtomicU64,
 }
 
 impl AppMetrics {
@@ -43,6 +44,9 @@ impl AppMetrics {
              # HELP bugfinder_alerts_sent_total Total alert notifications dispatched\n\
              # TYPE bugfinder_alerts_sent_total counter\n\
              bugfinder_alerts_sent_total {}\n\
+             # HELP bugfinder_self_errors_total Total internal errors recorded by self-monitor\n\
+             # TYPE bugfinder_self_errors_total counter\n\
+             bugfinder_self_errors_total {}\n\
              # HELP bugfinder_rss_bytes Current process VmRSS in bytes\n\
              # TYPE bugfinder_rss_bytes gauge\n\
              bugfinder_rss_bytes {}\n\
@@ -59,6 +63,7 @@ impl AppMetrics {
             self.queue_depth.load(Ordering::Relaxed),
             self.batch_flushes_total.load(Ordering::Relaxed),
             self.alerts_sent_total.load(Ordering::Relaxed),
+            self.self_errors_total.load(Ordering::Relaxed),
             rss,
             db_bytes,
         )

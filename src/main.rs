@@ -7,10 +7,12 @@ use bugfinder::runtime::{
     build_compact_tokio_runtime, init_low_ram_allocator, probe_existing_instance, run_healthcheck,
     spawn_desktop_window, wait_for_desktop_browser,
 };
+use bugfinder::selfcheck::{install_panic_hook, run_doctor_cli};
 use bugfinder::storage::batch_writer::spawn_alert_jobs;
 use bugfinder::{build_app_state, build_storage};
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -29,9 +31,48 @@ fn main() -> ExitCode {
     };
 
     match parsed.command {
+        CliCommand::Help => {
+            println!(
+                "Bug-Finder v{}\n\n\
+                 USAGE:\n  \
+                   bugfinder [--headless | --app] [--bind ADDR] [--data DIR] [--db URL]\n  \
+                   bugfinder doctor [--url URL] [--data DIR] [--db URL] [--json]\n  \
+                   bugfinder healthcheck [--url http://127.0.0.1:8080/api/health]\n  \
+                   bugfinder tail --url URL --org SLUG --token TOKEN [--project ID] [--level LVL] [--query Q]\n  \
+                   bugfinder mcp [--org SLUG] [--token TOKEN] [--data DIR] [--db URL]\n  \
+                   bugfinder test-event --dsn DSN\n  \
+                   bugfinder test-log --dsn DSN\n  \
+                   bugfinder --version | --help",
+                env!("CARGO_PKG_VERSION")
+            );
+            ExitCode::SUCCESS
+        }
         CliCommand::Version => {
             println!("bugfinder {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
+        }
+        CliCommand::Doctor { url, json } => {
+            let cfg = match AppConfig::from_env_and_overrides(
+                None,
+                parsed.data_override,
+                parsed.db_override,
+                false,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("config error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match build_compact_tokio_runtime() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("tokio init error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let code = rt.block_on(async move { run_doctor_cli(&cfg, url.as_deref(), json).await });
+            ExitCode::from(code as u8)
         }
         CliCommand::Healthcheck { url } => ExitCode::from(run_healthcheck(&url) as u8),
         CliCommand::Tail {
@@ -142,6 +183,7 @@ fn main() -> ExitCode {
 }
 
 async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
+    install_panic_hook(config.data_dir.clone());
     let storage = match build_storage(&config).await {
         Ok(s) => s,
         Err(e) => {
@@ -158,12 +200,32 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Ok(alerts) = maint_state
+            match maint_state
                 .storage
                 .run_maintenance(maint_state.config.retention_days, maint_state.config.max_db_mb)
                 .await
             {
-                spawn_alert_jobs(&maint_state.config, &maint_state.metrics, alerts);
+                Ok(alerts) => {
+                    spawn_alert_jobs(
+                        &maint_state.config,
+                        &maint_state.metrics,
+                        &maint_state.self_monitor,
+                        alerts,
+                    );
+                }
+                Err(err) => {
+                    maint_state
+                        .metrics
+                        .self_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    maint_state.self_monitor.record(
+                        "maintenance",
+                        "error",
+                        "storage",
+                        "Background maintenance failed",
+                        Some(&err),
+                    );
+                }
             }
         }
     });

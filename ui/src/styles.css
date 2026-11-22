@@ -149,6 +149,10 @@ textarea {
   min-height: 100dvh;
 }
 
+.shell > div {
+  min-width: 0;
+}
+
 .sidebar {
   background: var(--surface);
   border-inline-end: 1px solid var(--border);
@@ -527,12 +531,78 @@ dialog.bf-dialog::backdrop {
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.24);
 }
 
+.selfcheck-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+
+.selfcheck-strip-error {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+.selfcheck-strip-warn {
+  background: var(--warn-bg);
+  border-color: var(--warn);
+}
+
+.selfcheck-strip-ok {
+  background: var(--ok-bg);
+  border-color: var(--ok);
+}
+
+.selfcheck-strip-copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.probe-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.probe-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+}
+
+.mobile-top-bar {
+  display: none;
+}
+
 @media (max-width: 768px) {
   .shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .sidebar {
     display: none;
+  }
+  .mobile-top-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 14px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
   }
   .main-pane {
     padding: 14px 14px 148px;

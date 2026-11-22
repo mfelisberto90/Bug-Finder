@@ -587,3 +587,122 @@ async fn postgres_rls_live_isolation_test() {
     let resolved = app_backend.resolve_dsn(proj1.id, &dsn1_sha).await.unwrap();
     assert!(resolved.is_some());
 }
+
+#[tokio::test]
+async fn self_check_monitor_probe_client_error_and_doctor_flow() {
+    let (_dir, state, router, _dsn_key, _project_id) = setup_test_app().await;
+
+    // 1. Unauthenticated access to self-check must return 401
+    let (unauth_st, _, _) = send_json(&router, "GET", "/api/0/organizations/alpha/self-check/", &[], Value::Null).await;
+    assert_eq!(unauth_st, StatusCode::UNAUTHORIZED);
+
+    // 2. Public /api/health returns 200 OK when SQLite storage is healthy
+    let (h_st, _, _) = send_raw(&router, "GET", "/api/health", &[], Vec::new()).await;
+    assert_eq!(h_st, StatusCode::OK);
+
+    let (cookie, csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let auth_hdrs = [
+        (header::COOKIE.as_str(), cookie.as_str()),
+        ("x-csrf-token", csrf.as_str()),
+    ];
+
+    // 3. Initial GET /self-check/ accurately reports missing alerts/tokens/telemetry as warn and storage as ok
+    let (sc_st, _, sc_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/self-check/",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(sc_st, StatusCode::OK);
+    let checks = sc_body["checks"].as_array().unwrap();
+    let find_status = |id: &str| {
+        checks
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap()["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(find_status("storage_health"), "ok");
+    assert_eq!(find_status("projects_and_dsn"), "ok");
+    assert_eq!(find_status("telemetry_received"), "warn");
+    assert_eq!(find_status("alerts_configured"), "warn");
+    assert_eq!(find_status("api_tokens_configured"), "warn");
+
+    // 4. Report frontend client self-error containing a synthetic Bearer secret -> scrubbed + triggers error status
+    let synthetic_secret = "Bearer secret_client_probe_0000000000"; // gitleaks:allow
+    let (ce_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/self-check/client-error/",
+        &auth_hdrs,
+        json!({
+            "message": format!("UI failed with {synthetic_secret}"),
+            "component": "spa",
+            "severity": "error",
+            "detail": "stack line 42"
+        }),
+    )
+    .await;
+    assert_eq!(ce_st, StatusCode::ACCEPTED);
+
+    let (sc2_st, _, sc2_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/self-check/",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(sc2_st, StatusCode::OK);
+    assert_eq!(sc2_body["overall_status"], "error");
+    assert_eq!(sc2_body["unacknowledged_error_count"], 1);
+    let errs = sc2_body["self_errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 1);
+    let recorded_msg = errs[0]["message"].as_str().unwrap();
+    assert!(!recorded_msg.contains("secret_client_probe_0000000000"));
+    assert!(recorded_msg.contains("[Filtered]"));
+
+    // 5. Run live E2E probe -> all 5 steps pass & telemetry_received turns ok
+    let (pr_st, _, pr_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/self-check/probe/",
+        &auth_hdrs,
+        json!({ "send_test_log": true }),
+    )
+    .await;
+    assert_eq!(pr_st, StatusCode::OK);
+    assert_eq!(pr_body["ok"], true);
+    let steps = pr_body["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 5);
+    assert!(steps.iter().all(|s| s["ok"] == true));
+    let post_checks = pr_body["report"]["checks"].as_array().unwrap();
+    assert_eq!(
+        post_checks
+            .iter()
+            .find(|c| c["id"] == "telemetry_received")
+            .unwrap()["status"],
+        "ok"
+    );
+
+    // 6. Acknowledge / clear internal self-errors -> unacknowledged_error_count resets to 0
+    let (ack_st, _, ack_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/self-check/ack/",
+        &auth_hdrs,
+        json!({ "clear": true }),
+    )
+    .await;
+    assert_eq!(ack_st, StatusCode::OK);
+    assert_eq!(ack_body["unacknowledged_error_count"], 0);
+    assert!(ack_body["self_errors"].as_array().unwrap().is_empty());
+
+    // 7. Doctor CLI check on the initialized data_dir exits 0 cleanly
+    let doctor_code = bugfinder::selfcheck::run_doctor_cli(&state.config, None, true).await;
+    assert_eq!(doctor_code, 0);
+}

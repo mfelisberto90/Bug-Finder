@@ -7,6 +7,7 @@ pub mod http;
 pub mod mcp;
 pub mod runtime;
 pub mod security;
+pub mod selfcheck;
 pub mod storage;
 
 use crate::config::AppConfig;
@@ -15,6 +16,7 @@ use crate::domain::sourcemap::SourceMapCache;
 use crate::security::headers::ScannerGuard;
 use crate::security::metrics::AppMetrics;
 use crate::security::ratelimit::{EventDedupeCache, HmacRateLimiter};
+use crate::selfcheck::SelfMonitor;
 use crate::storage::batch_writer::BatchWriter;
 use crate::storage::postgres::PostgresStorage;
 use crate::storage::sqlite::SqliteStorage;
@@ -32,6 +34,7 @@ pub struct AppState {
     pub scanner_guard: ScannerGuard,
     pub sourcemap_cache: SourceMapCache,
     pub metrics: Arc<AppMetrics>,
+    pub self_monitor: Arc<SelfMonitor>,
     pub live_tx: broadcast::Sender<LiveStreamEvent>,
 }
 
@@ -51,7 +54,13 @@ pub fn build_app_state(
     storage: Arc<dyn StorageBackend>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(AppMetrics::default());
-    let batch_writer = BatchWriter::spawn(storage.clone(), config.clone(), metrics.clone());
+    let self_monitor = Arc::new(SelfMonitor::new(config.data_dir.clone()));
+    let batch_writer = BatchWriter::spawn(
+        storage.clone(),
+        config.clone(),
+        metrics.clone(),
+        self_monitor.clone(),
+    );
     let rate_limiter = HmacRateLimiter::new(config.app_key, 16_384);
     let event_dedupe = EventDedupeCache::new(32_768, Duration::from_secs(600));
     let scanner_guard = ScannerGuard::new();
@@ -67,6 +76,7 @@ pub fn build_app_state(
         scanner_guard,
         sourcemap_cache,
         metrics,
+        self_monitor,
         live_tx,
     })
 }

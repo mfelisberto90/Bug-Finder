@@ -2980,4 +2980,44 @@ impl StorageBackend for SqliteStorage {
             .unwrap_or(0);
         main + wal
     }
+
+    async fn check_health(&self) -> Result<StorageHealthInfo, String> {
+        let (journal_mode, fts_ok) = self
+            .read(|conn| {
+                let _: i64 = conn
+                    .query_row("SELECT 1", [], |r| r.get(0))
+                    .map_err(map_sqlite_err)?;
+                let mode: String = conn
+                    .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+                    .map_err(map_sqlite_err)?;
+                let fts_ok = conn
+                    .query_row("SELECT count(*) FROM issues_fts LIMIT 1", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .is_ok();
+                Ok((mode, fts_ok))
+            })
+            .await?;
+
+        self.write(|conn| {
+            let _: i64 = conn
+                .query_row("SELECT 1", [], |r| r.get(0))
+                .map_err(map_sqlite_err)?;
+            Ok(())
+        })
+        .await?;
+
+        let is_wal = journal_mode.eq_ignore_ascii_case("wal");
+        let ok = fts_ok;
+        let detail = format!(
+            "SQLite engine reachable (journal_mode={journal_mode}, fts5={})",
+            if fts_ok { "ready" } else { "missing" }
+        );
+        Ok(StorageHealthInfo {
+            engine: "sqlite".to_string(),
+            ok,
+            detail,
+            wal_or_rls_verified: is_wal,
+        })
+    }
 }
