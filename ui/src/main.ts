@@ -8,8 +8,11 @@ import {
   type IssueSummary,
   type LocalSelfError,
   type LogEventItem,
+  type MemberItem,
   type Organization,
   type Project,
+  type ProjectFilters,
+  type ProjectKeyItem,
   type ReleaseHealth,
   type SelfCheckReport,
   type SelfProbeResult,
@@ -19,6 +22,7 @@ import {
 } from "./api";
 
 type TabId = "issues" | "logs" | "perf" | "uptime" | "projects" | "selfcheck";
+type MountedMode = "none" | "loading" | "setup" | "login" | "dashboard";
 
 interface AppStateModel {
   loading: boolean;
@@ -31,11 +35,15 @@ interface AppStateModel {
   issues: IssueSummary[];
   issueFilterStatus: string;
   issueSearch: string;
+  issueSort: "date" | "freq" | "new";
+  issueOffset: number;
+  issueTotalHits: number;
   selectedIssue: IssueSummary | null;
   selectedIssueEvent: IssueEventDetail | null;
   logs: LogEventItem[];
   logSearch: string;
   logLevelFilter: string;
+  logsHasMore: boolean;
   liveTailOn: boolean;
   liveEntries: LogEventItem[];
   transactions: TransactionSummary[];
@@ -43,8 +51,10 @@ interface AppStateModel {
   monitors: UptimeMonitor[];
   alerts: AlertRule[];
   tokens: ApiTokenItem[];
+  members: MemberItem[];
+  activeProjectModalId: number | null;
+  activeProjectKeys: ProjectKeyItem[];
   lastCreatedToken: string | null;
-  toast: string | null;
   traceView: Record<string, any> | null;
   themePref: "system" | "light" | "dark";
   selfCheck: SelfCheckReport | null;
@@ -52,6 +62,9 @@ interface AppStateModel {
   localSelfErrors: LocalSelfError[];
   probeRunning: boolean;
 }
+
+const ISSUES_PAGE_SIZE = 25;
+const LOGS_PAGE_SIZE = 50;
 
 const state: AppStateModel = {
   loading: true,
@@ -64,11 +77,15 @@ const state: AppStateModel = {
   issues: [],
   issueFilterStatus: "unresolved",
   issueSearch: "",
+  issueSort: "date",
+  issueOffset: 0,
+  issueTotalHits: 0,
   selectedIssue: null,
   selectedIssueEvent: null,
   logs: [],
   logSearch: "",
   logLevelFilter: "",
+  logsHasMore: false,
   liveTailOn: false,
   liveEntries: [],
   transactions: [],
@@ -76,8 +93,10 @@ const state: AppStateModel = {
   monitors: [],
   alerts: [],
   tokens: [],
+  members: [],
+  activeProjectModalId: null,
+  activeProjectKeys: [],
   lastCreatedToken: null,
-  toast: null,
   traceView: null,
   themePref: readSavedTheme(),
   selfCheck: null,
@@ -87,9 +106,10 @@ const state: AppStateModel = {
 };
 
 let sseSource: EventSource | null = null;
-let openDialogCount = 0;
-let inRender = false;
+let mountedMode: MountedMode = "none";
 let localErrSeq = 1;
+let toastSeq = 1;
+let toastTimer: number | null = null;
 let sendingClientError = false;
 let lastClientErrSentAt = 0;
 let lastClientErrSig = "";
@@ -108,6 +128,8 @@ function applyTheme(pref: "system" | "light" | "dark"): void {
   if (meta) {
     meta.setAttribute("content", pref === "system" ? "light dark" : pref);
   }
+  const themeSel = document.getElementById("theme-select") as HTMLSelectElement | null;
+  if (themeSel && themeSel.value !== pref) themeSel.value = pref;
   try {
     if (pref === "system") localStorage.removeItem("bf-color-scheme");
     else localStorage.setItem("bf-color-scheme", pref);
@@ -117,20 +139,8 @@ function applyTheme(pref: "system" | "light" | "dark"): void {
 window.addEventListener("storage", (e) => {
   if (e.key === "bf-color-scheme") {
     applyTheme(readSavedTheme());
-    render();
   }
 });
-
-function showToast(msg: string): void {
-  state.toast = msg;
-  render();
-  setTimeout(() => {
-    if (state.toast === msg) {
-      state.toast = null;
-      render();
-    }
-  }, 3200);
-}
 
 function esc(val: unknown): string {
   return String(val ?? "")
@@ -141,42 +151,90 @@ function esc(val: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-function openDialog(dlg: HTMLDialogElement): void {
-  const chrome = document.getElementById("app-chrome");
-  openDialogCount += 1;
-  if (chrome) (chrome as any).inert = openDialogCount > 0;
-
-  // Mandatory Safari light-dismiss fallback alongside closedby="any"
-  if (!("closedBy" in HTMLDialogElement.prototype)) {
-    dlg.addEventListener("click", (event) => {
-      if (event.target !== dlg) return;
-      const rect = dlg.getBoundingClientRect();
-      const inside =
-        rect.top <= event.clientY &&
-        event.clientY <= rect.top + rect.height &&
-        rect.left <= event.clientX &&
-        event.clientX <= rect.left + rect.width;
-      if (!inside) dlg.close();
-    });
+function ensureRoots(): {
+  shell: HTMLElement;
+  dialogs: HTMLElement;
+  toast: HTMLElement;
+} | null {
+  const app = document.getElementById("app");
+  if (!app) return null;
+  let shell = document.getElementById("shell-root");
+  let dialogs = document.getElementById("dialogs-root");
+  let toast = document.getElementById("toast-root");
+  if (!shell || !dialogs || !toast) {
+    app.innerHTML =
+      '<div id="shell-root"></div><div id="dialogs-root"></div><div id="toast-root" aria-live="polite"></div>';
+    shell = document.getElementById("shell-root");
+    dialogs = document.getElementById("dialogs-root");
+    toast = document.getElementById("toast-root");
   }
-
-  dlg.addEventListener(
-    "close",
-    () => {
-      openDialogCount = Math.max(0, openDialogCount - 1);
-      if (chrome) (chrome as any).inert = openDialogCount > 0;
-    },
-    { once: true }
-  );
-  dlg.showModal();
+  if (!shell || !dialogs || !toast) return null;
+  return { shell, dialogs, toast };
 }
 
-function scheduleRender(): void {
-  if (inRender) {
-    queueMicrotask(() => render());
-  } else {
-    render();
+function showToast(msg: string): void {
+  const roots = ensureRoots();
+  if (!roots) return;
+  const seq = ++toastSeq;
+  if (toastTimer !== null) {
+    window.clearTimeout(toastTimer);
+    toastTimer = null;
   }
+  roots.toast.innerHTML = `<div class="toast" popover="manual" role="status">${esc(msg)}</div>`;
+  const toastEl = roots.toast.firstElementChild as HTMLElement | null;
+  if (toastEl && "showPopover" in toastEl) {
+    try {
+      (toastEl as any).showPopover();
+    } catch {}
+  }
+  toastTimer = window.setTimeout(() => {
+    if (toastSeq === seq) {
+      roots.toast.innerHTML = "";
+      toastTimer = null;
+    }
+  }, 3200);
+}
+
+function wireDialogBehavior(dlg: HTMLDialogElement): void {
+  if (dlg.dataset.bfWired === "1") return;
+  dlg.dataset.bfWired = "1";
+
+  dlg.addEventListener("close", () => {
+    dlg.returnValue = "";
+  });
+
+  // Safari fallback alongside declarative closedby="any": require both press and release outside dialog box
+  if (!("closedBy" in HTMLDialogElement.prototype)) {
+    const outside = (e: PointerEvent): boolean => {
+      const r = dlg.getBoundingClientRect();
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+    };
+    let pressedOutside = false;
+    dlg.addEventListener("pointerdown", (e) => {
+      pressedOutside = outside(e);
+    });
+    dlg.addEventListener("pointerup", (e) => {
+      if (pressedOutside && outside(e)) {
+        dlg.close();
+      }
+      pressedOutside = false;
+    });
+  }
+}
+
+function openDialog(dlg: HTMLDialogElement): void {
+  wireDialogBehavior(dlg);
+  if (!dlg.open) {
+    dlg.showModal();
+  }
+}
+
+function closeAllDialogs(): void {
+  document.querySelectorAll<HTMLDialogElement>("#dialogs-root dialog[open]").forEach((d) => {
+    try {
+      d.close();
+    } catch {}
+  });
 }
 
 async function refreshSelfCheck(): Promise<void> {
@@ -186,6 +244,36 @@ async function refreshSelfCheck(): Promise<void> {
   );
   if (res.ok && res.data) {
     state.selfCheck = res.data;
+  }
+}
+
+function syncSelfCheckSlots(): void {
+  if (!state.user) {
+    const authSlot = document.getElementById("auth-selfcheck-slot");
+    if (authSlot) {
+      authSlot.innerHTML = state.localSelfErrors.length
+        ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
+        : "";
+    }
+    return;
+  }
+
+  const summary = getEffectiveSelfStatus();
+  document.querySelectorAll<HTMLElement>("[data-selfcheck-badge]").forEach((badge) => {
+    badge.className = `badge badge-${summary.badgeClass}`;
+    badge.textContent = summary.badgeText;
+  });
+
+  const bannerSlot = document.getElementById("selfcheck-banner-slot");
+  if (bannerSlot) {
+    bannerSlot.innerHTML = renderSelfCheckBanner();
+    document.getElementById("btn-open-selfcheck")?.addEventListener("click", () => {
+      void switchTab("selfcheck");
+    });
+  }
+
+  if (state.tab === "selfcheck" && mountedMode === "dashboard") {
+    renderMainPane();
   }
 }
 
@@ -214,7 +302,7 @@ function recordClientSelfError(
     if (state.localSelfErrors.length > 32) {
       state.localSelfErrors.length = 32;
     }
-    scheduleRender();
+    syncSelfCheckSlots();
   }
 
   const now = Date.now();
@@ -245,7 +333,7 @@ function recordClientSelfError(
           if (state.selfCheck && insertedEntryId !== null) {
             state.localSelfErrors = state.localSelfErrors.filter((e) => e.id !== insertedEntryId);
           }
-          scheduleRender();
+          syncSelfCheckSlots();
         }
       })
       .finally(() => {
@@ -278,8 +366,11 @@ async function boot(): Promise<void> {
   const me = await apiFetch<any>("/api/auth/me");
   if (me.ok && me.data) {
     state.user = me.data.user;
-    state.orgSlug = me.data.organization_slug;
     state.orgs = me.data.organizations || [];
+    const preferredExists = state.orgs.some((o) => o.slug === state.orgSlug);
+    if (!preferredExists) {
+      state.orgSlug = me.data.organization_slug || state.orgs[0]?.slug || "";
+    }
     setCsrfToken(me.data.csrf_token || "");
     state.loading = false;
     await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
@@ -292,29 +383,69 @@ async function boot(): Promise<void> {
   render();
 }
 
+async function fetchIssuesPage(append: boolean): Promise<void> {
+  const qParts: string[] = [];
+  if (state.issueFilterStatus) qParts.push(`is:${state.issueFilterStatus}`);
+  if (state.issueSearch.trim()) qParts.push(state.issueSearch.trim());
+  const offset = append ? state.issues.length : 0;
+  const params = new URLSearchParams({
+    query: qParts.join(" "),
+    sort: state.issueSort,
+    limit: String(ISSUES_PAGE_SIZE),
+    offset: String(offset)
+  });
+  const res = await apiFetch<IssueSummary[]>(
+    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/?${params.toString()}`
+  );
+  if (res.ok && res.data) {
+    if (append) {
+      const seen = new Set(state.issues.map((i) => i.id));
+      for (const item of res.data) {
+        if (!seen.has(item.id)) state.issues.push(item);
+      }
+    } else {
+      state.issues = res.data;
+    }
+    state.issueOffset = state.issues.length;
+    state.issueTotalHits = res.hits ?? state.issues.length;
+  }
+}
+
+async function fetchLogsPage(append: boolean): Promise<void> {
+  const params = new URLSearchParams();
+  if (state.logLevelFilter) params.set("level", state.logLevelFilter);
+  if (state.logSearch.trim()) params.set("query", state.logSearch.trim());
+  params.set("limit", String(LOGS_PAGE_SIZE));
+  if (append && state.logs.length > 0) {
+    params.set("cursor", state.logs[state.logs.length - 1].id);
+  }
+  const res = await apiFetch<LogEventItem[]>(
+    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/logs/?${params.toString()}`
+  );
+  if (res.ok && res.data) {
+    if (append) {
+      const seen = new Set(state.logs.map((l) => l.id));
+      for (const item of res.data) {
+        if (!seen.has(item.id)) state.logs.push(item);
+      }
+    } else {
+      state.logs = res.data;
+    }
+    state.logsHasMore = res.data.length === LOGS_PAGE_SIZE;
+  }
+}
+
 async function loadCurrentTabData(): Promise<void> {
   if (!state.orgSlug) return;
-  const projRes = await apiFetch<Project[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/projects/`);
+  const projRes = await apiFetch<Project[]>(
+    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/projects/`
+  );
   if (projRes.ok && projRes.data) state.projects = projRes.data;
 
   if (state.tab === "issues") {
-    const qParts: string[] = [];
-    if (state.issueFilterStatus) qParts.push(`is:${state.issueFilterStatus}`);
-    if (state.issueSearch.trim()) qParts.push(state.issueSearch.trim());
-    const q = encodeURIComponent(qParts.join(" "));
-    const res = await apiFetch<IssueSummary[]>(
-      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/?query=${q}&limit=50`
-    );
-    if (res.ok && res.data) state.issues = res.data;
+    await fetchIssuesPage(false);
   } else if (state.tab === "logs") {
-    const params = new URLSearchParams();
-    if (state.logLevelFilter) params.set("level", state.logLevelFilter);
-    if (state.logSearch.trim()) params.set("query", state.logSearch.trim());
-    params.set("limit", "100");
-    const res = await apiFetch<LogEventItem[]>(
-      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/logs/?${params.toString()}`
-    );
-    if (res.ok && res.data) state.logs = res.data;
+    await fetchLogsPage(false);
   } else if (state.tab === "perf") {
     const [txRes, relRes] = await Promise.all([
       apiFetch<TransactionSummary[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/transactions/`),
@@ -330,11 +461,39 @@ async function loadCurrentTabData(): Promise<void> {
     if (monRes.ok && monRes.data) state.monitors = monRes.data;
     if (alRes.ok && alRes.data) state.alerts = alRes.data;
   } else if (state.tab === "projects") {
-    const tokRes = await apiFetch<ApiTokenItem[]>(`/api/0/api-tokens/`);
+    const [tokRes, memRes] = await Promise.all([
+      apiFetch<ApiTokenItem[]>(`/api/0/api-tokens/`),
+      apiFetch<MemberItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`)
+    ]);
     if (tokRes.ok && tokRes.data) state.tokens = tokRes.data;
+    if (memRes.ok && memRes.data) state.members = memRes.data;
   } else if (state.tab === "selfcheck") {
     await refreshSelfCheck();
   }
+}
+
+async function switchTab(target: TabId): Promise<void> {
+  if (target !== "logs") stopLiveTail();
+  state.tab = target;
+  await loadCurrentTabData();
+  render();
+}
+
+async function switchOrganization(slug: string): Promise<void> {
+  if (!slug || slug === state.orgSlug) return;
+  stopLiveTail();
+  closeAllDialogs();
+  state.orgSlug = slug;
+  state.issues = [];
+  state.issueOffset = 0;
+  state.issueTotalHits = 0;
+  state.logs = [];
+  state.liveEntries = [];
+  state.logsHasMore = false;
+  state.selectedIssue = null;
+  state.selectedIssueEvent = null;
+  await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+  render();
 }
 
 function stopLiveTail(): void {
@@ -345,10 +504,49 @@ function stopLiveTail(): void {
   state.liveTailOn = false;
 }
 
+function renderLogRowsHtml(items: LogEventItem[]): string {
+  return items.length
+    ? items
+        .map(
+          (l) => `
+          <tr>
+            <th scope="row" class="mono tabular">${esc(l.timestamp.slice(11, 23))}</th>
+            <td data-label="Level"><span class="badge badge-${esc(l.level)}">${esc(l.level)}</span></td>
+            <td data-label="Service" class="mono">${esc(l.service || "-")}</td>
+            <td data-label="Body" class="mono">${esc(l.body)}</td>
+            <td data-label="Trace" class="mono">
+              ${
+                l.traceID
+                  ? `<button type="button" class="row-trigger" data-open-trace="${esc(l.traceID)}">${esc(l.traceID.slice(0, 12))}...</button>`
+                  : "-"
+              }
+            </td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5">No structured logs yet. Post to Sentry Envelope (type=log) or OTLP /v1/logs.</td></tr>`;
+}
+
+function updateLiveTailDomInPlace(): void {
+  const tbody = document.getElementById("logs-tbody");
+  if (!tbody) return;
+  const items = state.liveTailOn ? state.liveEntries : state.logs;
+  tbody.innerHTML = renderLogRowsHtml(items);
+  bindTraceOpenButtons(tbody);
+  const toggleBtn = document.getElementById("btn-toggle-live");
+  if (toggleBtn) {
+    toggleBtn.textContent = state.liveTailOn ? "Pause Live Tail" : "Start Live Tail (SSE)";
+  }
+  const pager = document.getElementById("logs-pager-row");
+  if (pager) {
+    pager.classList.toggle("is-hidden", state.liveTailOn || !state.logsHasMore);
+  }
+}
+
 function toggleLiveTail(): void {
   if (state.liveTailOn) {
     stopLiveTail();
-    render();
+    updateLiveTailDomInPlace();
     return;
   }
   state.liveTailOn = true;
@@ -374,15 +572,21 @@ function toggleLiveTail(): void {
         projectId: parsed.project_id || 0
       });
       if (state.liveEntries.length > 80) state.liveEntries.length = 80;
-      render();
+      if (state.tab === "logs" && state.liveTailOn) {
+        updateLiveTailDomInPlace();
+      }
     } catch {}
   };
   sseSource.addEventListener("log", onMsg);
   sseSource.addEventListener("issue", onMsg);
-  render();
+  updateLiveTailDomInPlace();
 }
 
 function renderAuthScreen(): string {
+  const errBanner = state.localSelfErrors.length
+    ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
+    : "";
+
   if (state.needsSetup) {
     return `
       <main class="auth-wrap">
@@ -396,18 +600,31 @@ function renderAuthScreen(): string {
               <label for="setup-website">Website</label>
               <input id="setup-website" name="website" tabindex="-1" autocomplete="off">
             </div>
-            <label>Organization Name <input name="org_name" required value="Acme Engineering"></label>
-            <label>Organization Slug <input name="org_slug" required pattern="[a-z0-9_\\-]{2,40}" value="acme"></label>
-            <label>Your Name <input name="name" required value="Owner"></label>
-            <label>Email <input name="email" type="email" required placeholder="you@company.com"></label>
-            <label>Password (min 8 chars) <input name="password" type="password" required minlength="8"></label>
-            <label>First Project Name <input name="project_name" required value="Main App"></label>
+            <label for="setup-org-name">Organization Name
+              <input id="setup-org-name" name="org_name" type="text" required autocomplete="organization" enterkeyhint="next" value="Acme Engineering">
+            </label>
+            <label for="setup-org-slug">Organization Slug
+              <input id="setup-org-slug" name="org_slug" type="text" required pattern="[a-z0-9_\\-]{2,40}" autocomplete="off" spellcheck="false" enterkeyhint="next" value="acme">
+            </label>
+            <label for="setup-name">Your Name
+              <input id="setup-name" name="name" type="text" required autocomplete="name" enterkeyhint="next" value="Owner">
+            </label>
+            <label for="setup-email">Email
+              <input id="setup-email" name="email" type="email" required autocomplete="email" spellcheck="false" enterkeyhint="next" placeholder="you@company.com">
+            </label>
+            <label for="setup-password">Password (min 8 chars)
+              <input id="setup-password" name="password" type="password" required minlength="8" autocomplete="new-password" enterkeyhint="next">
+            </label>
+            <label for="setup-project-name">First Project Name
+              <input id="setup-project-name" name="project_name" type="text" required autocomplete="off" enterkeyhint="done" value="Main App">
+            </label>
             <div class="cta-dock">
               <button type="submit" data-primary-cta="true">Complete Setup</button>
             </div>
           </form>
         </section>
-      </main>`;
+      </main>
+      <div id="auth-selfcheck-slot">${errBanner}</div>`;
   }
 
   return `
@@ -422,20 +639,26 @@ function renderAuthScreen(): string {
             <label for="login-website">Website</label>
             <input id="login-website" name="website" tabindex="-1" autocomplete="off">
           </div>
-          <label>Email <input name="email" type="email" required autocomplete="username"></label>
-          <label>Password <input name="password" type="password" required autocomplete="current-password"></label>
+          <label for="login-email">Email
+            <input id="login-email" name="email" type="email" required autocomplete="username" spellcheck="false" enterkeyhint="next">
+          </label>
+          <label for="login-password">Password
+            <input id="login-password" name="password" type="password" required autocomplete="current-password" enterkeyhint="done">
+          </label>
           <div class="cta-dock">
             <button type="submit" data-primary-cta="true">Sign In</button>
           </div>
         </form>
       </section>
-    </main>`;
+    </main>
+    <div id="auth-selfcheck-slot">${errBanner}</div>`;
 }
 
 function renderIssuesTab(): string {
   const unresolvedCount = state.issues.filter((i) => i.status === "unresolved").length;
   const totalEvents = state.issues.reduce((acc, i) => acc + i.count, 0);
   const regressions = state.issues.filter((i) => i.is_regression).length;
+  const totalLabel = Math.max(state.issueTotalHits, state.issues.length);
 
   const rowsHtml = state.issues.length
     ? state.issues
@@ -443,7 +666,7 @@ function renderIssuesTab(): string {
           (it) => `
           <tr>
             <th scope="row">
-              <button class="row-trigger" data-open-issue="${it.id}">
+              <button type="button" class="row-trigger" data-open-issue="${it.id}">
                 <span class="mono">${esc(it.shortId)}</span> &mdash; ${esc(it.title)}
               </button>
               <div class="mono">${esc(it.culprit || "-")} &middot; ${esc(it.environment)}</div>
@@ -467,21 +690,26 @@ function renderIssuesTab(): string {
       <div class="row-gap">
         <a class="nav-link" href="/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/export.csv" download="issues.csv">Export CSV</a>
         <div class="cta-dock">
-          <button id="btn-refresh-issues" data-primary-cta="true">Refresh Issues</button>
+          <button type="button" id="btn-refresh-issues" data-primary-cta="true">Refresh Issues</button>
         </div>
       </div>
     </div>
 
     <div class="kpi-grid">
-      <div class="card"><div class="kpi-label">Visible Issues</div><div class="kpi-value tabular">${state.issues.length}</div></div>
+      <div class="card"><div class="kpi-label">Loaded / Total</div><div class="kpi-value tabular">${state.issues.length} / ${totalLabel}</div></div>
       <div class="card"><div class="kpi-label">Unresolved</div><div class="kpi-value tabular">${unresolvedCount}</div></div>
       <div class="card"><div class="kpi-label">Regressions</div><div class="kpi-value tabular">${regressions}</div></div>
       <div class="card"><div class="kpi-label">Events Counted</div><div class="kpi-value tabular">${totalEvents}</div></div>
     </div>
 
     <div class="toolbar">
-      <input id="issue-search-input" class="search-box" type="search" placeholder="Search issues (FTS)..." value="${esc(state.issueSearch)}">
-      <button id="btn-open-issue-filters">Filters (${esc(state.issueFilterStatus || "all")})</button>
+      <input id="issue-search-input" name="issue_search" class="search-box" type="search" aria-label="Search issues" autocomplete="off" placeholder="Search issues (FTS)..." value="${esc(state.issueSearch)}">
+      <select id="issue-sort-select" name="issue_sort" aria-label="Sort issues">
+        <option value="date" ${state.issueSort === "date" ? "selected" : ""}>Sort: Last Seen</option>
+        <option value="freq" ${state.issueSort === "freq" ? "selected" : ""}>Sort: Most Frequent</option>
+        <option value="new" ${state.issueSort === "new" ? "selected" : ""}>Sort: Newest</option>
+      </select>
+      <button type="button" id="btn-open-issue-filters">Filters (${esc(state.issueFilterStatus || "all")})</button>
     </div>
 
     <div tabindex="0" role="region" aria-labelledby="issues-cap" class="table-wrapper">
@@ -494,43 +722,34 @@ function renderIssuesTab(): string {
         </thead>
         <tbody>${rowsHtml}</tbody>
       </table>
+    </div>
+
+    <div class="pager-row">
+      <span class="mono">Showing ${state.issues.length} of ${totalLabel} issues</span>
+      ${
+        state.issues.length < state.issueTotalHits
+          ? `<button type="button" id="btn-load-more-issues">Carregar Mais</button>`
+          : ""
+      }
     </div>`;
 }
 
 function renderLogsTab(): string {
   const items = state.liveTailOn ? state.liveEntries : state.logs;
-  const rowsHtml = items.length
-    ? items
-        .map(
-          (l) => `
-          <tr>
-            <th scope="row" class="mono tabular">${esc(l.timestamp.slice(11, 23))}</th>
-            <td data-label="Level"><span class="badge badge-${esc(l.level)}">${esc(l.level)}</span></td>
-            <td data-label="Service" class="mono">${esc(l.service || "-")}</td>
-            <td data-label="Body" class="mono">${esc(l.body)}</td>
-            <td data-label="Trace" class="mono">
-              ${
-                l.traceID
-                  ? `<button class="row-trigger" data-open-trace="${esc(l.traceID)}">${esc(l.traceID.slice(0, 12))}...</button>`
-                  : "-"
-              }
-            </td>
-          </tr>`
-        )
-        .join("")
-    : `<tr><td colspan="5">No structured logs yet. Post to Sentry Envelope (type=log) or OTLP /v1/logs.</td></tr>`;
+  const rowsHtml = renderLogRowsHtml(items);
+  const showMore = !state.liveTailOn && state.logsHasMore && state.logs.length > 0;
 
   return `
     <div class="page-header">
       <h1 class="page-title">Structured Logs &amp; Live Tail</h1>
       <div class="cta-dock">
-        <button id="btn-toggle-live" data-primary-cta="true">${state.liveTailOn ? "Pause Live Tail" : "Start Live Tail (SSE)"}</button>
+        <button type="button" id="btn-toggle-live" data-primary-cta="true">${state.liveTailOn ? "Pause Live Tail" : "Start Live Tail (SSE)"}</button>
       </div>
     </div>
 
     <div class="toolbar">
-      <input id="log-search-input" class="search-box" type="search" placeholder="Full-text search log bodies..." value="${esc(state.logSearch)}">
-      <select id="log-level-select" aria-label="Log level filter">
+      <input id="log-search-input" name="log_search" class="search-box" type="search" aria-label="Search structured logs" autocomplete="off" placeholder="Full-text search log bodies..." value="${esc(state.logSearch)}">
+      <select id="log-level-select" name="log_level" aria-label="Log level filter">
         <option value="" ${state.logLevelFilter === "" ? "selected" : ""}>All levels</option>
         <option value="trace" ${state.logLevelFilter === "trace" ? "selected" : ""}>trace</option>
         <option value="debug" ${state.logLevelFilter === "debug" ? "selected" : ""}>debug</option>
@@ -539,7 +758,7 @@ function renderLogsTab(): string {
         <option value="error" ${state.logLevelFilter === "error" ? "selected" : ""}>error</option>
         <option value="fatal" ${state.logLevelFilter === "fatal" ? "selected" : ""}>fatal</option>
       </select>
-      <button id="btn-search-logs">Search</button>
+      <button type="button" id="btn-search-logs">Search</button>
     </div>
 
     <div tabindex="0" role="region" aria-labelledby="logs-cap" class="table-wrapper">
@@ -548,8 +767,13 @@ function renderLogsTab(): string {
         <thead>
           <tr><th>Time</th><th>Level</th><th>Service</th><th>Message Body</th><th>Trace ID</th></tr>
         </thead>
-        <tbody>${rowsHtml}</tbody>
+        <tbody id="logs-tbody">${rowsHtml}</tbody>
       </table>
+    </div>
+
+    <div id="logs-pager-row" class="pager-row ${showMore ? "" : "is-hidden"}">
+      <span class="mono">Loaded ${state.logs.length} logs</span>
+      <button type="button" id="btn-load-more-logs">Carregar Mais</button>
     </div>`;
 }
 
@@ -588,7 +812,7 @@ function renderPerfTab(): string {
     <div class="page-header">
       <h1 class="page-title">Performance &amp; Release Health</h1>
       <div class="cta-dock">
-        <button id="btn-refresh-perf" data-primary-cta="true">Refresh Metrics</button>
+        <button type="button" id="btn-refresh-perf" data-primary-cta="true">Refresh Metrics</button>
       </div>
     </div>
 
@@ -627,7 +851,12 @@ function renderUptimeTab(): string {
             <td data-label="Status"><span class="badge badge-${esc(m.status)}">${esc(m.status)}</span></td>
             <td data-label="Interval" class="tabular">${m.expected_interval_sec}s</td>
             <td data-label="Heartbeat Endpoint" class="mono">/api/0/organizations/${esc(state.orgSlug)}/heartbeat_check/${esc(m.uuid)}/</td>
-            <td data-label="Action"><button data-ping-monitor="${esc(m.uuid)}">Ping Now</button></td>
+            <td data-label="Actions">
+              <div class="row-gap">
+                <button type="button" data-ping-monitor="${esc(m.uuid)}">Ping Now</button>
+                <button type="button" class="btn-danger" data-del-monitor="${m.id}">Delete</button>
+              </div>
+            </td>
           </tr>`
         )
         .join("")
@@ -635,16 +864,26 @@ function renderUptimeTab(): string {
 
   const alertRows = state.alerts.length
     ? state.alerts
-        .map(
-          (a) => `
+        .map((a) => {
+          const target = a.channel_type === "email" ? a.email_to : a.target_url;
+          const trig =
+            a.trigger_type === "threshold"
+              ? `${a.trigger_type} (>=${a.threshold_count}/${a.window_sec}s)`
+              : a.trigger_type;
+          return `
           <tr>
             <th scope="row">${esc(a.name)}</th>
-            <td data-label="Trigger">${esc(a.trigger_type)}</td>
-            <td data-label="Channel">${esc(a.channel_type)}</td>
-            <td data-label="Target" class="mono">${esc(a.target_url || a.email_to)}</td>
-            <td data-label="Test"><button data-test-alert="${a.id}">Test</button></td>
-          </tr>`
-        )
+            <td data-label="Trigger">${esc(trig)}</td>
+            <td data-label="Channel">${esc(a.channel_type)}${a.has_secret ? ' <span class="badge badge-muted">HMAC</span>' : ""}</td>
+            <td data-label="Target" class="mono">${esc(target)}</td>
+            <td data-label="Actions">
+              <div class="row-gap">
+                <button type="button" data-test-alert="${a.id}">Test</button>
+                <button type="button" class="btn-danger" data-del-alert="${a.id}">Delete</button>
+              </div>
+            </td>
+          </tr>`;
+        })
         .join("")
     : `<tr><td colspan="5">No alert rules yet.</td></tr>`;
 
@@ -652,9 +891,9 @@ function renderUptimeTab(): string {
     <div class="page-header">
       <h1 class="page-title">Uptime Heartbeats &amp; Alerts</h1>
       <div class="row-gap">
-        <button id="btn-new-alert">New Alert Rule</button>
+        <button type="button" id="btn-new-alert">New Alert Rule</button>
         <div class="cta-dock">
-          <button id="btn-new-monitor" data-primary-cta="true">New Heartbeat Monitor</button>
+          <button type="button" id="btn-new-monitor" data-primary-cta="true">New Heartbeat Monitor</button>
         </div>
       </div>
     </div>
@@ -665,7 +904,7 @@ function renderUptimeTab(): string {
         <div tabindex="0" role="region" aria-labelledby="mon-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="mon-cap" class="hp-field">Monitors</caption>
-            <thead><tr><th>Name</th><th>Status</th><th>Interval</th><th>Check-in Endpoint</th><th>Ping</th></tr></thead>
+            <thead><tr><th>Name</th><th>Status</th><th>Interval</th><th>Check-in Endpoint</th><th>Actions</th></tr></thead>
             <tbody>${monRows}</tbody>
           </table>
         </div>
@@ -676,7 +915,7 @@ function renderUptimeTab(): string {
         <div tabindex="0" role="region" aria-labelledby="al-cap" class="table-wrapper">
           <table class="data-table">
             <caption id="al-cap" class="hp-field">Alerts</caption>
-            <thead><tr><th>Name</th><th>Trigger</th><th>Channel</th><th>Target</th><th>Verify</th></tr></thead>
+            <thead><tr><th>Name</th><th>Trigger</th><th>Channel</th><th>Target</th><th>Actions</th></tr></thead>
             <tbody>${alertRows}</tbody>
           </table>
         </div>
@@ -705,11 +944,13 @@ function renderProjectsTab(): string {
           </div>
           <div class="mono">DSN: ${esc(dsn)}</div>
           <div class="row-gap">
-            <button data-copy-text="${esc(dsn)}">Copy DSN</button>
+            <button type="button" data-copy-text="${esc(dsn)}">Copy DSN</button>
+            <button type="button" data-open-proj-settings="${p.id}">Filters &amp; Scrubbing</button>
+            <button type="button" data-open-proj-keys="${p.id}">DSN Keys</button>
             ${
               p.tunnel_slug
                 ? `<span class="mono">Tunnel: /t/${esc(p.tunnel_slug)}</span>`
-                : `<button data-enable-tunnel="${esc(p.slug)}">Enable Anti-AdBlock Tunnel</button>`
+                : `<button type="button" data-enable-tunnel="${esc(p.slug)}">Enable Anti-AdBlock Tunnel</button>`
             }
           </div>
         </article>`;
@@ -723,20 +964,61 @@ function renderProjectsTab(): string {
         <th scope="row">${esc(t.name)}</th>
         <td data-label="Prefix" class="mono">${esc(t.token_prefix)}...</td>
         <td data-label="Role">${esc(t.role)}</td>
-        <td data-label="Revoke"><button class="btn-danger" data-del-token="${t.id}">Revoke</button></td>
+        <td data-label="Revoke"><button type="button" class="btn-danger" data-del-token="${t.id}">Revoke</button></td>
       </tr>`
     )
+    .join("");
+
+  const memberRows = state.members
+    .map((m) => {
+      const isSelf = state.user?.id === m.user_id;
+      return `
+      <tr>
+        <th scope="row">
+          <div>${esc(m.name)}</div>
+          <div class="mono">${esc(m.email)}</div>
+        </th>
+        <td data-label="Role">
+          <select id="member-role-${m.user_id}" name="member_role_${m.user_id}" aria-label="Role for ${esc(m.email)}" data-member-role="${m.user_id}" ${isSelf ? "disabled" : ""}>
+            <option value="owner" ${m.role === "owner" ? "selected" : ""}>owner</option>
+            <option value="admin" ${m.role === "admin" ? "selected" : ""}>admin</option>
+            <option value="member" ${m.role === "member" ? "selected" : ""}>member</option>
+            <option value="viewer" ${m.role === "viewer" ? "selected" : ""}>viewer</option>
+          </select>
+        </td>
+        <td data-label="Status">
+          <span class="badge badge-${m.is_active ? "ok" : "muted"}">${m.is_active ? "active" : "inactive"}</span>
+        </td>
+        <td data-label="Action">
+          <button type="button" class="btn-danger" data-del-member="${m.user_id}" ${isSelf ? "disabled" : ""}>Remove</button>
+        </td>
+      </tr>`;
+    })
     .join("");
 
   return `
     <div class="page-header">
       <h1 class="page-title">Projects, DSNs &amp; SDK Integrations</h1>
       <div class="cta-dock">
-        <button id="btn-new-project" data-primary-cta="true">Create Project</button>
+        <button type="button" id="btn-new-project" data-primary-cta="true">Create Project</button>
       </div>
     </div>
 
     <div class="grid-2">${projCards}</div>
+
+    <section class="card stack-col">
+      <div class="row-gap">
+        <h2>Team Members</h2>
+        <button type="button" id="btn-add-member">Add Member</button>
+      </div>
+      <div tabindex="0" role="region" aria-labelledby="mem-cap" class="table-wrapper">
+        <table class="data-table">
+          <caption id="mem-cap" class="hp-field">Team Members</caption>
+          <thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>${memberRows || '<tr><td colspan="4">No team members found.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
 
     <section class="card">
       <h2>Drop-in SDK Quickstart (Errors + Structured Logs + RoleLane)</h2>
@@ -760,7 +1042,7 @@ bugfinder mcp --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;</pre>
     <section class="card stack-col">
       <div class="row-gap">
         <h2>API Tokens (RoleLane ReadClient / CLI / MCP)</h2>
-        <button id="btn-create-token">Generate API Token</button>
+        <button type="button" id="btn-create-token">Generate API Token</button>
       </div>
       ${
         state.lastCreatedToken
@@ -835,7 +1117,7 @@ function renderSelfCheckBanner(): string {
         <span class="badge badge-${esc(summary.badgeClass)}">${esc(summary.badgeText)}</span>
         <strong>${esc(label)}</strong>
       </div>
-      <button id="btn-open-selfcheck" data-tab="selfcheck">Abrir Auto-Check</button>
+      <button type="button" id="btn-open-selfcheck" data-tab="selfcheck">Abrir Auto-Check</button>
     </div>`;
 }
 
@@ -947,14 +1229,14 @@ function renderSelfCheckTab(): string {
     <div class="page-header">
       <h1 class="page-title">Auto-Check &amp; Self-Diagnostics</h1>
       <div class="row-gap">
-        <button id="btn-refresh-selfcheck">Atualizar Diagnóstico</button>
+        <button type="button" id="btn-refresh-selfcheck">Atualizar Diagnóstico</button>
         ${
           totalErrCount > 0 || (rep?.unacknowledged_error_count ?? 0) > 0
-            ? `<button id="btn-ack-selfcheck" class="btn-danger">Reconhecer / Limpar Erros</button>`
+            ? `<button type="button" id="btn-ack-selfcheck" class="btn-danger">Reconhecer / Limpar Erros</button>`
             : ""
         }
         <div class="cta-dock">
-          <button id="btn-run-self-probe" data-primary-cta="true" ${state.probeRunning ? "disabled" : ""}>
+          <button type="button" id="btn-run-self-probe" data-primary-cta="true" ${state.probeRunning ? "disabled" : ""}>
             ${state.probeRunning ? "Executando Auto-Teste..." : "Rodar Auto-Teste E2E"}
           </button>
         </div>
@@ -1010,121 +1292,275 @@ function renderSelfCheckTab(): string {
         <div>
           <p><strong>1. Instalar binário + serviço systemd --user + auto-check:</strong></p>
           <pre class="snippet-box">${esc(cmdServiceInstall)}</pre>
-          <button data-copy-text="${esc(cmdServiceInstall)}">Copiar Instalação Serviço</button>
+          <button type="button" data-copy-text="${esc(cmdServiceInstall)}">Copiar Instalação Serviço</button>
         </div>
         <div>
           <p><strong>2. Subir em Docker isolado (limite 32 MB RAM):</strong></p>
           <pre class="snippet-box">${esc(cmdDockerInstall)}</pre>
-          <button data-copy-text="${esc(cmdDockerInstall)}">Copiar Comando Docker</button>
+          <button type="button" data-copy-text="${esc(cmdDockerInstall)}">Copiar Comando Docker</button>
         </div>
         <div>
           <p><strong>3. Browser Mini-SDK (&lt;3 KB zero-dep, com captura de erros + logs):</strong></p>
           <pre class="snippet-box">${esc(cmdMiniSdk)}</pre>
-          <button data-copy-text="${esc(cmdMiniSdk)}">Copiar Snippet Browser</button>
+          <button type="button" data-copy-text="${esc(cmdMiniSdk)}">Copiar Snippet Browser</button>
         </div>
         <div>
           <p><strong>4. .env para Sentry SDKs / RoleLane / GlitchTip:</strong></p>
           <pre class="snippet-box">${esc(cmdSentryEnv)}</pre>
-          <button data-copy-text="${esc(cmdSentryEnv)}">Copiar Variáveis .env</button>
+          <button type="button" data-copy-text="${esc(cmdSentryEnv)}">Copiar Variáveis .env</button>
         </div>
       </section>
     </div>`;
 }
 
-function render(): void {
-  const root = document.getElementById("app");
-  if (!root) return;
-  inRender = true;
-  try {
-    if (state.loading) {
-      root.innerHTML = `<main class="auth-wrap"><div class="card">Loading Bug-Finder...</div></main>`;
-      return;
-    }
-
-    if (!state.user) {
-      const localErrBanner = state.localSelfErrors.length
-        ? `<div class="selfcheck-strip selfcheck-strip-error" role="status"><strong>Erro interno no app:</strong> ${esc(state.localSelfErrors[0].message)}</div>`
-        : "";
-      root.innerHTML =
-        renderAuthScreen() +
-        localErrBanner +
-        (state.toast ? `<div class="toast">${esc(state.toast)}</div>` : "");
-      bindAuthHandlers();
-      return;
-    }
-
-    let bodyHtml = "";
-    if (state.tab === "issues") bodyHtml = renderIssuesTab();
-    else if (state.tab === "logs") bodyHtml = renderLogsTab();
-    else if (state.tab === "perf") bodyHtml = renderPerfTab();
-    else if (state.tab === "uptime") bodyHtml = renderUptimeTab();
-    else if (state.tab === "selfcheck") bodyHtml = renderSelfCheckTab();
-    else bodyHtml = renderProjectsTab();
-
-    const selfSummary = getEffectiveSelfStatus();
-
-    root.innerHTML = `
-      <div id="app-chrome" class="shell">
-        <aside class="sidebar">
-          <div class="brand-row">
-            <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
-          </div>
-          <div class="mono">Org: ${esc(state.orgSlug)}</div>
-          <nav class="nav-list" aria-label="Main navigation">
-            <button class="nav-link" data-tab="issues" ${state.tab === "issues" ? 'aria-current="page"' : ""}>Issues</button>
-            <button class="nav-link" data-tab="logs" ${state.tab === "logs" ? 'aria-current="page"' : ""}>Logs &amp; Tail</button>
-            <button class="nav-link" data-tab="perf" ${state.tab === "perf" ? 'aria-current="page"' : ""}>Performance</button>
-            <button class="nav-link" data-tab="uptime" ${state.tab === "uptime" ? 'aria-current="page"' : ""}>Uptime &amp; Alerts</button>
-            <button class="nav-link" data-tab="projects" ${state.tab === "projects" ? 'aria-current="page"' : ""}>Projects &amp; SDK</button>
-            <button class="nav-link" data-tab="selfcheck" ${state.tab === "selfcheck" ? 'aria-current="page"' : ""}>
-              <span>Auto-Check</span>
-              <span class="badge badge-${esc(selfSummary.badgeClass)}">${esc(selfSummary.badgeText)}</span>
-            </button>
-          </nav>
-          <div class="sidebar-foot">
-            <label>Theme
-              <select id="theme-select">
-                <option value="system" ${state.themePref === "system" ? "selected" : ""}>System</option>
-                <option value="light" ${state.themePref === "light" ? "selected" : ""}>Light</option>
-                <option value="dark" ${state.themePref === "dark" ? "selected" : ""}>Dark</option>
-              </select>
-            </label>
-            <button id="btn-cmdk">Command Palette (Ctrl+K)</button>
-            <button id="btn-logout">Sign Out (${esc(state.user.name)})</button>
-          </div>
-        </aside>
-
-        <div>
-          <header class="mobile-top-bar">
-            <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
-            <button data-tab="selfcheck" aria-label="Open Auto-Check">
-              <span>Auto-Check</span>
-              <span class="badge badge-${esc(selfSummary.badgeClass)}">${esc(selfSummary.badgeText)}</span>
-            </button>
-          </header>
-          <main class="main-pane">${renderSelfCheckBanner()}${bodyHtml}</main>
+function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): void {
+  shellRoot.innerHTML = `
+    <div id="app-chrome" class="shell">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
         </div>
-
-        <nav class="mobile-tabbar" aria-label="Mobile navigation">
-          <button class="nav-link" data-tab="issues" ${state.tab === "issues" ? 'aria-current="page"' : ""}>Issues</button>
-          <button class="nav-link" data-tab="logs" ${state.tab === "logs" ? 'aria-current="page"' : ""}>Logs</button>
-          <button class="nav-link" data-tab="perf" ${state.tab === "perf" ? 'aria-current="page"' : ""}>Perf</button>
-          <button class="nav-link" data-tab="uptime" ${state.tab === "uptime" ? 'aria-current="page"' : ""}>Uptime</button>
-          <button class="nav-link" data-tab="projects" ${state.tab === "projects" ? 'aria-current="page"' : ""}>SDK</button>
+        <label for="org-select">Organization
+          <select id="org-select" name="org_slug"></select>
+        </label>
+        <nav class="nav-list" aria-label="Main navigation">
+          <button type="button" class="nav-link" data-tab="issues">Issues</button>
+          <button type="button" class="nav-link" data-tab="logs">Logs &amp; Tail</button>
+          <button type="button" class="nav-link" data-tab="perf">Performance</button>
+          <button type="button" class="nav-link" data-tab="uptime">Uptime &amp; Alerts</button>
+          <button type="button" class="nav-link" data-tab="projects">Projects &amp; SDK</button>
+          <button type="button" class="nav-link" data-tab="selfcheck">
+            <span>Auto-Check</span>
+            <span class="badge badge-ok" data-selfcheck-badge="1">OK</span>
+          </button>
         </nav>
-      </div>
-      ${renderDialogs()}
-      ${state.toast ? `<div class="toast" role="status">${esc(state.toast)}</div>` : ""}`;
+        <div class="sidebar-foot">
+          <label for="theme-select">Theme
+            <select id="theme-select" name="theme">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <button type="button" id="btn-cmdk">Command Palette (Ctrl+K)</button>
+          <button type="button" id="btn-logout">Sign Out</button>
+        </div>
+      </aside>
 
-    bindDashboardHandlers();
-  } finally {
-    inRender = false;
+      <div>
+        <header class="mobile-top-bar">
+          <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
+          <button type="button" data-tab="selfcheck" aria-label="Open Auto-Check">
+            <span>Auto-Check</span>
+            <span class="badge badge-ok" data-selfcheck-badge="1">OK</span>
+          </button>
+        </header>
+        <div id="selfcheck-banner-slot"></div>
+        <main id="main-pane" class="main-pane"></main>
+      </div>
+
+      <nav class="mobile-tabbar" aria-label="Mobile navigation">
+        <button type="button" class="nav-link" data-tab="issues">Issues</button>
+        <button type="button" class="nav-link" data-tab="logs">Logs</button>
+        <button type="button" class="nav-link" data-tab="perf">Perf</button>
+        <button type="button" class="nav-link" data-tab="uptime">Uptime</button>
+        <button type="button" class="nav-link" data-tab="projects">SDK</button>
+      </nav>
+    </div>`;
+
+  dialogsRoot.innerHTML = `
+    <dialog id="dlg-issue" class="bf-dialog" closedby="any" aria-labelledby="dlg-issue-title">
+      <div class="dialog-head">
+        <h2 id="dlg-issue-title">Issue</h2>
+        <button type="button" id="dlg-issue-close">Close</button>
+      </div>
+      <div id="dlg-issue-body"></div>
+    </dialog>
+
+    <dialog id="dlg-trace" class="bf-dialog" closedby="any" aria-labelledby="dlg-trace-title">
+      <div class="dialog-head">
+        <h2 id="dlg-trace-title">Trace Correlation</h2>
+        <button type="button" id="dlg-trace-close">Close</button>
+      </div>
+      <div id="dlg-trace-body"></div>
+    </dialog>
+
+    <dialog id="dlg-filters" class="bf-dialog" closedby="any" aria-labelledby="dlg-filters-title">
+      <div class="dialog-head">
+        <h2 id="dlg-filters-title">Issue Filters</h2>
+        <button type="button" id="dlg-filters-close">Close</button>
+      </div>
+      <div id="dlg-filters-body" class="stack-col">
+        <label for="filter-status-sel">Status
+          <select id="filter-status-sel" name="filter_status">
+            <option value="unresolved">Unresolved</option>
+            <option value="resolved">Resolved</option>
+            <option value="ignored">Ignored</option>
+            <option value="">All</option>
+          </select>
+        </label>
+        <button type="button" id="btn-apply-filters">Apply Filters</button>
+      </div>
+    </dialog>
+
+    <dialog id="dlg-create" class="bf-dialog" closedby="any" aria-labelledby="dlg-create-title">
+      <div class="dialog-head">
+        <h2 id="dlg-create-title">Create Resource</h2>
+        <button type="button" id="dlg-create-close">Close</button>
+      </div>
+      <div id="dlg-create-body"></div>
+    </dialog>
+
+    <dialog id="dlg-proj-settings" class="bf-dialog" closedby="any" aria-labelledby="dlg-proj-settings-title">
+      <div class="dialog-head">
+        <h2 id="dlg-proj-settings-title">Project Filters &amp; Scrubbing</h2>
+        <button type="button" id="dlg-proj-settings-close">Close</button>
+      </div>
+      <div id="dlg-proj-settings-body"></div>
+    </dialog>
+
+    <dialog id="dlg-proj-keys" class="bf-dialog" closedby="any" aria-labelledby="dlg-proj-keys-title">
+      <div class="dialog-head">
+        <h2 id="dlg-proj-keys-title">Project DSN Keys</h2>
+        <button type="button" id="dlg-proj-keys-close">Close</button>
+      </div>
+      <div id="dlg-proj-keys-body"></div>
+    </dialog>
+
+    <dialog id="dlg-cmdk" class="bf-dialog" closedby="any" aria-labelledby="dlg-cmdk-title">
+      <div class="dialog-head">
+        <h2 id="dlg-cmdk-title">Quick Jump</h2>
+        <button type="button" id="dlg-cmdk-close">Close</button>
+      </div>
+      <div class="stack-col">
+        <button type="button" data-cmdk-tab="issues">Go to Issues Inbox</button>
+        <button type="button" data-cmdk-tab="logs">Go to Structured Logs &amp; Live Tail</button>
+        <button type="button" data-cmdk-tab="perf">Go to Performance &amp; Release Health</button>
+        <button type="button" data-cmdk-tab="uptime">Go to Uptime Monitors &amp; Alerts</button>
+        <button type="button" data-cmdk-tab="projects">Go to Projects, DSN &amp; SDK Snippets</button>
+        <button type="button" data-cmdk-tab="selfcheck">Go to Auto-Check &amp; One-Command Install</button>
+      </div>
+    </dialog>`;
+
+  bindChromeHandlers();
+}
+
+function syncSidebarChrome(): void {
+  document.querySelectorAll<HTMLButtonElement>("#app-chrome [data-tab]").forEach((btn) => {
+    if (btn.dataset.tab === state.tab) {
+      btn.setAttribute("aria-current", "page");
+    } else {
+      btn.removeAttribute("aria-current");
+    }
+  });
+
+  const orgSel = document.getElementById("org-select") as HTMLSelectElement | null;
+  if (orgSel) {
+    const orgList = state.orgs.length
+      ? state.orgs
+      : state.orgSlug
+      ? [{ id: 0, slug: state.orgSlug, name: state.orgSlug, role: state.user?.role || "" }]
+      : [];
+    const sig = orgList.map((o) => `${o.slug}:${o.name}`).join("|");
+    if (orgSel.dataset.sig !== sig) {
+      orgSel.dataset.sig = sig;
+      orgSel.innerHTML = orgList
+        .map((o) => `<option value="${esc(o.slug)}">${esc(o.name)} (${esc(o.slug)})</option>`)
+        .join("");
+    }
+    if (orgSel.value !== state.orgSlug) {
+      orgSel.value = state.orgSlug;
+    }
+  }
+
+  const themeSel = document.getElementById("theme-select") as HTMLSelectElement | null;
+  if (themeSel && themeSel.value !== state.themePref) {
+    themeSel.value = state.themePref;
+  }
+
+  const logoutBtn = document.getElementById("btn-logout");
+  if (logoutBtn && state.user) {
+    logoutBtn.textContent = `Sign Out (${state.user.name})`;
+  }
+
+  const summary = getEffectiveSelfStatus();
+  document.querySelectorAll<HTMLElement>("[data-selfcheck-badge]").forEach((badge) => {
+    badge.className = `badge badge-${summary.badgeClass}`;
+    badge.textContent = summary.badgeText;
+  });
+
+  const bannerSlot = document.getElementById("selfcheck-banner-slot");
+  if (bannerSlot) {
+    bannerSlot.innerHTML = renderSelfCheckBanner();
+    document.getElementById("btn-open-selfcheck")?.addEventListener("click", () => {
+      void switchTab("selfcheck");
+    });
   }
 }
 
-function renderDialogs(): string {
+function renderMainPane(): void {
+  const mainPane = document.getElementById("main-pane");
+  if (!mainPane) return;
+  let bodyHtml = "";
+  if (state.tab === "issues") bodyHtml = renderIssuesTab();
+  else if (state.tab === "logs") bodyHtml = renderLogsTab();
+  else if (state.tab === "perf") bodyHtml = renderPerfTab();
+  else if (state.tab === "uptime") bodyHtml = renderUptimeTab();
+  else if (state.tab === "selfcheck") bodyHtml = renderSelfCheckTab();
+  else bodyHtml = renderProjectsTab();
+
+  mainPane.innerHTML = bodyHtml;
+  bindMainPaneHandlers(mainPane);
+}
+
+function render(): void {
+  const roots = ensureRoots();
+  if (!roots) return;
+  if (state.loading) {
+    if (mountedMode !== "loading") {
+      mountedMode = "loading";
+      roots.dialogs.innerHTML = "";
+      roots.shell.innerHTML = `<main class="auth-wrap"><div class="card">Loading Bug-Finder...</div></main>`;
+    }
+    return;
+  }
+
+  if (!state.user) {
+    closeAllDialogs();
+    const targetMode: MountedMode = state.needsSetup ? "setup" : "login";
+    if (mountedMode !== targetMode) {
+      mountedMode = targetMode;
+      roots.dialogs.innerHTML = "";
+      roots.shell.innerHTML = renderAuthScreen();
+      bindAuthHandlers();
+    } else {
+      syncSelfCheckSlots();
+    }
+    return;
+  }
+
+  if (mountedMode !== "dashboard") {
+    mountedMode = "dashboard";
+    mountDashboardShell(roots.shell, roots.dialogs);
+  }
+
+  syncSidebarChrome();
+  renderMainPane();
+}
+
+function populateIssueDialog(): void {
+  const titleEl = document.getElementById("dlg-issue-title");
+  const bodyEl = document.getElementById("dlg-issue-body");
+  if (!titleEl || !bodyEl) return;
+
   const issue = state.selectedIssue;
   const ev = state.selectedIssueEvent;
+  titleEl.textContent = issue ? `${issue.shortId} — ${issue.title}` : "Issue";
+  if (!issue) {
+    bodyEl.innerHTML = "";
+    return;
+  }
+
   let framesHtml = "";
   const excVals = ev?.payload?.exception?.values;
   if (Array.isArray(excVals)) {
@@ -1160,79 +1596,59 @@ function renderDialogs(): string {
         .join("")
     : "<li>No breadcrumbs captured.</li>";
 
-  return `
-    <dialog id="dlg-issue" class="bf-dialog" closedby="any" aria-labelledby="dlg-issue-title">
-      <div class="dialog-head">
-        <h2 id="dlg-issue-title">${issue ? `${esc(issue.shortId)} — ${esc(issue.title)}` : "Issue"}</h2>
-        <button id="dlg-issue-close">Close</button>
+  bodyEl.innerHTML = `
+    <div class="stack-col">
+      <div class="row-gap">
+        <span class="badge badge-${esc(issue.status)}">${esc(issue.status)}</span>
+        <button type="button" data-issue-status="resolved" data-issue-id="${issue.id}" data-issue-rel="${esc(issue.last_release || "")}">Resolve</button>
+        <button type="button" data-issue-status="ignored" data-issue-id="${issue.id}">Ignore</button>
+        <button type="button" data-issue-status="unresolved" data-issue-id="${issue.id}">Reopen</button>
+        ${ev?.trace_id ? `<button type="button" data-open-trace="${esc(ev.trace_id)}">Inspect Trace Logs</button>` : ""}
       </div>
-      ${
-        issue
-          ? `<div class="stack-col">
-               <div class="row-gap">
-                 <span class="badge badge-${esc(issue.status)}">${esc(issue.status)}</span>
-                 <button data-issue-status="resolved" data-issue-id="${issue.id}" data-issue-rel="${esc(issue.last_release || "")}">Resolve</button>
-                 <button data-issue-status="ignored" data-issue-id="${issue.id}">Ignore</button>
-                 <button data-issue-status="unresolved" data-issue-id="${issue.id}">Reopen</button>
-                 ${ev?.trace_id ? `<button data-open-trace="${esc(ev.trace_id)}">Inspect Trace Logs</button>` : ""}
-               </div>
-               <h3>Stack Trace</h3>
-               <div>${framesHtml || "<p>No stacktrace attached to latest event.</p>"}</div>
-               <h3>Breadcrumbs</h3>
-               <ul>${crumbsHtml}</ul>
-             </div>`
-          : ""
+      <h3>Stack Trace</h3>
+      <div>${framesHtml || "<p>No stacktrace attached to latest event.</p>"}</div>
+      <h3>Breadcrumbs</h3>
+      <ul>${crumbsHtml}</ul>
+    </div>`;
+
+  bindTraceOpenButtons(bodyEl);
+  bodyEl.querySelectorAll<HTMLButtonElement>("[data-issue-status]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.dataset.issueId);
+      const newStatus = btn.dataset.issueStatus || "resolved";
+      const rel = btn.dataset.issueRel || undefined;
+      const prevStatus = state.selectedIssue?.status;
+      if (state.selectedIssue && state.selectedIssue.id === id) {
+        state.selectedIssue.status = newStatus;
       }
-    </dialog>
+      const inList = state.issues.find((i) => i.id === id);
+      if (inList) inList.status = newStatus;
+      populateIssueDialog();
+      if (state.tab === "issues") renderMainPane();
 
-    <dialog id="dlg-trace" class="bf-dialog" closedby="any" aria-labelledby="dlg-trace-title">
-      <div class="dialog-head">
-        <h2 id="dlg-trace-title">Trace Correlation</h2>
-        <button id="dlg-trace-close">Close</button>
-      </div>
-      <pre class="snippet-box">${esc(state.traceView ? JSON.stringify(state.traceView, null, 2) : "")}</pre>
-    </dialog>
+      const res = await apiFetch<IssueSummary>(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/${id}/`,
+        { method: "PUT", body: { status: newStatus, resolved_in_release: rel } }
+      );
+      if (!res.ok) {
+        if (state.selectedIssue && state.selectedIssue.id === id && prevStatus) {
+          state.selectedIssue.status = prevStatus;
+        }
+        if (inList && prevStatus) inList.status = prevStatus;
+        populateIssueDialog();
+        if (state.tab === "issues") renderMainPane();
+        showToast(res.error || "Failed updating status");
+      } else {
+        showToast(`Issue marked ${newStatus}`);
+      }
+    });
+  });
+}
 
-    <dialog id="dlg-filters" class="bf-dialog" closedby="any" aria-labelledby="dlg-filters-title">
-      <div class="dialog-head">
-        <h2 id="dlg-filters-title">Issue Filters</h2>
-        <button id="dlg-filters-close">Close</button>
-      </div>
-      <div class="stack-col">
-        <label>Status
-          <select id="filter-status-sel">
-            <option value="unresolved" ${state.issueFilterStatus === "unresolved" ? "selected" : ""}>Unresolved</option>
-            <option value="resolved" ${state.issueFilterStatus === "resolved" ? "selected" : ""}>Resolved</option>
-            <option value="ignored" ${state.issueFilterStatus === "ignored" ? "selected" : ""}>Ignored</option>
-            <option value="" ${state.issueFilterStatus === "" ? "selected" : ""}>All</option>
-          </select>
-        </label>
-        <button id="btn-apply-filters">Apply Filters</button>
-      </div>
-    </dialog>
-
-    <dialog id="dlg-create" class="bf-dialog" closedby="any" aria-labelledby="dlg-create-title">
-      <div class="dialog-head">
-        <h2 id="dlg-create-title">Create Resource</h2>
-        <button id="dlg-create-close">Close</button>
-      </div>
-      <div id="dlg-create-body"></div>
-    </dialog>
-
-    <dialog id="dlg-cmdk" class="bf-dialog" closedby="any" aria-labelledby="dlg-cmdk-title">
-      <div class="dialog-head">
-        <h2 id="dlg-cmdk-title">Quick Jump</h2>
-        <button id="dlg-cmdk-close">Close</button>
-      </div>
-      <div class="stack-col">
-        <button data-cmdk-tab="issues">Go to Issues Inbox</button>
-        <button data-cmdk-tab="logs">Go to Structured Logs &amp; Live Tail</button>
-        <button data-cmdk-tab="perf">Go to Performance &amp; Release Health</button>
-        <button data-cmdk-tab="uptime">Go to Uptime Monitors &amp; Alerts</button>
-        <button data-cmdk-tab="projects">Go to Projects, DSN &amp; SDK Snippets</button>
-        <button data-cmdk-tab="selfcheck">Go to Auto-Check &amp; One-Command Install</button>
-      </div>
-    </dialog>`;
+function populateTraceDialog(): void {
+  const bodyEl = document.getElementById("dlg-trace-body");
+  if (!bodyEl) return;
+  bodyEl.innerHTML = `<pre class="snippet-box">${esc(state.traceView ? JSON.stringify(state.traceView, null, 2) : "")}</pre>`;
 }
 
 function bindAuthHandlers(): void {
@@ -1271,15 +1687,16 @@ function bindAuthHandlers(): void {
   }
 }
 
-function bindDashboardHandlers(): void {
-  document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((btn) => {
+function bindChromeHandlers(): void {
+  document.querySelectorAll<HTMLButtonElement>("#app-chrome [data-tab]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const target = btn.dataset.tab as TabId;
-      if (target !== "logs") stopLiveTail();
-      state.tab = target;
-      await loadCurrentTabData();
-      render();
+      await switchTab(btn.dataset.tab as TabId);
     });
+  });
+
+  const orgSel = document.getElementById("org-select") as HTMLSelectElement | null;
+  orgSel?.addEventListener("change", () => {
+    void switchOrganization(orgSel.value);
   });
 
   const themeSel = document.getElementById("theme-select") as HTMLSelectElement | null;
@@ -1289,8 +1706,10 @@ function bindDashboardHandlers(): void {
 
   document.getElementById("btn-logout")?.addEventListener("click", async () => {
     stopLiveTail();
+    closeAllDialogs();
     await apiFetch("/api/auth/logout", { method: "POST", body: {} });
     state.user = null;
+    state.orgs = [];
     setCsrfToken("");
     render();
   });
@@ -1299,106 +1718,47 @@ function bindDashboardHandlers(): void {
     const dlg = document.getElementById("dlg-cmdk") as HTMLDialogElement | null;
     if (dlg) openDialog(dlg);
   });
-  document.getElementById("dlg-cmdk-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-cmdk") as HTMLDialogElement | null)?.close();
-  });
+
   document.querySelectorAll<HTMLButtonElement>("[data-cmdk-tab]").forEach((b) => {
     b.addEventListener("click", async () => {
       (document.getElementById("dlg-cmdk") as HTMLDialogElement | null)?.close();
-      state.tab = b.dataset.cmdkTab as TabId;
-      await loadCurrentTabData();
-      render();
+      await switchTab(b.dataset.cmdkTab as TabId);
     });
   });
 
-  document.getElementById("btn-refresh-issues")?.addEventListener("click", async () => {
-    const inp = document.getElementById("issue-search-input") as HTMLInputElement | null;
-    if (inp) state.issueSearch = inp.value;
-    await loadCurrentTabData();
-    render();
+  document.getElementById("dlg-issue-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-issue") as HTMLDialogElement | null)?.close();
   });
-  document.getElementById("issue-search-input")?.addEventListener("keydown", async (e) => {
-    if (e.key === "Enter") {
-      state.issueSearch = (e.target as HTMLInputElement).value;
-      await loadCurrentTabData();
-      render();
-    }
-  });
-
-  document.getElementById("btn-open-issue-filters")?.addEventListener("click", () => {
-    const dlg = document.getElementById("dlg-filters") as HTMLDialogElement | null;
-    if (dlg) openDialog(dlg);
+  document.getElementById("dlg-trace-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-trace") as HTMLDialogElement | null)?.close();
   });
   document.getElementById("dlg-filters-close")?.addEventListener("click", () => {
     (document.getElementById("dlg-filters") as HTMLDialogElement | null)?.close();
   });
+  document.getElementById("dlg-create-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-create") as HTMLDialogElement | null)?.close();
+  });
+  document.getElementById("dlg-proj-settings-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-proj-settings") as HTMLDialogElement | null)?.close();
+  });
+  document.getElementById("dlg-proj-keys-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-proj-keys") as HTMLDialogElement | null)?.close();
+  });
+  document.getElementById("dlg-cmdk-close")?.addEventListener("click", () => {
+    (document.getElementById("dlg-cmdk") as HTMLDialogElement | null)?.close();
+  });
+
   document.getElementById("btn-apply-filters")?.addEventListener("click", async () => {
     const sel = document.getElementById("filter-status-sel") as HTMLSelectElement | null;
     if (sel) state.issueFilterStatus = sel.value;
     (document.getElementById("dlg-filters") as HTMLDialogElement | null)?.close();
     await loadCurrentTabData();
-    render();
+    renderMainPane();
   });
+}
 
-  document.querySelectorAll<HTMLButtonElement>("[data-open-issue]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = Number(btn.dataset.openIssue);
-      const found = state.issues.find((i) => i.id === id) || null;
-      state.selectedIssue = found;
-      const evRes = await apiFetch<IssueEventDetail>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/${id}/events/latest/`
-      );
-      state.selectedIssueEvent = evRes.ok ? evRes.data : null;
-      render();
-      const dlg = document.getElementById("dlg-issue") as HTMLDialogElement | null;
-      if (dlg) openDialog(dlg);
-    });
-  });
-  document.getElementById("dlg-issue-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-issue") as HTMLDialogElement | null)?.close();
-  });
-
-  // Optimistic status update (<50ms Doherty Threshold)
-  document.querySelectorAll<HTMLButtonElement>("[data-issue-status]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = Number(btn.dataset.issueId);
-      const newStatus = btn.dataset.issueStatus || "resolved";
-      const rel = btn.dataset.issueRel || undefined;
-      const prevStatus = state.selectedIssue?.status;
-      if (state.selectedIssue && state.selectedIssue.id === id) {
-        state.selectedIssue.status = newStatus;
-      }
-      const inList = state.issues.find((i) => i.id === id);
-      if (inList) inList.status = newStatus;
-      render();
-      const dlg = document.getElementById("dlg-issue") as HTMLDialogElement | null;
-      if (dlg && !dlg.open) openDialog(dlg);
-
-      const res = await apiFetch<IssueSummary>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/${id}/`,
-        { method: "PUT", body: { status: newStatus, resolved_in_release: rel } }
-      );
-      if (!res.ok) {
-        if (inList && prevStatus) inList.status = prevStatus;
-        showToast(res.error || "Failed updating status");
-        render();
-      } else {
-        showToast(`Issue marked ${newStatus}`);
-      }
-    });
-  });
-
-  document.getElementById("btn-toggle-live")?.addEventListener("click", toggleLiveTail);
-  document.getElementById("btn-search-logs")?.addEventListener("click", async () => {
-    const inp = document.getElementById("log-search-input") as HTMLInputElement | null;
-    const sel = document.getElementById("log-level-select") as HTMLSelectElement | null;
-    if (inp) state.logSearch = inp.value;
-    if (sel) state.logLevelFilter = sel.value;
-    await loadCurrentTabData();
-    render();
-  });
-
-  document.querySelectorAll<HTMLButtonElement>("[data-open-trace]").forEach((btn) => {
+function bindTraceOpenButtons(scope: ParentNode): void {
+  scope.querySelectorAll<HTMLButtonElement>("[data-open-trace]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const tid = btn.dataset.openTrace;
       if (!tid) return;
@@ -1407,22 +1767,112 @@ function bindDashboardHandlers(): void {
       );
       if (res.ok && res.data) {
         state.traceView = res.data;
-        render();
+        populateTraceDialog();
         const dlg = document.getElementById("dlg-trace") as HTMLDialogElement | null;
         if (dlg) openDialog(dlg);
+      } else {
+        showToast(res.error || "Failed loading trace");
       }
     });
   });
-  document.getElementById("dlg-trace-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-trace") as HTMLDialogElement | null)?.close();
+}
+
+function bindCopyButtons(scope: ParentNode): void {
+  scope.querySelectorAll<HTMLButtonElement>("[data-copy-text]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      await navigator.clipboard?.writeText(btn.dataset.copyText || "").catch(() => {});
+      showToast("Copied to clipboard");
+    });
+  });
+}
+
+function bindMainPaneHandlers(mainPane: HTMLElement): void {
+  bindCopyButtons(mainPane);
+  bindTraceOpenButtons(mainPane);
+
+  // Issues tab handlers
+  document.getElementById("btn-refresh-issues")?.addEventListener("click", async () => {
+    const inp = document.getElementById("issue-search-input") as HTMLInputElement | null;
+    if (inp) state.issueSearch = inp.value;
+    await fetchIssuesPage(false);
+    renderMainPane();
   });
 
+  document.getElementById("issue-search-input")?.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter") {
+      state.issueSearch = (e.target as HTMLInputElement).value;
+      await fetchIssuesPage(false);
+      renderMainPane();
+    }
+  });
+
+  const issueSortSel = document.getElementById("issue-sort-select") as HTMLSelectElement | null;
+  issueSortSel?.addEventListener("change", async () => {
+    state.issueSort = (issueSortSel.value as "date" | "freq" | "new") || "date";
+    await fetchIssuesPage(false);
+    renderMainPane();
+  });
+
+  document.getElementById("btn-load-more-issues")?.addEventListener("click", async () => {
+    await fetchIssuesPage(true);
+    renderMainPane();
+  });
+
+  document.getElementById("btn-open-issue-filters")?.addEventListener("click", () => {
+    const sel = document.getElementById("filter-status-sel") as HTMLSelectElement | null;
+    if (sel) sel.value = state.issueFilterStatus;
+    const dlg = document.getElementById("dlg-filters") as HTMLDialogElement | null;
+    if (dlg) openDialog(dlg);
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-open-issue]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.dataset.openIssue);
+      state.selectedIssue = state.issues.find((i) => i.id === id) || null;
+      const evRes = await apiFetch<IssueEventDetail>(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/${id}/events/latest/`
+      );
+      state.selectedIssueEvent = evRes.ok ? evRes.data : null;
+      populateIssueDialog();
+      const dlg = document.getElementById("dlg-issue") as HTMLDialogElement | null;
+      if (dlg) openDialog(dlg);
+    });
+  });
+
+  // Logs tab handlers
+  document.getElementById("btn-toggle-live")?.addEventListener("click", toggleLiveTail);
+
+  document.getElementById("btn-search-logs")?.addEventListener("click", async () => {
+    const inp = document.getElementById("log-search-input") as HTMLInputElement | null;
+    const sel = document.getElementById("log-level-select") as HTMLSelectElement | null;
+    if (inp) state.logSearch = inp.value;
+    if (sel) state.logLevelFilter = sel.value;
+    if (state.liveTailOn) {
+      stopLiveTail();
+      state.liveEntries = [];
+      toggleLiveTail();
+    } else {
+      await fetchLogsPage(false);
+      renderMainPane();
+    }
+  });
+
+  document.getElementById("btn-load-more-logs")?.addEventListener("click", async () => {
+    await fetchLogsPage(true);
+    renderMainPane();
+  });
+
+  // Perf tab handlers
   document.getElementById("btn-refresh-perf")?.addEventListener("click", async () => {
     await loadCurrentTabData();
-    render();
+    renderMainPane();
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-ping-monitor]").forEach((btn) => {
+  // Uptime & Alerts tab handlers
+  document.getElementById("btn-new-monitor")?.addEventListener("click", () => openCreateDialog("monitor"));
+  document.getElementById("btn-new-alert")?.addEventListener("click", () => openCreateDialog("alert"));
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-ping-monitor]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const uuid = btn.dataset.pingMonitor!;
       const res = await apiFetch(
@@ -1431,38 +1881,118 @@ function bindDashboardHandlers(): void {
       );
       showToast(res.ok ? "Heartbeat recorded (UP)" : res.error || "Ping failed");
       await loadCurrentTabData();
-      render();
+      renderMainPane();
     });
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-test-alert]").forEach((btn) => {
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-monitor]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.delMonitor!;
+      const res = await apiFetch(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/monitors/${encodeURIComponent(id)}/`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Failed deleting monitor");
+        return;
+      }
+      showToast("Monitor deleted");
+      await loadCurrentTabData();
+      renderMainPane();
+    });
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-test-alert]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.testAlert!;
       const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/${id}/test/`,
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/${encodeURIComponent(id)}/test/`,
         { method: "POST", body: {} }
       );
       showToast(res.ok ? "Test alert dispatched" : res.error || "Alert dispatch failed");
     });
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-copy-text]").forEach((btn) => {
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-alert]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      await navigator.clipboard?.writeText(btn.dataset.copyText || "").catch(() => {});
-      showToast("Copied to clipboard");
+      const id = btn.dataset.delAlert!;
+      const res = await apiFetch(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/${encodeURIComponent(id)}/`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Failed deleting alert rule");
+        return;
+      }
+      showToast("Alert rule deleted");
+      await loadCurrentTabData();
+      renderMainPane();
     });
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-enable-tunnel]").forEach((btn) => {
+  // Projects, Members & API Tokens handlers
+  document.getElementById("btn-new-project")?.addEventListener("click", () => openCreateDialog("project"));
+  document.getElementById("btn-add-member")?.addEventListener("click", () => openCreateDialog("member"));
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-enable-tunnel]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const slug = btn.dataset.enableTunnel!;
       const res = await apiFetch(
         `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(slug)}/tunnel/`,
         { method: "POST", body: {} }
       );
-      if (res.ok) showToast("Anti-AdBlock tunnel enabled");
+      showToast(res.ok ? "Anti-AdBlock tunnel enabled" : res.error || "Tunnel update failed");
       await loadCurrentTabData();
-      render();
+      renderMainPane();
+    });
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-open-proj-settings]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      openProjectSettingsDialog(Number(btn.dataset.openProjSettings));
+    });
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-open-proj-keys]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      void openProjectKeysDialog(Number(btn.dataset.openProjKeys));
+    });
+  });
+
+  mainPane.querySelectorAll<HTMLSelectElement>("[data-member-role]").forEach((sel) => {
+    sel.addEventListener("change", async () => {
+      const uid = Number(sel.dataset.memberRole);
+      const role = sel.value;
+      const res = await apiFetch<MemberItem>(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
+        { method: "PUT", body: { role } }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Failed updating member role");
+        await loadCurrentTabData();
+        renderMainPane();
+        return;
+      }
+      showToast("Member role updated");
+      await loadCurrentTabData();
+      renderMainPane();
+    });
+  });
+
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-member]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const uid = Number(btn.dataset.delMember);
+      const res = await apiFetch(
+        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Failed removing member");
+        return;
+      }
+      showToast("Member removed");
+      await loadCurrentTabData();
+      renderMainPane();
     });
   });
 
@@ -1474,37 +2004,32 @@ function bindDashboardHandlers(): void {
     if (res.ok && res.data) {
       state.lastCreatedToken = res.data.token;
       await loadCurrentTabData();
-      render();
+      renderMainPane();
     } else {
       showToast(res.error || "Token creation failed");
     }
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-del-token]").forEach((btn) => {
+  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-token]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.delToken!;
-      await apiFetch(`/api/0/api-tokens/${id}/`, { method: "DELETE" });
+      const res = await apiFetch(`/api/0/api-tokens/${encodeURIComponent(id)}/`, { method: "DELETE" });
+      showToast(res.ok ? "API token revoked" : res.error || "Token revoke failed");
       await loadCurrentTabData();
-      render();
+      renderMainPane();
     });
   });
 
-  document.getElementById("btn-new-project")?.addEventListener("click", () => openCreateDialog("project"));
-  document.getElementById("btn-new-monitor")?.addEventListener("click", () => openCreateDialog("monitor"));
-  document.getElementById("btn-new-alert")?.addEventListener("click", () => openCreateDialog("alert"));
-  document.getElementById("dlg-create-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-create") as HTMLDialogElement | null)?.close();
-  });
-
+  // Auto-Check tab handlers
   document.getElementById("btn-refresh-selfcheck")?.addEventListener("click", async () => {
     await refreshSelfCheck();
     showToast("Diagnóstico atualizado");
-    render();
+    syncSelfCheckSlots();
   });
 
   document.getElementById("btn-run-self-probe")?.addEventListener("click", async () => {
     state.probeRunning = true;
-    render();
+    renderMainPane();
     const res = await apiFetch<SelfProbeResult>(
       `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/probe/`,
       { method: "POST", body: { send_test_log: true } }
@@ -1517,7 +2042,7 @@ function bindDashboardHandlers(): void {
     } else {
       showToast(res.error || "Falha ao executar Auto-Teste E2E");
     }
-    render();
+    syncSelfCheckSlots();
   });
 
   document.getElementById("btn-ack-selfcheck")?.addEventListener("click", async () => {
@@ -1532,24 +2057,246 @@ function bindDashboardHandlers(): void {
     } else {
       showToast(res.error || "Falha ao limpar erros internos");
     }
-    render();
+    syncSelfCheckSlots();
   });
 }
 
-function openCreateDialog(kind: "project" | "monitor" | "alert"): void {
+function splitFilterList(raw: string): string[] {
+  return raw
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function openProjectSettingsDialog(projectId: number): void {
+  const proj = state.projects.find((p) => p.id === projectId);
+  const dlg = document.getElementById("dlg-proj-settings") as HTMLDialogElement | null;
+  const titleEl = document.getElementById("dlg-proj-settings-title");
+  const bodyEl = document.getElementById("dlg-proj-settings-body");
+  if (!proj || !dlg || !titleEl || !bodyEl) return;
+
+  state.activeProjectModalId = proj.id;
+  const f = proj.filters;
+  titleEl.textContent = `Filters & Scrubbing — ${proj.name}`;
+  bodyEl.innerHTML = `
+    <form id="proj-settings-form" class="stack-col">
+      <label for="pf-domains">Allowed Domains (one per line or comma-separated)
+        <textarea id="pf-domains" name="allowed_domains" rows="2" placeholder="app.example.com">${esc((f.allowed_domains || []).join("\n"))}</textarea>
+      </label>
+      <label for="pf-ignore-msg">Ignored Error Patterns (one per line)
+        <textarea id="pf-ignore-msg" name="ignore_messages" rows="2" placeholder="ResizeObserver loop">${esc((f.ignore_messages || []).join("\n"))}</textarea>
+      </label>
+      <label class="check-row" for="pf-ext">
+        <input id="pf-ext" type="checkbox" name="ignore_browser_extensions" ${f.ignore_browser_extensions ? "checked" : ""}>
+        <span>Ignore browser extension errors</span>
+      </label>
+      <label class="check-row" for="pf-crawl">
+        <input id="pf-crawl" type="checkbox" name="ignore_crawlers" ${f.ignore_crawlers ? "checked" : ""}>
+        <span>Ignore known bots / crawlers</span>
+      </label>
+      <label class="check-row" for="pf-local">
+        <input id="pf-local" type="checkbox" name="ignore_localhost" ${f.ignore_localhost ? "checked" : ""}>
+        <span>Ignore localhost events</span>
+      </label>
+      <label class="check-row" for="pf-ip">
+        <input id="pf-ip" type="checkbox" name="scrub_ip_addresses" ${f.scrub_ip_addresses ? "checked" : ""}>
+        <span>Scrub client IP addresses</span>
+      </label>
+      <label class="check-row" for="pf-emails">
+        <input id="pf-emails" type="checkbox" name="scrub_emails" ${f.scrub_emails ? "checked" : ""}>
+        <span>Scrub email addresses from payloads</span>
+      </label>
+      <label for="pf-storm-thresh">Storm Sample Threshold (events/min)
+        <input id="pf-storm-thresh" name="storm_sample_threshold" type="number" min="0" value="${f.storm_sample_threshold}">
+      </label>
+      <label for="pf-storm-every">Storm Sample 1 in N
+        <input id="pf-storm-every" name="storm_sample_every" type="number" min="1" value="${f.storm_sample_every}">
+      </label>
+      <label for="pf-promote">Auto-Promote Log Level to Issue
+        <select id="pf-promote" name="auto_promote_log_level">
+          <option value="" ${!f.auto_promote_log_level ? "selected" : ""}>Disabled</option>
+          <option value="error" ${f.auto_promote_log_level === "error" ? "selected" : ""}>error</option>
+          <option value="fatal" ${f.auto_promote_log_level === "fatal" ? "selected" : ""}>fatal</option>
+        </select>
+      </label>
+      <label for="pf-safe-keys">Safe Keys Allowlist (comma-separated, never scrubbed)
+        <input id="pf-safe-keys" name="safe_keys" type="text" autocomplete="off" value="${esc((f.safe_keys || []).join(", "))}">
+      </label>
+      <label for="pf-sens-keys">Extra Sensitive Keys (comma-separated)
+        <input id="pf-sens-keys" name="sensitive_keys" type="text" autocomplete="off" value="${esc((f.sensitive_keys || []).join(", "))}">
+      </label>
+      <button type="submit" autofocus>Save Filters &amp; Scrubbing</button>
+    </form>`;
+
+  const form = document.getElementById("proj-settings-form") as HTMLFormElement | null;
+  form?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const getChecked = (id: string) => (document.getElementById(id) as HTMLInputElement | null)?.checked ?? false;
+    const getVal = (id: string) =>
+      (document.getElementById(id) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null)?.value || "";
+
+    const payload: ProjectFilters = {
+      allowed_domains: splitFilterList(getVal("pf-domains")),
+      ignore_messages: splitFilterList(getVal("pf-ignore-msg")),
+      ignore_browser_extensions: getChecked("pf-ext"),
+      ignore_crawlers: getChecked("pf-crawl"),
+      ignore_localhost: getChecked("pf-local"),
+      scrub_ip_addresses: getChecked("pf-ip"),
+      scrub_emails: getChecked("pf-emails"),
+      storm_sample_threshold: Math.max(0, Number(getVal("pf-storm-thresh") || 0)),
+      storm_sample_every: Math.max(1, Number(getVal("pf-storm-every") || 1)),
+      auto_promote_log_level: getVal("pf-promote") || null,
+      safe_keys: splitFilterList(getVal("pf-safe-keys")),
+      sensitive_keys: splitFilterList(getVal("pf-sens-keys"))
+    };
+
+    const res = await apiFetch<Project>(
+      `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/settings/`,
+      { method: "PUT", body: payload }
+    );
+    if (!res.ok || !res.data) {
+      showToast(res.error || "Failed saving project filters");
+      return;
+    }
+    const idx = state.projects.findIndex((p) => p.id === proj.id);
+    if (idx >= 0) state.projects[idx] = res.data;
+    dlg.close();
+    renderMainPane();
+    showToast("Project filters saved");
+  });
+
+  openDialog(dlg);
+}
+
+function renderProjectKeysDialogBody(proj: Project): void {
+  const bodyEl = document.getElementById("dlg-proj-keys-body");
+  if (!bodyEl) return;
+  const origin = location.origin;
+
+  const keyRows = state.activeProjectKeys.length
+    ? state.activeProjectKeys
+        .map((k) => {
+          const dsn = `${origin.replace("://", `://${k.public_key}@`)}/${proj.id}`;
+          return `
+          <tr>
+            <th scope="row">${esc(k.label)}</th>
+            <td data-label="Public Key" class="mono">${esc(k.public_key)}</td>
+            <td data-label="Rate Limit" class="tabular">${k.rate_limit_per_min}/min</td>
+            <td data-label="Actions">
+              <div class="row-gap">
+                <button type="button" data-copy-text="${esc(dsn)}">Copy DSN</button>
+                <button type="button" class="btn-danger" data-del-proj-key="${k.id}">Revoke</button>
+              </div>
+            </td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="4">No active DSN keys for this project.</td></tr>`;
+
+  bodyEl.innerHTML = `
+    <div class="stack-col">
+      <form id="proj-key-create-form" class="row-gap">
+        <label for="new-proj-key-label">New Key Label
+          <input id="new-proj-key-label" name="label" type="text" required autocomplete="off" placeholder="Staging Browser" autofocus>
+        </label>
+        <button type="submit">Create DSN Key</button>
+      </form>
+      <div tabindex="0" role="region" aria-labelledby="pkeys-cap" class="table-wrapper">
+        <table class="data-table">
+          <caption id="pkeys-cap" class="hp-field">Project DSN Keys</caption>
+          <thead><tr><th>Label</th><th>Public Key</th><th>Limit</th><th>Actions</th></tr></thead>
+          <tbody>${keyRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  bindCopyButtons(bodyEl);
+
+  const form = document.getElementById("proj-key-create-form") as HTMLFormElement | null;
+  form?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const label = (document.getElementById("new-proj-key-label") as HTMLInputElement | null)?.value?.trim() || "";
+    const res = await apiFetch<ProjectKeyItem>(
+      `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/keys/`,
+      { method: "POST", body: { label } }
+    );
+    if (!res.ok) {
+      showToast(res.error || "Failed creating DSN key");
+      return;
+    }
+    showToast("DSN key created");
+    await refreshProjectKeysAndProjects(proj);
+  });
+
+  bodyEl.querySelectorAll<HTMLButtonElement>("[data-del-proj-key]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const keyId = Number(btn.dataset.delProjKey);
+      const res = await apiFetch(
+        `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/keys/${keyId}/`,
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        showToast(res.error || "Failed revoking DSN key");
+        return;
+      }
+      showToast("DSN key revoked");
+      await refreshProjectKeysAndProjects(proj);
+    });
+  });
+}
+
+async function refreshProjectKeysAndProjects(proj: Project): Promise<void> {
+  const [keysRes, projRes] = await Promise.all([
+    apiFetch<ProjectKeyItem[]>(
+      `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/keys/`
+    ),
+    apiFetch<Project[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/projects/`)
+  ]);
+  if (keysRes.ok && keysRes.data) state.activeProjectKeys = keysRes.data;
+  if (projRes.ok && projRes.data) state.projects = projRes.data;
+  const freshProj = state.projects.find((p) => p.id === proj.id) || proj;
+  renderProjectKeysDialogBody(freshProj);
+  if (state.tab === "projects") renderMainPane();
+}
+
+async function openProjectKeysDialog(projectId: number): Promise<void> {
+  const proj = state.projects.find((p) => p.id === projectId);
+  const dlg = document.getElementById("dlg-proj-keys") as HTMLDialogElement | null;
+  const titleEl = document.getElementById("dlg-proj-keys-title");
+  if (!proj || !dlg || !titleEl) return;
+
+  state.activeProjectModalId = proj.id;
+  titleEl.textContent = `DSN Keys — ${proj.name}`;
+  const res = await apiFetch<ProjectKeyItem[]>(
+    `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/keys/`
+  );
+  if (!res.ok || !res.data) {
+    showToast(res.error || "Failed loading DSN keys");
+    return;
+  }
+  state.activeProjectKeys = res.data;
+  renderProjectKeysDialogBody(proj);
+  openDialog(dlg);
+}
+
+function openCreateDialog(kind: "project" | "monitor" | "alert" | "member"): void {
   const dlg = document.getElementById("dlg-create") as HTMLDialogElement | null;
+  const title = document.getElementById("dlg-create-title");
   const body = document.getElementById("dlg-create-body");
-  if (!dlg || !body) return;
+  if (!dlg || !title || !body) return;
   const projOptions = state.projects
     .map((p) => `<option value="${p.id}">${esc(p.name)}</option>`)
     .join("");
 
   if (kind === "project") {
+    title.textContent = "Create Project";
     body.innerHTML = `
       <form id="create-res-form" class="stack-col">
-        <label>Project Name <input name="name" required placeholder="RoleLane Web"></label>
-        <label>Platform
-          <select name="platform">
+        <label for="cr-proj-name">Project Name
+          <input id="cr-proj-name" name="name" type="text" required autocomplete="off" placeholder="RoleLane Web" autofocus>
+        </label>
+        <label for="cr-proj-plat">Platform
+          <select id="cr-proj-plat" name="platform">
             <option value="javascript">JavaScript / Browser</option>
             <option value="node">Node.js</option>
             <option value="php">PHP / Laravel</option>
@@ -1560,36 +2307,116 @@ function openCreateDialog(kind: "project" | "monitor" | "alert"): void {
         <button type="submit">Create Project</button>
       </form>`;
   } else if (kind === "monitor") {
+    title.textContent = "New Heartbeat Monitor";
     body.innerHTML = `
       <form id="create-res-form" class="stack-col">
-        <label>Project <select name="project_id">${projOptions}</select></label>
-        <label>Monitor Name <input name="name" required placeholder="Nightly Backup Cron"></label>
-        <label>Expected Interval (sec) <input name="expected_interval_sec" type="number" value="60" min="10"></label>
+        <label for="cr-mon-proj">Project
+          <select id="cr-mon-proj" name="project_id">${projOptions}</select>
+        </label>
+        <label for="cr-mon-name">Monitor Name
+          <input id="cr-mon-name" name="name" type="text" required autocomplete="off" placeholder="Nightly Backup Cron" autofocus>
+        </label>
+        <label for="cr-mon-int">Expected Interval (sec)
+          <input id="cr-mon-int" name="expected_interval_sec" type="number" value="60" min="10">
+        </label>
         <button type="submit">Create Monitor</button>
       </form>`;
-  } else {
+  } else if (kind === "member") {
+    title.textContent = "Add Team Member";
     body.innerHTML = `
       <form id="create-res-form" class="stack-col">
-        <label>Project <select name="project_id">${projOptions}</select></label>
-        <label>Rule Name <input name="name" required placeholder="Notify Slack on new error"></label>
-        <label>Trigger
-          <select name="trigger_type">
+        <label for="cr-mem-email">Email
+          <input id="cr-mem-email" name="email" type="email" required autocomplete="email" spellcheck="false" placeholder="dev@company.com" autofocus>
+        </label>
+        <label for="cr-mem-name">Name
+          <input id="cr-mem-name" name="name" type="text" required autocomplete="name" placeholder="Developer Name">
+        </label>
+        <label for="cr-mem-pw">Temporary Password (min 8 chars)
+          <input id="cr-mem-pw" name="password" type="password" required minlength="8" autocomplete="new-password">
+        </label>
+        <label for="cr-mem-role">Role
+          <select id="cr-mem-role" name="role">
+            <option value="member" selected>member</option>
+            <option value="admin">admin</option>
+            <option value="viewer">viewer</option>
+            <option value="owner">owner</option>
+          </select>
+        </label>
+        <button type="submit">Add Member</button>
+      </form>`;
+  } else {
+    title.textContent = "New Alert Rule";
+    body.innerHTML = `
+      <form id="create-res-form" class="stack-col">
+        <label for="cr-al-proj">Project
+          <select id="cr-al-proj" name="project_id">${projOptions}</select>
+        </label>
+        <label for="cr-al-name">Rule Name
+          <input id="cr-al-name" name="name" type="text" required autocomplete="off" placeholder="Notify on error" autofocus>
+        </label>
+        <label for="cr-al-trigger">Trigger
+          <select id="cr-al-trigger" name="trigger_type">
             <option value="new_issue">New Issue</option>
             <option value="regression">Regression</option>
+            <option value="threshold">Event Threshold</option>
             <option value="fatal_log">Fatal Log</option>
             <option value="uptime_down">Uptime Down</option>
           </select>
         </label>
-        <label>Channel
-          <select name="channel_type">
+        <div id="cr-al-thresh-wrap" class="stack-col is-hidden">
+          <label for="cr-al-thresh-cnt">Threshold Event Count
+            <input id="cr-al-thresh-cnt" name="threshold_count" type="number" min="1" value="5">
+          </label>
+          <label for="cr-al-window">Window (sec)
+            <input id="cr-al-window" name="window_sec" type="number" min="10" max="86400" value="60">
+          </label>
+        </div>
+        <label for="cr-al-channel">Channel
+          <select id="cr-al-channel" name="channel_type">
             <option value="webhook">Webhook (JSON + HMAC)</option>
             <option value="slack">Slack Webhook</option>
             <option value="discord">Discord Webhook</option>
+            <option value="email">Email (SMTP)</option>
           </select>
         </label>
-        <label>HTTPS Target URL <input name="target_url" type="url" required placeholder="https://hooks.slack.com/services/..."></label>
+        <div id="cr-al-webhook-wrap" class="stack-col">
+          <label for="cr-al-url">HTTPS Target URL
+            <input id="cr-al-url" name="target_url" type="url" required placeholder="https://hooks.slack.com/services/...">
+          </label>
+          <label for="cr-al-secret">Webhook HMAC Secret (optional)
+            <input id="cr-al-secret" name="webhook_secret" type="password" autocomplete="new-password" placeholder="Optional X-BugFinder-Signature secret">
+          </label>
+        </div>
+        <div id="cr-al-email-wrap" class="stack-col is-hidden">
+          <label for="cr-al-email">Email Recipient
+            <input id="cr-al-email" name="email_to" type="email" autocomplete="email" spellcheck="false" placeholder="oncall@company.com">
+          </label>
+        </div>
         <button type="submit">Save Alert Rule</button>
       </form>`;
+
+    const trigSel = document.getElementById("cr-al-trigger") as HTMLSelectElement | null;
+    const threshWrap = document.getElementById("cr-al-thresh-wrap");
+    const syncThresh = () => {
+      threshWrap?.classList.toggle("is-hidden", trigSel?.value !== "threshold");
+    };
+    trigSel?.addEventListener("change", syncThresh);
+    syncThresh();
+
+    const chSel = document.getElementById("cr-al-channel") as HTMLSelectElement | null;
+    const webWrap = document.getElementById("cr-al-webhook-wrap");
+    const emailWrap = document.getElementById("cr-al-email-wrap");
+    const urlInput = document.getElementById("cr-al-url") as HTMLInputElement | null;
+    const emailInput = document.getElementById("cr-al-email") as HTMLInputElement | null;
+    const syncChannel = () => {
+      const isEmail = chSel?.value === "email";
+      webWrap?.classList.toggle("is-hidden", isEmail);
+      emailWrap?.classList.toggle("is-hidden", !isEmail);
+      if (urlInput) urlInput.required = !isEmail;
+      if (emailInput) emailInput.required = isEmail;
+    };
+    chSel?.addEventListener("change", syncChannel);
+    syncChannel();
   }
 
   const form = document.getElementById("create-res-form") as HTMLFormElement | null;
@@ -1598,12 +2425,26 @@ function openCreateDialog(kind: "project" | "monitor" | "alert"): void {
     const raw = Object.fromEntries(new FormData(form).entries()) as Record<string, any>;
     if (raw.project_id) raw.project_id = Number(raw.project_id);
     if (raw.expected_interval_sec) raw.expected_interval_sec = Number(raw.expected_interval_sec);
+    if (raw.threshold_count) raw.threshold_count = Number(raw.threshold_count);
+    if (raw.window_sec) raw.window_sec = Number(raw.window_sec);
+    if (kind === "alert") {
+      if (raw.channel_type === "email") {
+        delete raw.target_url;
+        delete raw.webhook_secret;
+      } else {
+        delete raw.email_to;
+      }
+    }
+
     const url =
       kind === "project"
         ? `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/projects/`
         : kind === "monitor"
         ? `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/monitors/`
+        : kind === "member"
+        ? `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`
         : `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/`;
+
     const res = await apiFetch(url, { method: "POST", body: raw });
     if (!res.ok) {
       showToast(res.error || "Failed creating item");
@@ -1611,7 +2452,16 @@ function openCreateDialog(kind: "project" | "monitor" | "alert"): void {
     }
     dlg.close();
     await loadCurrentTabData();
-    render();
+    renderMainPane();
+    showToast(
+      kind === "project"
+        ? "Project created"
+        : kind === "monitor"
+        ? "Monitor created"
+        : kind === "member"
+        ? "Member added"
+        : "Alert rule saved"
+    );
   });
 
   openDialog(dlg);

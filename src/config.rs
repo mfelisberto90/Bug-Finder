@@ -148,9 +148,13 @@ impl AppConfig {
                 .filter(|v| !v.is_empty())
         });
 
-        let is_dev = env::var("BUGFINDER_ENV")
-            .map(|v| v.eq_ignore_ascii_case("dev") || v.eq_ignore_ascii_case("development"))
-            .unwrap_or(true);
+        let is_loopback_bind = bind_addr.starts_with("127.0.0.1:")
+            || bind_addr.starts_with("localhost:")
+            || bind_addr.starts_with("[::1]:");
+        let is_dev = match env::var("BUGFINDER_ENV") {
+            Ok(v) => v.eq_ignore_ascii_case("dev") || v.eq_ignore_ascii_case("development"),
+            Err(_) => desktop_app_mode || is_loopback_bind,
+        };
 
         let app_key = load_or_create_app_key(&data_dir)?;
 

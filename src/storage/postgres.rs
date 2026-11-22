@@ -163,6 +163,102 @@ fn row_to_issue(r: &PgRow, org_slug: &str) -> IssueSummaryDto {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn pg_build_alert_jobs_for_event(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: i64,
+    project_id: i64,
+    project_slug: &str,
+    short_id: &str,
+    title: &str,
+    level: &str,
+    is_new_issue: bool,
+    is_regression: bool,
+    now_sec: i64,
+) -> Result<Vec<AlertDispatchJob>, String> {
+    let rows = sqlx::query(
+        "SELECT id, name, trigger_type, threshold_count, window_sec, cooldown_sec,
+                channel_type, target_url, webhook_secret, email_to, last_triggered_at
+         FROM alert_rules
+         WHERE organization_id = $1 AND project_id = $2 AND is_active = TRUE",
+    )
+    .bind(organization_id)
+    .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(map_pg_err)?;
+
+    let mut jobs = Vec::new();
+    let mut triggered_ids = Vec::new();
+
+    for r in rows {
+        let id: i64 = r.get("id");
+        let name: String = r.get("name");
+        let trigger_type: String = r.get("trigger_type");
+        let threshold_count: i64 = r.get("threshold_count");
+        let window_sec: i64 = r.get("window_sec");
+        let cooldown_sec: i64 = r.get("cooldown_sec");
+        let channel_type: String = r.get("channel_type");
+        let target_url: String = r.get("target_url");
+        let webhook_secret: String = r.get("webhook_secret");
+        let email_to: String = r.get("email_to");
+        let last_triggered_at: Option<i64> = r.get("last_triggered_at");
+
+        if let Some(last) = last_triggered_at {
+            if now_sec - last < cooldown_sec {
+                continue;
+            }
+        }
+
+        let matched = match trigger_type.as_str() {
+            "new_issue" => is_new_issue,
+            "regression" => is_regression,
+            "fatal_log" => level == "fatal",
+            "threshold" => {
+                let since_ms = (now_sec - window_sec) * 1000;
+                let recent: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM issue_events WHERE project_id = $1 AND timestamp_ms >= $2",
+                )
+                .bind(project_id)
+                .bind(since_ms)
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap_or(0);
+                recent >= threshold_count.max(1)
+            }
+            _ => false,
+        };
+
+        if matched {
+            triggered_ids.push(id);
+            jobs.push(AlertDispatchJob {
+                rule_id: id,
+                rule_name: name,
+                channel_type,
+                target_url,
+                webhook_secret,
+                email_to,
+                title: title.to_string(),
+                message: format!("Trigger: {trigger_type} | Issue {short_id}"),
+                level: level.to_string(),
+                project_slug: project_slug.to_string(),
+                short_id: Some(short_id.to_string()),
+            });
+        }
+    }
+
+    for id in triggered_ids {
+        sqlx::query("UPDATE alert_rules SET last_triggered_at = $1 WHERE id = $2")
+            .bind(now_sec)
+            .bind(id)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_pg_err)?;
+    }
+
+    Ok(jobs)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn pg_insert_event_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     auth: &ProjectAuthInfo,
@@ -797,6 +893,24 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
+    async fn tunnel_slug_exists(&self, tunnel_slug: &str) -> Result<bool, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.tunnel_slug', $1, true)")
+            .bind(tunnel_slug)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let active: Option<bool> = sqlx::query_scalar(
+            "SELECT is_active FROM tunnel_lookup WHERE slug = $1",
+        )
+        .bind(tunnel_slug)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(active == Some(true))
+    }
+
     async fn resolve_tunnel(&self, tunnel_slug: &str, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.tunnel_slug', $1, true)")
@@ -1183,6 +1297,7 @@ impl StorageBackend for PostgresStorage {
             _ => "i.last_seen DESC",
         };
         let limit = p.limit.clamp(1, 200);
+        let offset = p.offset.clamp(0, 100_000);
         let q_text = p.search_query.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
         let total: i64 = sqlx::query_scalar(
@@ -1220,7 +1335,7 @@ impl StorageBackend for PostgresStorage {
                AND ($5::bigint IS NULL OR i.project_id = $5)
                AND ($6::bigint IS NULL OR i.last_seen >= $6)
                AND ($7::text IS NULL OR i.search_vec @@ plainto_tsquery('english', $7))
-             ORDER BY {order} LIMIT $8"
+             ORDER BY {order} LIMIT $8 OFFSET $9"
         );
 
         let rows = sqlx::query(&sql)
@@ -1232,6 +1347,7 @@ impl StorageBackend for PostgresStorage {
             .bind(p.since_ms)
             .bind(q_text)
             .bind(limit)
+            .bind(offset)
             .fetch_all(&mut *tx)
             .await
             .map_err(map_pg_err)?;
@@ -2065,6 +2181,10 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn get_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<AlertRuleDto>, String> {
+        Ok(self.get_alert_rule_for_dispatch(ctx, rule_id).await?.map(|(dto, _)| dto))
+    }
+
+    async fn get_alert_rule_for_dispatch(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<(AlertRuleDto, String)>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let row = sqlx::query(
             "SELECT id, project_id, name, trigger_type, threshold_count, window_sec, cooldown_sec,
@@ -2078,7 +2198,7 @@ impl StorageBackend for PostgresStorage {
         tx.commit().await.map_err(map_pg_err)?;
         Ok(row.map(|r| {
             let sec: String = r.get("webhook_secret");
-            AlertRuleDto {
+            let dto = AlertRuleDto {
                 id: r.get("id"),
                 project_id: r.get("project_id"),
                 name: r.get("name"),
@@ -2093,7 +2213,8 @@ impl StorageBackend for PostgresStorage {
                 last_triggered_at: r.get("last_triggered_at"),
                 is_active: r.get("is_active"),
                 created_at: iso_from_ms(r.get("created_at")),
-            }
+            };
+            (dto, sec)
         }))
     }
 
@@ -2453,7 +2574,8 @@ impl StorageBackend for PostgresStorage {
             by_org.entry(oid).or_default().push(it);
         }
 
-        let alerts = Vec::new();
+        let mut alerts = Vec::new();
+        let now_sec = chrono::Utc::now().timestamp();
         for (org_id, org_items) in by_org {
             let mut tx = self.begin_tenant(org_id).await?;
             for item in org_items {
@@ -2465,7 +2587,24 @@ impl StorageBackend for PostgresStorage {
                             &auth.filters,
                             received_ms,
                         );
-                        let _ = pg_insert_event_in_tx(&mut tx, &auth, &meta, &payload_json, received_ms, store_blob).await?;
+                        let (issue_id, short_id, is_new, is_reg) =
+                            pg_insert_event_in_tx(&mut tx, &auth, &meta, &payload_json, received_ms, store_blob).await?;
+                        if issue_id > 0 {
+                            let jobs = pg_build_alert_jobs_for_event(
+                                &mut tx,
+                                auth.organization_id,
+                                auth.project_id,
+                                &auth.project_slug,
+                                &short_id,
+                                &meta.title,
+                                &meta.level,
+                                is_new,
+                                is_reg,
+                                now_sec,
+                            )
+                            .await?;
+                            alerts.extend(jobs);
+                        }
                     }
                     IngestWriteItem::Logs { organization_id, project_id, project_slug, auto_promote_level, logs } => {
                         for l in logs {
@@ -2521,6 +2660,7 @@ impl StorageBackend for PostgresStorage {
                             .await
                             .map_err(map_pg_err)?;
 
+                            let mut fatal_alert_checked = false;
                             if let Some(min_lvl) = auto_promote_level {
                                 if l.level.num() >= min_lvl.num() {
                                     let ev = json!({
@@ -2543,8 +2683,42 @@ impl StorageBackend for PostgresStorage {
                                         rate_limit_per_min: 300,
                                         filters: ProjectFilters::default(),
                                     };
-                                    let _ = pg_insert_event_in_tx(&mut tx, &synth_auth, &meta, &bytes, l.timestamp_ms, true).await?;
+                                    let (issue_id, short_id, is_new, is_reg) =
+                                        pg_insert_event_in_tx(&mut tx, &synth_auth, &meta, &bytes, l.timestamp_ms, true).await?;
+                                    if issue_id > 0 {
+                                        let jobs = pg_build_alert_jobs_for_event(
+                                            &mut tx,
+                                            organization_id,
+                                            project_id,
+                                            &project_slug,
+                                            &short_id,
+                                            &meta.title,
+                                            l.level.as_str(),
+                                            is_new,
+                                            is_reg,
+                                            now_sec,
+                                        )
+                                        .await?;
+                                        alerts.extend(jobs);
+                                        fatal_alert_checked = true;
+                                    }
                                 }
+                            }
+                            if !fatal_alert_checked && l.level == LogLevel::Fatal {
+                                let jobs = pg_build_alert_jobs_for_event(
+                                    &mut tx,
+                                    organization_id,
+                                    project_id,
+                                    &project_slug,
+                                    "LOG",
+                                    &l.body,
+                                    "fatal",
+                                    false,
+                                    false,
+                                    now_sec,
+                                )
+                                .await?;
+                                alerts.extend(jobs);
                             }
                         }
                     }
@@ -2567,6 +2741,19 @@ impl StorageBackend for PostgresStorage {
                         .bind(&tr.release)
                         .bind(&tr.spans)
                         .bind(tr.timestamp_ms)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(map_pg_err)?;
+
+                        let bh = (tr.timestamp_ms / 3_600_000) * 3_600_000;
+                        sqlx::query(
+                            "INSERT INTO hourly_stats (organization_id, project_id, bucket_hour, category, quantity)
+                             VALUES ($1,$2,$3,'transaction',1)
+                             ON CONFLICT (project_id, bucket_hour, category) DO UPDATE SET quantity = hourly_stats.quantity + 1",
+                        )
+                        .bind(organization_id)
+                        .bind(project_id)
+                        .bind(bh)
                         .execute(&mut *tx)
                         .await
                         .map_err(map_pg_err)?;
@@ -2650,8 +2837,148 @@ impl StorageBackend for PostgresStorage {
         Ok(alerts)
     }
 
-    async fn run_maintenance(&self, _retention_days: u32, _max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String> {
-        Ok(Vec::new())
+    async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String> {
+        let now = now_ms();
+        let cutoff_ms = now - (retention_days as i64) * 86_400_000;
+        let now_sec = now / 1000;
+        let size_bytes = self.db_size_bytes().await;
+        let max_bytes = max_db_mb * 1024 * 1024;
+        let over_budget = size_bytes > max_bytes;
+
+        let mut scan_tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.maintenance_scan', '1', true)")
+            .execute(&mut *scan_tx)
+            .await
+            .map_err(map_pg_err)?;
+        sqlx::query("DELETE FROM session_lookup WHERE expires_at <= EXTRACT(EPOCH FROM NOW())::bigint")
+            .execute(&mut *scan_tx)
+            .await
+            .map_err(map_pg_err)?;
+        let org_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM organizations ORDER BY id ASC")
+            .fetch_all(&mut *scan_tx)
+            .await
+            .map_err(map_pg_err)?;
+        scan_tx.commit().await.map_err(map_pg_err)?;
+
+        let mut alerts = Vec::new();
+        for org_id in org_ids {
+            let mut tx = self.begin_tenant(org_id).await?;
+            sqlx::query("DELETE FROM sessions WHERE expires_at <= $1")
+                .bind(now_sec)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("DELETE FROM idempotency_keys WHERE created_at < $1")
+                .bind(now - 86_400_000)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("DELETE FROM issue_events WHERE timestamp_ms < $1")
+                .bind(cutoff_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("DELETE FROM log_events WHERE timestamp_ms < $1")
+                .bind(cutoff_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("DELETE FROM transaction_events WHERE timestamp_ms < $1")
+                .bind(cutoff_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+
+            if over_budget {
+                sqlx::query(
+                    "DELETE FROM log_events WHERE id IN (SELECT id FROM log_events ORDER BY id ASC LIMIT 2000)",
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+                sqlx::query(
+                    "DELETE FROM issue_events WHERE id IN (SELECT id FROM issue_events ORDER BY timestamp_ms ASC LIMIT 1000)",
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            }
+
+            let down_rows: Vec<(i64, i64, String, String, String)> = sqlx::query_as(
+                "SELECT m.id, m.project_id, p.slug, m.name, m.uuid
+                 FROM uptime_monitors m
+                 JOIN projects p ON p.id = m.project_id
+                 WHERE m.is_active = TRUE AND m.status = 'up'
+                   AND m.last_heartbeat_at IS NOT NULL
+                   AND ($1 - m.last_heartbeat_at) > (m.expected_interval_sec * 1500)",
+            )
+            .bind(now)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+
+            for (mon_id, proj_id, pslug, mname, muuid) in down_rows {
+                sqlx::query("UPDATE uptime_monitors SET status = 'down' WHERE id = $1")
+                    .bind(mon_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_pg_err)?;
+                sqlx::query(
+                    "INSERT INTO uptime_checks (organization_id, monitor_id, is_up, message, checked_at)
+                     VALUES ($1, $2, FALSE, 'Heartbeat missed', $3)",
+                )
+                .bind(org_id)
+                .bind(mon_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+
+                let rules = sqlx::query(
+                    "SELECT id, name, channel_type, target_url, webhook_secret, email_to, cooldown_sec, last_triggered_at
+                     FROM alert_rules WHERE project_id = $1 AND trigger_type = 'uptime_down' AND is_active = TRUE",
+                )
+                .bind(proj_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+
+                let mut fired = Vec::new();
+                for rr in rules {
+                    let rid: i64 = rr.get("id");
+                    let cd: i64 = rr.get("cooldown_sec");
+                    let lt: Option<i64> = rr.get("last_triggered_at");
+                    if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                        fired.push(rid);
+                        alerts.push(AlertDispatchJob {
+                            rule_id: rid,
+                            rule_name: rr.get("name"),
+                            channel_type: rr.get("channel_type"),
+                            target_url: rr.get("target_url"),
+                            webhook_secret: rr.get("webhook_secret"),
+                            email_to: rr.get("email_to"),
+                            title: format!("Uptime monitor down: {mname}"),
+                            message: format!("Heartbeat missed for monitor {muuid}"),
+                            level: "fatal".into(),
+                            project_slug: pslug.clone(),
+                            short_id: None,
+                        });
+                    }
+                }
+                for rid in fired {
+                    sqlx::query("UPDATE alert_rules SET last_triggered_at = $1 WHERE id = $2")
+                        .bind(now_sec)
+                        .bind(rid)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(map_pg_err)?;
+                }
+            }
+
+            tx.commit().await.map_err(map_pg_err)?;
+        }
+
+        Ok(alerts)
     }
 
     async fn db_size_bytes(&self) -> u64 {

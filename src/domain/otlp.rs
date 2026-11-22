@@ -22,7 +22,10 @@ fn should_skip_resource_attr(key: &str) -> bool {
     key.starts_with("telemetry.sdk.") || key.starts_with("telemetry.auto.")
 }
 
-fn unwrap_otel_json_anyvalue(val: &Value) -> Value {
+fn unwrap_otel_json_anyvalue(val: &Value, depth: usize) -> Value {
+    if depth > 16 {
+        return Value::String("[MaxDepth]".into());
+    }
     let Some(obj) = val.as_object() else {
         return val.clone();
     };
@@ -48,7 +51,11 @@ fn unwrap_otel_json_anyvalue(val: &Value) -> Value {
     }
     if let Some(arr) = obj.get("arrayValue").or_else(|| obj.get("array_value")) {
         if let Some(vals) = arr.get("values").and_then(|v| v.as_array()) {
-            return Value::Array(vals.iter().map(unwrap_otel_json_anyvalue).collect());
+            return Value::Array(
+                vals.iter()
+                    .map(|v| unwrap_otel_json_anyvalue(v, depth + 1))
+                    .collect(),
+            );
         }
     }
     if let Some(kv) = obj.get("kvlistValue").or_else(|| obj.get("kvlist_value")) {
@@ -58,7 +65,7 @@ fn unwrap_otel_json_anyvalue(val: &Value) -> Value {
                 if let Some(k) = item.get("key").and_then(|v| v.as_str()) {
                     let vv = item
                         .get("value")
-                        .map(unwrap_otel_json_anyvalue)
+                        .map(|v| unwrap_otel_json_anyvalue(v, depth + 1))
                         .unwrap_or(Value::Null);
                     m.insert(k.to_string(), vv);
                 }
@@ -111,7 +118,7 @@ fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> 
                     if !should_skip_resource_attr(k) {
                         let v = attr
                             .get("value")
-                            .map(unwrap_otel_json_anyvalue)
+                            .map(|val| unwrap_otel_json_anyvalue(val, 0))
                             .unwrap_or(Value::Null);
                         res_attrs.push((k.to_string(), v));
                     }
@@ -157,12 +164,12 @@ fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> 
                     .and_then(|v| v.as_str());
 
                 let level = sev_text
-                    .map(LogLevel::from_str_loose)
+                    .and_then(LogLevel::try_from_str_strict)
                     .or_else(|| sev_num.map(LogLevel::from_otel_severity))
                     .unwrap_or(LogLevel::Info);
 
                 let body_str = match rec.get("body") {
-                    Some(b) => match unwrap_otel_json_anyvalue(b) {
+                    Some(b) => match unwrap_otel_json_anyvalue(b, 0) {
                         Value::String(s) => s,
                         Value::Null => String::new(),
                         other => other.to_string(),
@@ -193,7 +200,7 @@ fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> 
                         if let Some(k) = attr.get("key").and_then(|v| v.as_str()) {
                             let v = attr
                                 .get("value")
-                                .map(unwrap_otel_json_anyvalue)
+                                .map(|val| unwrap_otel_json_anyvalue(val, 0))
                                 .unwrap_or(Value::Null);
                             attrs_map.insert(k.to_string(), v);
                         }
@@ -297,12 +304,18 @@ impl<'a> PbCursor<'a> {
     }
 
     fn read_bytes(&mut self) -> Result<&'a [u8], OtlpDecodeError> {
-        let len = self.read_varint()? as usize;
-        if self.pos + len > self.buf.len() {
+        let len_u64 = self.read_varint()?;
+        let len = usize::try_from(len_u64)
+            .map_err(|_| OtlpDecodeError("Length overflows usize".into()))?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| OtlpDecodeError("Length arithmetic overflow".into()))?;
+        if end > self.buf.len() {
             return Err(OtlpDecodeError("Truncated length-delimited field".into()));
         }
-        let slice = &self.buf[self.pos..self.pos + len];
-        self.pos += len;
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -377,7 +390,7 @@ fn decode_pb_resource(buf: &[u8]) -> Result<Vec<(String, Value)>, OtlpDecodeErro
     while !cur.eof() {
         let (field, wt) = cur.read_tag()?;
         if field == 1 && wt == 2 {
-            let kv = decode_pb_key_value(cur.read_bytes()?)?;
+            let kv = decode_pb_key_value(cur.read_bytes()?, 0)?;
             if !should_skip_resource_attr(&kv.0) {
                 attrs.push(kv);
             }
@@ -450,7 +463,7 @@ fn decode_pb_log_record(
                 };
             }
             (6, 2) => {
-                let (k, v) = decode_pb_key_value(cur.read_bytes()?)?;
+                let (k, v) = decode_pb_key_value(cur.read_bytes()?, 0)?;
                 attrs_map.insert(k, v);
             }
             (9, 2) => {
@@ -478,7 +491,7 @@ fn decode_pb_log_record(
 
     let level = severity_text
         .as_deref()
-        .map(LogLevel::from_str_loose)
+        .and_then(LogLevel::try_from_str_strict)
         .or_else(|| severity_num.map(LogLevel::from_otel_severity))
         .unwrap_or(LogLevel::Info);
 
@@ -498,7 +511,10 @@ fn decode_pb_log_record(
     })
 }
 
-fn decode_pb_key_value(buf: &[u8]) -> Result<(String, Value), OtlpDecodeError> {
+fn decode_pb_key_value(buf: &[u8], depth: usize) -> Result<(String, Value), OtlpDecodeError> {
+    if depth > 16 {
+        return Ok(("[MaxDepth]".to_string(), Value::String("[MaxDepth]".into())));
+    }
     let mut cur = PbCursor::new(buf);
     let mut key = String::new();
     let mut val = Value::Null;
@@ -506,7 +522,7 @@ fn decode_pb_key_value(buf: &[u8]) -> Result<(String, Value), OtlpDecodeError> {
         let (field, wt) = cur.read_tag()?;
         match (field, wt) {
             (1, 2) => key = String::from_utf8_lossy(cur.read_bytes()?).to_string(),
-            (2, 2) => val = decode_pb_anyvalue(cur.read_bytes()?, 0)?,
+            (2, 2) => val = decode_pb_anyvalue(cur.read_bytes()?, depth + 1)?,
             _ => cur.skip_field(wt)?,
         }
     }
@@ -553,7 +569,7 @@ fn decode_pb_anyvalue(buf: &[u8], depth: usize) -> Result<Value, OtlpDecodeError
                 while !kc.eof() {
                     let (kf, kwt) = kc.read_tag()?;
                     if kf == 1 && kwt == 2 {
-                        let (k, v) = decode_pb_key_value(kc.read_bytes()?)?;
+                        let (k, v) = decode_pb_key_value(kc.read_bytes()?, depth + 1)?;
                         map.insert(k, v);
                     } else {
                         kc.skip_field(kwt)?;
@@ -668,5 +684,31 @@ mod tests {
         assert_eq!(logs[0].body, "Queue drained");
         assert_eq!(logs[0].trace_id.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert_eq!(logs[0].span_id.as_deref(), Some("bbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn guards_nested_kvlist_depth_varint_overflow_and_unknown_severity_text() {
+        // 1. 40-level deep kvlistValue must cap cleanly at [MaxDepth] without stack overflow
+        let mut any = pb_bytes(1, b"leaf");
+        for _ in 0..40 {
+            let kv = [pb_bytes(1, b"nested"), pb_bytes(2, &any)].concat();
+            let kvlist = pb_bytes(1, &kv);
+            any = pb_bytes(6, &kvlist);
+        }
+        let top_kv = [pb_bytes(1, b"deep"), pb_bytes(2, &any)].concat();
+        let mut log_rec = Vec::new();
+        log_rec.extend(pb_varint(2, 17)); // ERROR
+        log_rec.extend(pb_bytes(3, b"CUSTOM_UNKNOWN_LEVEL"));
+        log_rec.extend(pb_bytes(5, &pb_bytes(1, b"nested test")));
+        log_rec.extend(pb_bytes(6, &top_kv));
+        let req = pb_bytes(1, &pb_bytes(2, &pb_bytes(2, &log_rec)));
+        let logs = decode_otlp_logs(&req, "application/x-protobuf").unwrap();
+        assert_eq!(logs[0].level, LogLevel::Error);
+        assert!(serde_json::to_string(&logs[0].attributes["deep"]).unwrap().contains("[MaxDepth]"));
+
+        // 2. Varint overflow / huge length field must return Err cleanly (never panic)
+        let mut bad_bytes = vec![0x0a]; // field 1, wire type 2 (length-delimited)
+        push_varint(&mut bad_bytes, u64::MAX);
+        assert!(decode_otlp_logs(&bad_bytes, "application/x-protobuf").is_err());
     }
 }

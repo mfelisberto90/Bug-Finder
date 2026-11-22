@@ -751,6 +751,21 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
+    async fn tunnel_slug_exists(&self, tunnel_slug: &str) -> Result<bool, String> {
+        let slug = tunnel_slug.to_string();
+        self.read(move |conn| {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tunnel_routes WHERE slug = ?1 AND is_active = 1",
+                    params![slug],
+                    |r| r.get(0),
+                )
+                .map_err(map_sqlite_err)?;
+            Ok(exists > 0)
+        })
+        .await
+    }
+
     async fn resolve_tunnel(&self, tunnel_slug: &str, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
         let tslug = tunnel_slug.to_string();
         let sha = key_sha256.to_string();
@@ -1191,7 +1206,8 @@ impl StorageBackend for SqliteStorage {
             };
             sql.push_str(order);
             let limit = p.limit.clamp(1, 200);
-            sql.push_str(&format!(" LIMIT {limit}"));
+            let offset = p.offset.clamp(0, 100_000);
+            sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
 
             let total: i64 = conn
                 .query_row(&count_sql, rusqlite::params_from_iter(bind_vals.iter()), |r| r.get(0))
@@ -2232,6 +2248,10 @@ impl StorageBackend for SqliteStorage {
     }
 
     async fn get_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<AlertRuleDto>, String> {
+        Ok(self.get_alert_rule_for_dispatch(ctx, rule_id).await?.map(|(dto, _)| dto))
+    }
+
+    async fn get_alert_rule_for_dispatch(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<(AlertRuleDto, String)>, String> {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             conn.query_row(
@@ -2241,7 +2261,7 @@ impl StorageBackend for SqliteStorage {
                 params![rule_id, org_id],
                 |r| {
                     let secret: String = r.get(9)?;
-                    Ok(AlertRuleDto {
+                    let dto = AlertRuleDto {
                         id: r.get(0)?,
                         project_id: r.get(1)?,
                         name: r.get(2)?,
@@ -2256,7 +2276,8 @@ impl StorageBackend for SqliteStorage {
                         last_triggered_at: r.get(11)?,
                         is_active: r.get::<_, i64>(12)? != 0,
                         created_at: iso_from_ms(r.get(13)?),
-                    })
+                    };
+                    Ok((dto, secret))
                 },
             )
             .optional()
@@ -2704,6 +2725,7 @@ impl StorageBackend for SqliteStorage {
                             .map_err(map_sqlite_err)?;
 
                             // Auto-promote fatal/error logs into trackable Issues if enabled on project
+                            let mut fatal_alert_checked = false;
                             if let Some(min_lvl) = auto_promote_level {
                                 if l.level.num() >= min_lvl.num() {
                                     let ev = json!({
@@ -2748,8 +2770,24 @@ impl StorageBackend for SqliteStorage {
                                             now_sec,
                                         )?;
                                         alert_jobs.extend(jobs);
+                                        fatal_alert_checked = true;
                                     }
                                 }
+                            }
+                            if !fatal_alert_checked && l.level == LogLevel::Fatal {
+                                let jobs = build_alert_jobs_for_event(
+                                    &tx,
+                                    organization_id,
+                                    project_id,
+                                    &project_slug,
+                                    "LOG",
+                                    &l.body,
+                                    "fatal",
+                                    false,
+                                    false,
+                                    now_sec,
+                                )?;
+                                alert_jobs.extend(jobs);
                             }
                         }
                     }
@@ -2856,35 +2894,48 @@ impl StorageBackend for SqliteStorage {
                 params![now - 86_400_000],
             )
             .map_err(map_sqlite_err)?;
-            tx.execute(
-                "DELETE FROM issue_events WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .map_err(map_sqlite_err)?;
-            tx.execute(
-                "DELETE FROM log_events WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .map_err(map_sqlite_err)?;
-            tx.execute(
-                "DELETE FROM transaction_events WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .map_err(map_sqlite_err)?;
+            let mut purged_rows = 0usize;
+            purged_rows += tx
+                .execute(
+                    "DELETE FROM issue_events WHERE timestamp_ms < ?1",
+                    params![cutoff_ms],
+                )
+                .map_err(map_sqlite_err)?;
+            purged_rows += tx
+                .execute(
+                    "DELETE FROM log_events WHERE timestamp_ms < ?1",
+                    params![cutoff_ms],
+                )
+                .map_err(map_sqlite_err)?;
+            purged_rows += tx
+                .execute(
+                    "DELETE FROM transaction_events WHERE timestamp_ms < ?1",
+                    params![cutoff_ms],
+                )
+                .map_err(map_sqlite_err)?;
 
             // Circuit breaker: if DB exceeds max_db_mb, shed oldest 10% of logs & events
             let max_bytes = max_db_mb * 1024 * 1024;
-            if size_bytes > max_bytes {
-                tx.execute(
-                    "DELETE FROM log_events WHERE id IN (SELECT id FROM log_events ORDER BY id ASC LIMIT 5000)",
+            let over_budget = size_bytes > max_bytes;
+            if over_budget {
+                purged_rows += tx
+                    .execute(
+                        "DELETE FROM log_events WHERE id IN (SELECT id FROM log_events ORDER BY id ASC LIMIT 5000)",
+                        [],
+                    )
+                    .map_err(map_sqlite_err)?;
+                purged_rows += tx
+                    .execute(
+                        "DELETE FROM issue_events WHERE id IN (SELECT id FROM issue_events ORDER BY timestamp_ms ASC LIMIT 2000)",
+                        [],
+                    )
+                    .map_err(map_sqlite_err)?;
+            }
+            if purged_rows > 0 {
+                let _ = tx.execute(
+                    "DELETE FROM logs_fts WHERE log_id NOT IN (SELECT id FROM log_events)",
                     [],
-                )
-                .map_err(map_sqlite_err)?;
-                tx.execute(
-                    "DELETE FROM issue_events WHERE id IN (SELECT id FROM issue_events ORDER BY timestamp_ms ASC LIMIT 2000)",
-                    [],
-                )
-                .map_err(map_sqlite_err)?;
+                );
             }
 
             // Detect missed uptime heartbeats
@@ -2966,6 +3017,11 @@ impl StorageBackend for SqliteStorage {
             }
 
             tx.commit().map_err(map_sqlite_err)?;
+            if purged_rows > 0 || over_budget {
+                let _ = conn.execute_batch(
+                    "PRAGMA incremental_vacuum(256); PRAGMA wal_checkpoint(TRUNCATE);",
+                );
+            }
             let _ = conn.execute_batch("PRAGMA optimize;");
             trim_heap();
             Ok(alerts)
@@ -2975,7 +3031,9 @@ impl StorageBackend for SqliteStorage {
 
     async fn db_size_bytes(&self) -> u64 {
         let main = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        let wal = std::fs::metadata(self.path.with_extension("db-wal"))
+        let mut wal_os = self.path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal = std::fs::metadata(PathBuf::from(wal_os))
             .map(|m| m.len())
             .unwrap_or(0);
         main + wal

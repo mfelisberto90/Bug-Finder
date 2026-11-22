@@ -1,6 +1,7 @@
 use crate::domain::decompress::{decompress_bounded, DecompressError};
 use crate::domain::envelope::{
     extract_dsn_key, normalize_csp_report, parse_dsn_url, parse_envelope, EnvelopeItem,
+    ParsedEnvelope,
 };
 use crate::domain::fingerprint::{
     evaluate_inbound_filters, extract_issue_metadata, FilterDecision,
@@ -8,7 +9,7 @@ use crate::domain::fingerprint::{
 use crate::domain::models::{now_ms, LiveStreamEvent, LogLevel, NormalizedLog, ProjectAuthInfo};
 use crate::domain::otlp::decode_otlp_logs;
 use crate::domain::scrubber::Scrubber;
-use crate::domain::sourcemap::demangle_event_with_maps;
+use crate::domain::sourcemap::{demangle_event_with_maps, strip_url_basename};
 use crate::security::auth::sha256_hex;
 use crate::security::headers::ClientIp;
 use crate::security::ratelimit::sentry_rate_limit_header;
@@ -200,7 +201,7 @@ async fn maybe_demangle_event(state: &AppState, auth: &ProjectAuthInfo, ev: &mut
                         .or_else(|| fr.get("abs_path"))
                         .and_then(|v| v.as_str())
                     {
-                        let base = fname.rsplit('/').next().unwrap_or(fname).to_string();
+                        let base = strip_url_basename(fname).to_string();
                         let did = debug_id_map
                             .get(fname)
                             .or_else(|| debug_id_map.get(&base))
@@ -279,7 +280,7 @@ async fn process_single_event(
     scrubber.scrub_event_in_place(&mut ev);
 
     let meta = extract_issue_metadata(&ev);
-    if state.event_dedupe.check_and_mark(auth.project_id, &meta.event_id) {
+    if state.event_dedupe.contains(auth.project_id, &meta.event_id) {
         state
             .metrics
             .dropped_dedupe_total
@@ -321,6 +322,7 @@ async fn process_single_event(
         return Err(rate_limited_response(5, "error"));
     }
 
+    state.event_dedupe.mark(auth.project_id, &event_id);
     state
         .metrics
         .ingest_events_total
@@ -393,15 +395,12 @@ fn process_logs_batch(
     Ok(())
 }
 
-async fn handle_envelope_bytes(
+async fn handle_parsed_envelope(
     state: &AppState,
     auth: &ProjectAuthInfo,
     headers: &HeaderMap,
-    decompressed: &[u8],
+    parsed: ParsedEnvelope,
 ) -> Result<Value, Response> {
-    let parsed = parse_envelope(decompressed)
-        .map_err(|e| error_response(StatusCode::BAD_REQUEST, &e.0))?;
-
     let mut primary_event_id = parsed
         .header
         .event_id
@@ -409,6 +408,7 @@ async fn handle_envelope_bytes(
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
     let received_ms = now_ms();
+    let tx_scrubber = Scrubber::from_filters(&auth.filters);
     for item in parsed.items {
         match item {
             EnvelopeItem::Event(ev) => {
@@ -419,7 +419,8 @@ async fn handle_envelope_bytes(
             EnvelopeItem::Logs(logs) => {
                 process_logs_batch(state, auth, logs)?;
             }
-            EnvelopeItem::Transaction(tr) => {
+            EnvelopeItem::Transaction(mut tr) => {
+                tx_scrubber.scrub_log_in_place(&mut tr.name, &mut tr.spans);
                 if state
                     .batch_writer
                     .try_enqueue(IngestWriteItem::Transaction {
@@ -459,6 +460,17 @@ async fn handle_envelope_bytes(
     Ok(json!({ "id": primary_event_id }))
 }
 
+async fn handle_envelope_bytes(
+    state: &AppState,
+    auth: &ProjectAuthInfo,
+    headers: &HeaderMap,
+    decompressed: &[u8],
+) -> Result<Value, Response> {
+    let parsed = parse_envelope(decompressed)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, &e.0))?;
+    handle_parsed_envelope(state, auth, headers, parsed).await
+}
+
 pub async fn ingest_envelope(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i64>,
@@ -493,7 +505,8 @@ pub async fn ingest_envelope(
 }
 
 /// Anti-AdBlocker Sentry Tunnel endpoint: `POST /t/:slug`.
-/// Validates the envelope's `dsn` header against the project bound to `:slug`.
+/// Rate-limits and validates tunnel existence BEFORE decompression, parses envelope once,
+/// and validates the envelope's `dsn` header against the project bound to `:slug`.
 pub async fn ingest_tunnel(
     State(state): State<Arc<AppState>>,
     Path(tunnel_slug): Path<String>,
@@ -505,6 +518,25 @@ pub async fn ingest_tunnel(
         .get::<ClientIp>()
         .map(|c| c.0.to_string())
         .unwrap_or_else(|| "127.0.0.1".into());
+    let pre_dec = state.rate_limiter.check_and_record(
+        "tunnel_pre",
+        &format!("{tunnel_slug}:{client_ip}"),
+        600,
+        Duration::from_secs(60),
+    );
+    if !pre_dec.allowed {
+        state
+            .metrics
+            .dropped_rate_limit_total
+            .fetch_add(1, Ordering::Relaxed);
+        return rate_limited_response(pre_dec.retry_after_sec, "error");
+    }
+    match state.storage.tunnel_slug_exists(&tunnel_slug).await {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::UNAUTHORIZED, "Invalid tunnel"),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+
     let decompressed = match decompress_ingest_body(&state, &headers, &body) {
         Ok(b) => b,
         Err(r) => return r,
@@ -532,7 +564,7 @@ pub async fn ingest_tunnel(
     if let Err(r) = check_ingest_rate_limit(&state, &auth, &client_ip, "error") {
         return r;
     }
-    match handle_envelope_bytes(&state, &auth, &headers, &decompressed).await {
+    match handle_parsed_envelope(&state, &auth, &headers, parsed).await {
         Ok(resp) => {
             let mut r = (StatusCode::OK, Json(resp)).into_response();
             attach_ingest_cors(r.headers_mut());
@@ -734,6 +766,12 @@ pub async fn ingest_direct_logs(
     } else {
         vec![val]
     };
+    if items.len() > 500 {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Batch exceeds 500 log items per request",
+        );
+    }
     let mut normalized = Vec::with_capacity(items.len());
     for item in items {
         let level_s = item.get("level").and_then(|v| v.as_str()).unwrap_or("info");

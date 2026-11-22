@@ -154,6 +154,27 @@ impl EventDedupeCache {
         }
     }
 
+    /// Read-only check: returns `true` if this `(project_id, event_id)` was already seen within `ttl`.
+    pub fn contains(&self, project_id: i64, event_id: &str) -> bool {
+        let key = (project_id, event_id.to_string());
+        let now = Instant::now();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen_at) = guard.get_mut(&key) {
+            if now.duration_since(*seen_at) < self.ttl {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record `(project_id, event_id)` as ingested only after durable queue acceptance.
+    pub fn mark(&self, project_id: i64, event_id: &str) {
+        let key = (project_id, event_id.to_string());
+        let now = Instant::now();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(key, now);
+    }
+
     /// Returns `true` if this `(project_id, event_id)` was already seen within `ttl`.
     pub fn check_and_mark(&self, project_id: i64, event_id: &str) -> bool {
         let key = (project_id, event_id.to_string());
@@ -207,6 +228,10 @@ mod tests {
     #[test]
     fn event_id_dedupe_blocks_sdk_retries() {
         let dedupe = EventDedupeCache::new(64, Duration::from_secs(300));
+        assert!(!dedupe.contains(1, "evt_split"));
+        dedupe.mark(1, "evt_split");
+        assert!(dedupe.contains(1, "evt_split"));
+
         assert!(!dedupe.check_and_mark(1, "evt_abc"));
         assert!(dedupe.check_and_mark(1, "evt_abc"));
         assert!(!dedupe.check_and_mark(2, "evt_abc"));

@@ -71,16 +71,20 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub fn from_str_loose(raw: &str) -> Self {
+    pub fn try_from_str_strict(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "trace" => Self::Trace,
-            "debug" => Self::Debug,
-            "info" | "log" => Self::Info,
-            "warn" | "warning" => Self::Warn,
-            "error" | "err" => Self::Error,
-            "fatal" | "critical" | "crit" | "emerg" => Self::Fatal,
-            _ => Self::Info,
+            "trace" => Some(Self::Trace),
+            "debug" => Some(Self::Debug),
+            "info" | "log" => Some(Self::Info),
+            "warn" | "warning" => Some(Self::Warn),
+            "error" | "err" => Some(Self::Error),
+            "fatal" | "critical" | "crit" | "emerg" => Some(Self::Fatal),
+            _ => None,
         }
+    }
+
+    pub fn from_str_loose(raw: &str) -> Self {
+        Self::try_from_str_strict(raw).unwrap_or(Self::Info)
     }
 
     pub fn from_num(n: i32) -> Self {

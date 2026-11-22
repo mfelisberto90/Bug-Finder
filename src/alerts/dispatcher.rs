@@ -4,23 +4,34 @@ use crate::security::ssrf::validate_webhook_url;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
 type HmacSha256 = Hmac<Sha256>;
 
-static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 static WEBHOOK_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-fn http_agent() -> &'static ureq::Agent {
-    HTTP_AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
-            .redirects(0)
-            .build()
-    })
+struct PinnedResolver {
+    expected_plain: String,
+    expected_bracketed: String,
+    addrs: Vec<SocketAddr>,
+}
+
+impl ureq::Resolver for PinnedResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        if netloc.eq_ignore_ascii_case(&self.expected_plain)
+            || netloc.eq_ignore_ascii_case(&self.expected_bracketed)
+        {
+            Ok(self.addrs.clone())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Blocked unpinned webhook host resolution",
+            ))
+        }
+    }
 }
 
 fn webhook_semaphore() -> Arc<Semaphore> {
@@ -89,20 +100,33 @@ pub async fn dispatch_alert(config: Arc<AppConfig>, job: AlertDispatchJob) -> Re
             .map_err(|e| format!("SMTP join error: {e}"))?;
     }
 
-    let target = validate_webhook_url(&job.target_url, config.dev_allow_http_webhooks)
-        .map_err(|e| format!("SSRF blocked webhook: {e}"))?;
-
     let permit = webhook_semaphore()
         .acquire_owned()
         .await
         .map_err(|e| format!("webhook semaphore: {e}"))?;
 
+    let allow_http_dev = config.dev_allow_http_webhooks;
     tokio::task::spawn_blocking(move || {
         let _guard = permit;
+        let target = validate_webhook_url(&job.target_url, allow_http_dev)
+            .map_err(|e| format!("SSRF blocked webhook: {e}"))?;
+
+        let pinned = PinnedResolver {
+            expected_plain: format!("{}:{}", target.host, target.port),
+            expected_bracketed: format!("[{}]:{}", target.host, target.port),
+            addrs: target.resolved_addrs,
+        };
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .redirects(0)
+            .resolver(pinned)
+            .build();
+
         let payload = format_alert_payload(&job);
         let body_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
         let ts = chrono::Utc::now().timestamp();
-        let mut req = http_agent()
+        let mut req = agent
             .post(&target.url)
             .set("Content-Type", "application/json")
             .set("User-Agent", "BugFinder-Alerts/1.0");

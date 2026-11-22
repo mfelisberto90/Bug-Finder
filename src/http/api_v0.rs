@@ -354,6 +354,11 @@ fn parse_issue_query(q: &HashMap<String, String>) -> IssueQueryParams {
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(50)
         .clamp(1, 200);
+    let offset = q
+        .get("offset")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, 100_000);
 
     IssueQueryParams {
         status,
@@ -365,6 +370,7 @@ fn parse_issue_query(q: &HashMap<String, String>) -> IssueQueryParams {
         sort,
         since_ms,
         limit,
+        offset,
     }
 }
 
@@ -786,6 +792,15 @@ pub async fn upload_sourcemap(
     if !ctx.role.can_mutate_issues() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
+    let project_exists = state
+        .storage
+        .list_projects(&ctx)
+        .await
+        .map(|ps| ps.iter().any(|p| p.slug == proj))
+        .unwrap_or(false);
+    if !project_exists {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Project not found" }))).into_response();
+    }
     if body.len() > 10 * 1024 * 1024 {
         return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({ "error": "Source map exceeds 10 MiB" }))).into_response();
     }
@@ -957,6 +972,13 @@ pub async fn post_heartbeat_check(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if !ctx.role.can_mutate_issues() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Viewers cannot record heartbeats" })),
+        )
+            .into_response();
+    }
     match state.storage.record_heartbeat(&ctx, &uuid, true, "OK").await {
         Ok(Some(m)) => Json(m).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Monitor not found" }))).into_response(),
@@ -1025,9 +1047,28 @@ pub async fn create_alert(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid channel_type" }))).into_response();
     }
     let target_url = req.target_url.unwrap_or_default();
-    if req.channel_type != "email" {
-        if let Err(e) = validate_webhook_url(&target_url, state.config.dev_allow_http_webhooks) {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.0 }))).into_response();
+    let email_to = req.email_to.unwrap_or_default().trim().to_string();
+    if req.channel_type == "email" {
+        if email_to.is_empty()
+            || !email_to.contains('@')
+            || email_to.len() > 254
+            || email_to.contains(['\r', '\n', '<', '>'])
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Valid email_to address is required for email alerts" })),
+            )
+                .into_response();
+        }
+    } else {
+        let target_copy = target_url.clone();
+        let allow_http = state.config.dev_allow_http_webhooks;
+        let check_res = tokio::task::spawn_blocking(move || validate_webhook_url(&target_copy, allow_http))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.0));
+        if let Err(msg) = check_res {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
         }
     }
 
@@ -1041,7 +1082,7 @@ pub async fn create_alert(
         channel_type: req.channel_type,
         target_url,
         webhook_secret: req.webhook_secret.unwrap_or_default(),
-        email_to: req.email_to.unwrap_or_default(),
+        email_to,
     };
     match state.storage.create_alert_rule(&ctx, &rule).await {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
@@ -1082,8 +1123,8 @@ pub async fn test_alert(
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
-    let rule = match state.storage.get_alert_rule(&ctx, rule_id).await {
-        Ok(Some(r)) => r,
+    let (rule, webhook_secret) = match state.storage.get_alert_rule_for_dispatch(&ctx, rule_id).await {
+        Ok(Some(pair)) => pair,
         Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Rule not found" }))).into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     };
@@ -1092,7 +1133,7 @@ pub async fn test_alert(
         rule_name: rule.name,
         channel_type: rule.channel_type,
         target_url: rule.target_url,
-        webhook_secret: String::new(),
+        webhook_secret,
         email_to: rule.email_to,
         title: "Test alert from Bug-Finder".into(),
         message: "Verification test payload".into(),
@@ -1157,7 +1198,7 @@ pub async fn create_api_token(
     };
 
     let (plaintext, prefix, sha) = generate_api_token();
-    let (status_code, body_str) = match state
+    let (status_code, body_str, replay_safe_str) = match state
         .storage
         .create_api_token(&ctx, req.name.trim(), &sha, &prefix, requested_role)
         .await
@@ -1165,16 +1206,17 @@ pub async fn create_api_token(
         Ok(dto) => (
             StatusCode::CREATED,
             serde_json::to_string(&json!({ "token": plaintext, "meta": dto })).unwrap(),
+            serde_json::to_string(&json!({ "token": "[REDACTED_ON_REPLAY]", "meta": dto, "replayed": true })).unwrap(),
         ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            serde_json::to_string(&json!({ "error": e })).unwrap(),
-        ),
+        Err(e) => {
+            let err_s = serde_json::to_string(&json!({ "error": e })).unwrap();
+            (StatusCode::BAD_REQUEST, err_s.clone(), err_s)
+        }
     };
     if let Some((k, _)) = idem {
         let _ = state
             .storage
-            .finish_idempotency(&ctx, "create_api_token", &k, status_code.as_u16(), &body_str)
+            .finish_idempotency(&ctx, "create_api_token", &k, status_code.as_u16(), &replay_safe_str)
             .await;
     }
     (

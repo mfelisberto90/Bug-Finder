@@ -356,6 +356,7 @@ CREATE POLICY org_tenant_isolation ON organizations
             )
         )
         OR NULLIF(current_setting('app.setup_bootstrap', true), '') = '1'
+        OR NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
     )
     WITH CHECK (
         id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
@@ -431,7 +432,13 @@ ALTER TABLE session_lookup ENABLE ROW LEVEL SECURITY;
 ALTER TABLE session_lookup FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS cap_session ON session_lookup;
 CREATE POLICY cap_session ON session_lookup
-    USING (token_sha256 = NULLIF(current_setting('app.session_sha256', true), ''))
+    USING (
+        token_sha256 = NULLIF(current_setting('app.session_sha256', true), '')
+        OR (
+            NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
+            AND expires_at <= EXTRACT(EPOCH FROM NOW())::bigint
+        )
+    )
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
 
 ALTER TABLE tunnel_lookup ENABLE ROW LEVEL SECURITY;

@@ -585,7 +585,156 @@ async fn postgres_rls_live_isolation_test() {
 
     // Capability-GUC DSN resolution works without BYPASSRLS
     let resolved = app_backend.resolve_dsn(proj1.id, &dsn1_sha).await.unwrap();
-    assert!(resolved.is_some());
+    let proj_auth = resolved.expect("resolve_dsn should return ProjectAuthInfo");
+
+    // Health check & tunnel slug lookup under NOBYPASSRLS
+    let health = app_backend.check_health().await.unwrap();
+    assert!(health.ok && health.engine == "postgres");
+    let slug = app_backend
+        .enable_project_tunnel(&ctx1, "proj1", "tun-org1-pg")
+        .await
+        .unwrap();
+    assert_eq!(slug.as_deref(), Some("tun-org1-pg"));
+    assert!(app_backend.tunnel_slug_exists("tun-org1-pg").await.unwrap());
+    assert!(!app_backend.tunnel_slug_exists("missing-tun").await.unwrap());
+
+    // Alert rule creation + dispatch secret lookup + flush_ingest_batch triggering alert job
+    let pg_webhook_secret = "pg_test_hmac_secret_000"; // gitleaks:allow
+    let new_rule = app_backend
+        .create_alert_rule(
+            &ctx1,
+            &bugfinder::storage::NewAlertRule {
+                project_id: proj1.id,
+                name: "PG New Issue Webhook".into(),
+                trigger_type: "new_issue".into(),
+                threshold_count: 1,
+                window_sec: 60,
+                cooldown_sec: 60,
+                channel_type: "webhook".into(),
+                target_url: "https://alerts.example.com/pg-hook".into(),
+                webhook_secret: pg_webhook_secret.into(),
+                email_to: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let (_, fetched_secret) = app_backend
+        .get_alert_rule_for_dispatch(&ctx1, new_rule.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched_secret, pg_webhook_secret);
+
+    let ev_jobs = app_backend
+        .flush_ingest_batch(vec![bugfinder::storage::IngestWriteItem::Event {
+            auth: proj_auth,
+            meta: bugfinder::domain::fingerprint::ComputedIssueMetadata {
+                event_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                fingerprint: "pg-fp-1".into(),
+                title: "PG ParityPanic".into(),
+                culprit: "pg::worker".into(),
+                level: "error".into(),
+                issue_type: bugfinder::domain::models::IssueType::Error,
+                environment: "production".into(),
+                release: Some("1.0.0".into()),
+                trace_id: None,
+                span_id: None,
+                user_hash: None,
+                tags: serde_json::json!({}),
+                search_text: "PG ParityPanic".into(),
+            },
+            payload_json: br#"{"event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_vec(),
+            received_ms: bugfinder::domain::models::now_ms(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(ev_jobs.len(), 1);
+    assert_eq!(ev_jobs[0].webhook_secret, pg_webhook_secret);
+    assert_eq!(ev_jobs[0].project_slug, "proj1");
+
+    // Overdue uptime monitor + expired session maintenance under NOBYPASSRLS + FORCE RLS
+    app_backend
+        .create_monitor(&ctx1, proj1.id, "PG Overdue Cron", "pg-mon-uuid", 10)
+        .await
+        .unwrap();
+    app_backend
+        .record_heartbeat(&ctx1, "pg-mon-uuid", true, "initial up")
+        .await
+        .unwrap();
+    app_backend
+        .create_alert_rule(
+            &ctx1,
+            &bugfinder::storage::NewAlertRule {
+                project_id: proj1.id,
+                name: "PG Uptime Down".into(),
+                trigger_type: "uptime_down".into(),
+                threshold_count: 1,
+                window_sec: 60,
+                cooldown_sec: 60,
+                channel_type: "webhook".into(),
+                target_url: "https://alerts.example.com/pg-down".into(),
+                webhook_secret: String::new(),
+                email_to: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let expired_sha = sha256_hex(b"expired_pg_session_tok");
+    let mut mtx = app_pg.pool().begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+        .bind(org1.id.to_string())
+        .execute(&mut *mtx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE uptime_monitors SET last_heartbeat_at = 1 WHERE uuid = 'pg-mon-uuid'")
+        .execute(&mut *mtx)
+        .await
+        .unwrap();
+    let owner_uid: i64 = sqlx::query_scalar(
+        "SELECT user_id FROM organization_members WHERE organization_id = $1 LIMIT 1",
+    )
+    .bind(org1.id)
+    .fetch_one(&mut *mtx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, expires_at, created_at)
+         VALUES ($1, $2, $3, 'csrf_expired', 1, 1)",
+    )
+    .bind(&expired_sha)
+    .bind(owner_uid)
+    .bind(org1.id)
+    .execute(&mut *mtx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO session_lookup (token_sha256, organization_id, organization_slug, user_id, role, csrf_token, expires_at)
+         VALUES ($1, $2, $3, $4, 'owner', 'csrf_expired', 1)",
+    )
+    .bind(&expired_sha)
+    .bind(org1.id)
+    .bind(&ctx1.organization_slug)
+    .bind(owner_uid)
+    .execute(&mut *mtx)
+    .await
+    .unwrap();
+    mtx.commit().await.unwrap();
+
+    assert!(
+        app_backend.resolve_session(&expired_sha, 0).await.unwrap().is_some(),
+        "Pre-maintenance expired row should still exist in session_lookup"
+    );
+
+    let maint_jobs = app_backend.run_maintenance(30, 512).await.unwrap();
+    assert!(
+        maint_jobs.iter().any(|j| j.title.contains("PG Overdue Cron")),
+        "PG run_maintenance must emit uptime_down alert job, got {maint_jobs:?}"
+    );
+    assert!(
+        app_backend.resolve_session(&expired_sha, 0).await.unwrap().is_none(),
+        "Expired session must be deleted from sessions/session_lookup by run_maintenance"
+    );
 }
 
 #[tokio::test]
@@ -705,4 +854,314 @@ async fn self_check_monitor_probe_client_error_and_doctor_flow() {
     // 7. Doctor CLI check on the initialized data_dir exits 0 cleanly
     let doctor_code = bugfinder::selfcheck::run_doctor_cli(&state.config, None, true).await;
     assert_eq!(doctor_code, 0);
+}
+
+#[tokio::test]
+async fn audit_security_and_stability_fixes_test() {
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+    ];
+
+    // 1. POST /api/auth/setup when already initialized -> 409 Conflict immediately
+    let (dup_setup_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/setup",
+        &[],
+        json!({
+            "org_name": "Org Beta",
+            "org_slug": "beta",
+            "email": "b@beta.test",
+            "name": "Bob",
+            "password": "StrongPassword123!",
+            "project_name": "B"
+        }),
+    )
+    .await;
+    assert_eq!(dup_setup_st, StatusCode::CONFLICT);
+
+    // 2. Invite viewer, verify logout CSRF (403 without header, 200 with CSRF), and Viewer RBAC on heartbeat_check (403)
+    let (inv_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/members/",
+        &owner_hdrs,
+        json!({
+            "email": "viewer@alpha.test",
+            "name": "Viewer",
+            "password": "StrongPassword123!",
+            "role": "viewer"
+        }),
+    )
+    .await;
+    assert_eq!(inv_st, StatusCode::CREATED);
+
+    let (mon_st, _, mon_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/monitors/",
+        &owner_hdrs,
+        json!({ "project_id": project_id, "name": "Cron", "expected_interval_sec": 60 }),
+    )
+    .await;
+    assert_eq!(mon_st, StatusCode::CREATED);
+    let mon_uuid = mon_body["uuid"].as_str().unwrap();
+
+    let (viewer_cookie, viewer_csrf) =
+        login_cookie_and_csrf(&router, "viewer@alpha.test", "StrongPassword123!").await;
+    let (hb_deny_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/0/organizations/alpha/heartbeat_check/{mon_uuid}/"),
+        &[
+            (header::COOKIE.as_str(), viewer_cookie.as_str()),
+            ("x-csrf-token", viewer_csrf.as_str()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(hb_deny_st, StatusCode::FORBIDDEN);
+
+    let (logout_no_csrf, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/logout",
+        &[(header::COOKIE.as_str(), viewer_cookie.as_str())],
+        json!({}),
+    )
+    .await;
+    assert_eq!(logout_no_csrf, StatusCode::FORBIDDEN);
+
+    let (logout_ok, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/logout",
+        &[
+            (header::COOKIE.as_str(), viewer_cookie.as_str()),
+            ("x-csrf-token", viewer_csrf.as_str()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(logout_ok, StatusCode::OK);
+
+    // 3. API token idempotency replay redacts plaintext token
+    let (tk1_st, _, tk1_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+            ("idempotency-key", "audit-redact-1"),
+        ],
+        json!({ "name": "Redact Token", "role": "admin" }),
+    )
+    .await;
+    assert_eq!(tk1_st, StatusCode::CREATED);
+    assert!(tk1_body["token"].as_str().unwrap().starts_with("bf_"));
+
+    let (tk2_st, tk2_hdrs, tk2_body) = send_json(
+        &router,
+        "POST",
+        "/api/0/api-tokens/",
+        &[
+            (header::COOKIE.as_str(), owner_cookie.as_str()),
+            ("x-csrf-token", owner_csrf.as_str()),
+            ("idempotency-key", "audit-redact-1"),
+        ],
+        json!({ "name": "Redact Token", "role": "admin" }),
+    )
+    .await;
+    assert_eq!(tk2_st, StatusCode::CREATED);
+    assert_eq!(tk2_hdrs.get("x-idempotent-replay").unwrap(), "true");
+    assert_eq!(tk2_body["token"], "[REDACTED_ON_REPLAY]");
+
+    // 4. Upload sourcemap to nonexistent project -> 404 & zero files written to sourcemaps_dir
+    let (sm_404, _, _) = send_raw(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/does-not-exist/releases/1.0.0/sourcemaps/?filename=ghost.js.map",
+        &owner_hdrs,
+        br#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(sm_404, StatusCode::NOT_FOUND);
+    let sm_files = std::fs::read_dir(state.config.sourcemaps_dir())
+        .map(|it| it.count())
+        .unwrap_or(0);
+    assert_eq!(sm_files, 0, "Orphan sourcemap blob must not be written for nonexistent project");
+
+    // 5. Unknown tunnel slug -> 401 BEFORE gzip decompression (invalid gzip would be 400 if decompressed); >500 items direct log batch -> 413
+    let (tun_unauth, _, _) = send_raw(
+        &router,
+        "POST",
+        "/t/nonexistent-slug",
+        &[("content-encoding", "gzip")],
+        b"not-valid-gzip".to_vec(),
+    )
+    .await;
+    assert_eq!(tun_unauth, StatusCode::UNAUTHORIZED);
+
+    let sentry_auth = format!("Sentry sentry_version=7, sentry_key={dsn_key}");
+    let too_many_logs: Vec<Value> = (0..501)
+        .map(|i| json!({ "level": "info", "message": format!("line {i}") }))
+        .collect();
+    let (logs_413, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/v1/logs?project_id={project_id}"),
+        &[("x-sentry-auth", &sentry_auth)],
+        json!(too_many_logs),
+    )
+    .await;
+    assert_eq!(logs_413, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 6. Upload real sourcemap, ingest event with ?v=99#top filename + scrubbed transaction + 2 distinct issues + aged FTS log
+    let sm_bytes = br#"{
+        "version": 3,
+        "sources": ["src/checkout.ts"],
+        "names": ["submitOrder"],
+        "sourcesContent": ["export function submitOrder() {\n  throw new Error('boom');\n}\n"],
+        "mappings": "AAAA"
+    }"#
+    .to_vec();
+    let (sm_ok, _, _) = send_raw(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/rolelane/releases/2.0.0/sourcemaps/?filename=bundle.min.js.map",
+        &owner_hdrs,
+        sm_bytes,
+    )
+    .await;
+    assert_eq!(sm_ok, StatusCode::CREATED);
+
+    let trace_id = "abcdef1234567890abcdef1234567890";
+    let tx_secret = "Bearer tx_secret_token_999900"; // gitleaks:allow
+    let env_payload = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        json!({ "event_id": "22222222222222222222222222222222" }),
+        json!({ "type": "event" }),
+        json!({
+            "event_id": "22222222222222222222222222222222",
+            "platform": "javascript",
+            "level": "error",
+            "release": "2.0.0",
+            "exception": { "values": [{ "type": "FirstErr", "value": "One", "stacktrace": { "frames": [{ "filename": "https://cdn.example.com/assets/bundle.min.js?v=99#top", "lineno": 1, "colno": 0, "in_app": true }] } }] }
+        }),
+        json!({ "type": "event" }),
+        json!({
+            "event_id": "33333333333333333333333333333333",
+            "platform": "javascript",
+            "level": "error",
+            "exception": { "values": [{ "type": "SecondErr", "value": "Two" }] }
+        }),
+        json!({ "type": "transaction" }),
+        json!({
+            "transaction": format!("GET /secret {tx_secret}"),
+            "start_timestamp": 1700000000.0,
+            "timestamp": 1700000000.2,
+            "contexts": { "trace": { "trace_id": trace_id, "span_id": "1122334455667788", "op": "http" } },
+            "spans": [{ "description": format!("Auth {tx_secret}") }]
+        }),
+        json!({ "type": "log" }),
+        json!({
+            "version": 2,
+            "items": [{
+                "timestamp": 1700000000.0,
+                "level": "info",
+                "body": "ephemeralftsmarker log entry to purge",
+                "trace_id": trace_id
+            }]
+        })
+    );
+    let (env_ok, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/"),
+        &[("x-sentry-auth", &sentry_auth)],
+        env_payload.into_bytes(),
+    )
+    .await;
+    assert_eq!(env_ok, StatusCode::OK);
+    state.batch_writer.flush_now().await;
+
+    // 7. Pagination offset on issues + sourcemap demangling on ?v=99#top + scrubbed transaction trace
+    let (p1_st, p1_hdrs, p1_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?limit=1&offset=0&sort=date",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(p1_st, StatusCode::OK);
+    assert_eq!(p1_hdrs.get("x-hits").unwrap(), "2");
+    let first_id = p1_body[0]["id"].as_i64().unwrap();
+
+    let (p2_st, _, p2_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/?limit=1&offset=1&sort=date",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(p2_st, StatusCode::OK);
+    assert_eq!(p2_body.as_array().unwrap().len(), 1);
+    let second_id = p2_body[0]["id"].as_i64().unwrap();
+    assert_ne!(first_id, second_id);
+
+    // Check whichever issue corresponds to FirstErr has source_mapped = true
+    let first_err_id = p1_body
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(p2_body.as_array().unwrap().iter())
+        .find(|i| i["title"].as_str().unwrap_or("").contains("FirstErr"))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (ev_st, _, ev_body) = send_json(
+        &router,
+        "GET",
+        &format!("/api/0/organizations/alpha/issues/{first_err_id}/events/latest/"),
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ev_st, StatusCode::OK);
+    let frame0 = &ev_body["payload"]["exception"]["values"][0]["stacktrace"]["frames"][0];
+    assert_eq!(frame0["source_mapped"], true);
+    assert_eq!(frame0["filename"], "src/checkout.ts");
+
+    let (tr_st, _, tr_body) = send_json(
+        &router,
+        "GET",
+        &format!("/api/0/organizations/alpha/traces/{trace_id}/"),
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(tr_st, StatusCode::OK);
+    let tr_str = tr_body.to_string();
+    assert!(!tr_str.contains("tx_secret_token_999900"));
+    assert!(tr_str.contains("[Filtered]"));
+
+    // 8. run_maintenance purges old logs and cleans logs_fts so FTS search returns empty
+    state.storage.run_maintenance(1, 512).await.unwrap();
+    let (fts_st, _, fts_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/logs/?query=ephemeralftsmarker",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(fts_st, StatusCode::OK);
+    assert!(fts_body.as_array().unwrap().is_empty());
 }
