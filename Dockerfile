@@ -5,7 +5,7 @@ RUN npm ci --no-audit --no-fund
 COPY ui/ ./
 RUN npm run build
 
-FROM rust:1.85-bookworm AS rust-builder
+FROM rust:1.89-bookworm AS rust-builder
 WORKDIR /build
 RUN cargo install cargo-auditable --locked || true
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -13,9 +13,9 @@ COPY migrations ./migrations
 COPY sdks ./sdks
 COPY src ./src
 COPY --from=ui-builder /build/ui/dist ./ui/dist
-RUN RUSTFLAGS="-C force-unwind-tables=no -C link-arg=-Wl,-z,pack-relative-relocs -C link-arg=-Wl,--as-needed --remap-path-prefix=/build=/src" \
+RUN RUSTFLAGS="-C force-unwind-tables=no -C link-arg=-Wl,-z,pack-relative-relocs -C link-arg=-Wl,--as-needed --remap-path-prefix=/build=. --remap-path-prefix=/usr/local/cargo=cargo" \
     cargo auditable build --release --locked || \
-    RUSTFLAGS="-C force-unwind-tables=no -C link-arg=-Wl,-z,pack-relative-relocs -C link-arg=-Wl,--as-needed --remap-path-prefix=/build=/src" \
+    RUSTFLAGS="-C force-unwind-tables=no -C link-arg=-Wl,-z,pack-relative-relocs -C link-arg=-Wl,--as-needed --remap-path-prefix=/build=. --remap-path-prefix=/usr/local/cargo=cargo" \
     cargo build --release --locked
 
 FROM debian:bookworm-slim

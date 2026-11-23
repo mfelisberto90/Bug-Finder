@@ -2,9 +2,12 @@
 name = "bugfinder"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Ultra-lightweight Rust error tracking, structured logs, OTLP, uptime monitoring & Anti-REA security shield (<15 MB VmRSS)"
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/mfelisberto90/Bug-Finder"
+homepage = "https://github.com/mfelisberto90/Bug-Finder"
 keywords = ["error-tracking", "sentry", "observability", "opentelemetry", "security"]
 categories = ["web-programming::http-server", "development-tools::debugging"]
 

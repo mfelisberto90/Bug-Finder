@@ -95,7 +95,13 @@ async fn send_raw(
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let raw = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let raw = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, headers, raw)
 }
 
@@ -129,7 +135,8 @@ async fn login_cookie_and_csrf(
 #[tokio::test]
 async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
-    let (cookie, csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let (cookie, csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
 
     // 1. Upload JS SourceMap v3 for release 1.2.0
     let sm_bytes = br#"{
@@ -194,7 +201,8 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gz.write_all(env_body.as_bytes()).unwrap();
     let gz_bytes = gz.finish().unwrap();
-    let sentry_auth = format!("Sentry sentry_version=7, sentry_client=sentry.js/11.16.0, sentry_key={dsn_key}");
+    let sentry_auth =
+        format!("Sentry sentry_version=7, sentry_client=sentry.js/11.16.0, sentry_key={dsn_key}");
 
     let (ing_st, _, ing_raw) = send_raw(
         &router,
@@ -209,7 +217,12 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
         gz_bytes,
     )
     .await;
-    assert_eq!(ing_st, StatusCode::OK, "envelope ingest failed: {}", String::from_utf8_lossy(&ing_raw));
+    assert_eq!(
+        ing_st,
+        StatusCode::OK,
+        "envelope ingest failed: {}",
+        String::from_utf8_lossy(&ing_raw)
+    );
 
     // 3. Send GlitchTip `/store/` event + retry duplicate check
     let store_payload = json!({
@@ -275,8 +288,14 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     .await;
     assert_eq!(ev_st, StatusCode::OK);
     let ev_text = String::from_utf8(ev_raw).unwrap();
-    assert!(!ev_text.contains("4111-1111-1111-1111"), "Luhn card leaked: {ev_text}");
-    assert!(!ev_text.contains("supersecret"), "Query secret leaked: {ev_text}");
+    assert!(
+        !ev_text.contains("4111-1111-1111-1111"),
+        "Luhn card leaked: {ev_text}"
+    );
+    assert!(
+        !ev_text.contains("supersecret"),
+        "Query secret leaked: {ev_text}"
+    );
 
     // Verify trace correlation (transaction + error + 2 logs share trace_id)
     let (tr_st, _, tr_raw) = send_raw(
@@ -306,7 +325,12 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     .await;
     assert_eq!(sv2_st, StatusCode::OK);
     let sv2: Value = serde_json::from_slice(&sv2_raw).unwrap();
-    assert!(sv2["groups"][0]["totals"]["sum(quantity)"].as_i64().unwrap() >= 2);
+    assert!(
+        sv2["groups"][0]["totals"]["sum(quantity)"]
+            .as_i64()
+            .unwrap()
+            >= 2
+    );
 
     // Verify Anti-AdBlock Tunnel `/t/:slug`
     let (tun_st, _, tun_body) = send_json(
@@ -352,16 +376,27 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     )
     .await
     .unwrap();
-    assert!(mcp_res["content"][0]["text"].as_str().unwrap().contains("otlp-worker"));
+    assert!(mcp_res["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("otlp-worker"));
 }
 
 #[tokio::test]
 async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
     let (_dir, _state, router, dsn_key, project_id) = setup_test_app().await;
-    let (owner_cookie, owner_csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
 
     // 1. 401 Unauthenticated
-    let (unauth_st, _, _) = send_raw(&router, "GET", "/api/0/organizations/alpha/issues/", &[], Vec::new()).await;
+    let (unauth_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[],
+        Vec::new(),
+    )
+    .await;
     assert_eq!(unauth_st, StatusCode::UNAUTHORIZED);
 
     // 2. Invite Viewer & enforce 403 BFLA on mutations
@@ -369,7 +404,10 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
         &router,
         "POST",
         "/api/0/organizations/alpha/members/",
-        &[(header::COOKIE.as_str(), &owner_cookie), ("x-csrf-token", &owner_csrf)],
+        &[
+            (header::COOKIE.as_str(), &owner_cookie),
+            ("x-csrf-token", &owner_csrf),
+        ],
         json!({
             "email": "viewer@alpha.test",
             "name": "Bob Viewer",
@@ -379,13 +417,17 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
     )
     .await;
     assert_eq!(inv_st, StatusCode::CREATED);
-    let (v_cookie, v_csrf) = login_cookie_and_csrf(&router, "viewer@alpha.test", "BobPassPhrase!987").await;
+    let (v_cookie, v_csrf) =
+        login_cookie_and_csrf(&router, "viewer@alpha.test", "BobPassPhrase!987").await;
 
     let (bfla_st, _, _) = send_json(
         &router,
         "POST",
         "/api/0/organizations/alpha/projects/",
-        &[(header::COOKIE.as_str(), &v_cookie), ("x-csrf-token", &v_csrf)],
+        &[
+            (header::COOKIE.as_str(), &v_cookie),
+            ("x-csrf-token", &v_csrf),
+        ],
         json!({ "name": "Hacked" }),
     )
     .await;
@@ -456,7 +498,10 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
         &router,
         "POST",
         &format!("/api/{project_id}/envelope/"),
-        &[("content-encoding", "gzip"), ("x-sentry-auth", &sentry_auth)],
+        &[
+            ("content-encoding", "gzip"),
+            ("x-sentry-auth", &sentry_auth),
+        ],
         gz_bomb,
     )
     .await;
@@ -467,7 +512,10 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
         &router,
         "POST",
         "/api/0/organizations/alpha/alerts/",
-        &[(header::COOKIE.as_str(), &owner_cookie), ("x-csrf-token", &owner_csrf)],
+        &[
+            (header::COOKIE.as_str(), &owner_cookie),
+            ("x-csrf-token", &owner_csrf),
+        ],
         json!({
             "project_id": project_id,
             "name": "Metadata Exploit",
@@ -502,12 +550,17 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
     assert_eq!(locked_st, StatusCode::TOO_MANY_REQUESTS);
 
     // 8. A+ Security Headers + zero Set-Cookie on /robots.txt & /api/health
-    let (rob_st, rob_hdrs, rob_raw) = send_raw(&router, "GET", "/robots.txt", &[], Vec::new()).await;
+    let (rob_st, rob_hdrs, rob_raw) =
+        send_raw(&router, "GET", "/robots.txt", &[], Vec::new()).await;
     assert_eq!(rob_st, StatusCode::OK);
     let rob_txt = String::from_utf8(rob_raw).unwrap();
     assert!(!rob_txt.contains("Disallow:"));
     assert!(rob_hdrs.get(header::SET_COOKIE).is_none());
-    let csp = rob_hdrs.get("content-security-policy").unwrap().to_str().unwrap();
+    let csp = rob_hdrs
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(!csp.contains("unsafe-inline"));
     assert!(csp.contains("nonce-"));
 }
@@ -515,19 +568,18 @@ async fn negative_security_suite_401_403_409_413_429_ssrf_csv_and_headers() {
 #[tokio::test]
 #[ignore = "Requires live PostgreSQL 17 container on BUGFINDER_TEST_PG_ADMIN_URL & BUGFINDER_TEST_PG_APP_URL"]
 async fn postgres_rls_live_isolation_test() {
-    let admin_url = std::env::var("BUGFINDER_TEST_PG_ADMIN_URL")
-        .expect("Set BUGFINDER_TEST_PG_ADMIN_URL");
-    let app_url = std::env::var("BUGFINDER_TEST_PG_APP_URL")
-        .expect("Set BUGFINDER_TEST_PG_APP_URL");
+    let admin_url =
+        std::env::var("BUGFINDER_TEST_PG_ADMIN_URL").expect("Set BUGFINDER_TEST_PG_ADMIN_URL");
+    let app_url =
+        std::env::var("BUGFINDER_TEST_PG_APP_URL").expect("Set BUGFINDER_TEST_PG_APP_URL");
 
     // 1. Run DDL migrations as migrator/superuser
     let admin_pg = PostgresStorage::connect(&admin_url, true).await.unwrap();
-    let bypass: bool = sqlx::query_scalar(
-        "SELECT rolbypassrls FROM pg_roles WHERE rolname = 'bugfinder_app'",
-    )
-    .fetch_one(admin_pg.pool())
-    .await
-    .unwrap();
+    let bypass: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'bugfinder_app'")
+            .fetch_one(admin_pg.pool())
+            .await
+            .unwrap();
     assert!(!bypass, "bugfinder_app MUST NOT have BYPASSRLS");
 
     // 2. Connect as runtime NOBYPASSRLS role (`bugfinder_app`)
@@ -537,7 +589,17 @@ async fn postgres_rls_live_isolation_test() {
     let pw = hash_password("PgPassword123!".into()).await.unwrap();
     let dsn1_sha = sha256_hex(b"key_org1");
     let (org1, proj1) = app_backend
-        .initial_setup("PG Org 1", "pg-org-1", "a@pg1.test", "A", &pw, "Proj1", "proj1", "key_org1", &dsn1_sha)
+        .initial_setup(&bugfinder::storage::InitialSetupInput {
+            org_name: "PG Org 1",
+            org_slug: "pg-org-1",
+            email: "a@pg1.test",
+            name: "A",
+            password_hash: &pw,
+            first_project_name: "Proj1",
+            first_project_slug: "proj1",
+            dsn_public_key: "key_org1",
+            dsn_key_sha256: &dsn1_sha,
+        })
         .await
         .unwrap();
 
@@ -632,8 +694,8 @@ async fn postgres_rls_live_isolation_test() {
 
     let ev_jobs = app_backend
         .flush_ingest_batch(vec![bugfinder::storage::IngestWriteItem::Event {
-            auth: proj_auth,
-            meta: bugfinder::domain::fingerprint::ComputedIssueMetadata {
+            auth: Box::new(proj_auth),
+            meta: Box::new(bugfinder::domain::fingerprint::ComputedIssueMetadata {
                 event_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 fingerprint: "pg-fp-1".into(),
                 title: "PG ParityPanic".into(),
@@ -647,7 +709,7 @@ async fn postgres_rls_live_isolation_test() {
                 user_hash: None,
                 tags: serde_json::json!({}),
                 search_text: "PG ParityPanic".into(),
-            },
+            }),
             payload_json: br#"{"event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.to_vec(),
             received_ms: bugfinder::domain::models::now_ms(),
         }])
@@ -727,7 +789,11 @@ async fn postgres_rls_live_isolation_test() {
     mtx.commit().await.unwrap();
 
     assert!(
-        app_backend.resolve_session(&expired_sha, 0, 86400).await.unwrap().is_some(),
+        app_backend
+            .resolve_session(&expired_sha, 0, 86400)
+            .await
+            .unwrap()
+            .is_some(),
         "Pre-maintenance expired row should still exist in session_lookup"
     );
 
@@ -757,20 +823,36 @@ async fn postgres_rls_live_isolation_test() {
         .fetch_one(app_pg.pool())
         .await
         .unwrap();
-    assert_eq!(sec_leak, 0, "FORCE RLS fail-closed failed on security_events");
+    assert_eq!(
+        sec_leak, 0,
+        "FORCE RLS fail-closed failed on security_events"
+    );
     let q_leak: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shield_quarantine")
         .fetch_one(app_pg.pool())
         .await
         .unwrap();
-    assert_eq!(q_leak, 0, "FORCE RLS fail-closed failed on shield_quarantine");
+    assert_eq!(
+        q_leak, 0,
+        "FORCE RLS fail-closed failed on shield_quarantine"
+    );
 
-    let (pg_evs, pg_sum) = app_backend.list_security_events(&ctx1, None, 20).await.unwrap();
+    let (pg_evs, pg_sum) = app_backend
+        .list_security_events(&ctx1, None, 20)
+        .await
+        .unwrap();
     assert_eq!(pg_evs.len(), 1);
     assert_eq!(pg_sum.active_quarantines, 1);
     let pg_qs = app_backend.list_quarantine(&ctx1, None).await.unwrap();
     assert_eq!(pg_qs.len(), 1);
-    assert!(app_backend.delete_quarantine(&ctx1, pg_qs[0].id).await.unwrap());
-    assert!(app_backend.list_quarantine(&ctx1, None).await.unwrap().is_empty());
+    assert!(app_backend
+        .delete_quarantine(&ctx1, pg_qs[0].id)
+        .await
+        .unwrap());
+    assert!(app_backend
+        .list_quarantine(&ctx1, None)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Insert an already-expired quarantine row to verify run_maintenance purges it cleanly
     let exp_sec = bugfinder::domain::models::NewSecurityEvent {
@@ -797,12 +879,18 @@ async fn postgres_rls_live_isolation_test() {
         .fetch_one(app_pg.pool())
         .await
         .unwrap();
-    assert_eq!(inv_leak, 0, "FORCE RLS fail-closed failed on org_invitations");
+    assert_eq!(
+        inv_leak, 0,
+        "FORCE RLS fail-closed failed on org_invitations"
+    );
     let invl_leak: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invitation_lookup")
         .fetch_one(app_pg.pool())
         .await
         .unwrap();
-    assert_eq!(invl_leak, 0, "FORCE RLS fail-closed failed on invitation_lookup");
+    assert_eq!(
+        invl_leak, 0,
+        "FORCE RLS fail-closed failed on invitation_lookup"
+    );
 
     let pg_inv_tok_sha = sha256_hex(b"pg-live-invite-token-72h");
     let now_s = chrono::Utc::now().timestamp();
@@ -826,11 +914,19 @@ async fn postgres_rls_live_isolation_test() {
     let pg_pw = bugfinder::security::auth::hash_password("PgInviteeStrongPass!22".into())
         .await
         .unwrap();
-    let (inv_uid, inv_oid, _, _, inv_role) = app_backend
-        .accept_invitation(&pg_inv_tok_sha, "PG Invitee", &pg_pw, now_s)
+    let outcome = app_backend
+        .accept_invitation(&pg_inv_tok_sha, "PG Invitee", &pg_pw, None, now_s)
         .await
-        .unwrap()
         .unwrap();
+    let (inv_uid, inv_oid, inv_role) = match outcome {
+        bugfinder::storage::AcceptInvitationOutcome::AcceptedNewUser {
+            user_id,
+            org_id,
+            role,
+            ..
+        } => (user_id, org_id, role),
+        other => panic!("Expected AcceptedNewUser, got {other:?}"),
+    };
     assert_eq!(inv_oid, org1.id);
     assert_eq!(inv_role, bugfinder::domain::models::UserRole::Member);
 
@@ -858,7 +954,11 @@ async fn postgres_rls_live_isolation_test() {
             .unwrap();
     }
     let pg_aud_ver = app_backend.verify_audit_chain(&ctx1).await.unwrap();
-    assert!(pg_aud_ver.valid, "PG JSONB audit chain failed: {:?}", pg_aud_ver);
+    assert!(
+        pg_aud_ver.valid,
+        "PG JSONB audit chain failed: {:?}",
+        pg_aud_ver
+    );
     assert!(pg_aud_ver.checked_entries >= 3);
 
     // AEAD check on alert_rules.webhook_secret inside raw PG row
@@ -874,12 +974,24 @@ async fn postgres_rls_live_isolation_test() {
         .await
         .unwrap();
     aead_tx.commit().await.unwrap();
-    assert!(raw_wh.starts_with("enc:v1:"), "PG webhook secret not AEAD sealed: {raw_wh}");
+    assert!(
+        raw_wh.starts_with("enc:v1:"),
+        "PG webhook secret not AEAD sealed: {raw_wh}"
+    );
 
     // Cascade revocation on remove_member under NOBYPASSRLS
     let inv_sess_sha = sha256_hex(b"pg_member_live_sess");
     app_backend
-        .create_session(&inv_sess_sha, inv_uid, org1.id, "csrf_m", "ua", "iph", now_s, now_s + 3600)
+        .create_session(&bugfinder::storage::NewSessionInput {
+            token_sha256: &inv_sess_sha,
+            user_id: inv_uid,
+            org_id: org1.id,
+            csrf_token: "csrf_m",
+            user_agent: "ua",
+            ip_hmac: "iph",
+            now_sec: now_s,
+            expires_at: now_s + 3600,
+        })
         .await
         .unwrap();
     let inv_tok_sha = sha256_hex(b"bf_pg_member_tok"); // gitleaks:allow
@@ -892,26 +1004,66 @@ async fn postgres_rls_live_isolation_test() {
         None,
     );
     app_backend
-        .create_api_token(&inv_ctx, "PG Mem Tok", &inv_tok_sha, "bf_pg_", bugfinder::domain::models::UserRole::Member, "event:read", Some(now_s + 3600))
+        .create_api_token(
+            &inv_ctx,
+            &bugfinder::storage::NewApiTokenInput {
+                name: "PG Mem Tok",
+                token_sha256: &inv_tok_sha,
+                token_prefix: "bf_pg_",
+                role: bugfinder::domain::models::UserRole::Member,
+                scopes: "event:read",
+                expires_at: Some(now_s + 3600),
+            },
+        )
         .await
         .unwrap();
-    assert!(app_backend.resolve_session(&inv_sess_sha, now_s, 3600).await.unwrap().is_some());
-    assert!(app_backend.resolve_api_token(&inv_tok_sha, None, now_s).await.unwrap().is_some());
-    assert!(app_backend.remove_member(&ctx1, inv_uid).await.unwrap().unwrap());
-    assert!(app_backend.resolve_session(&inv_sess_sha, now_s, 3600).await.unwrap().is_none());
-    assert!(app_backend.resolve_api_token(&inv_tok_sha, None, now_s).await.unwrap().is_none());
+    assert!(app_backend
+        .resolve_session(&inv_sess_sha, now_s, 3600)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(app_backend
+        .resolve_api_token(&inv_tok_sha, None, now_s)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(app_backend
+        .remove_member(&ctx1, inv_uid)
+        .await
+        .unwrap()
+        .unwrap());
+    assert!(app_backend
+        .resolve_session(&inv_sess_sha, now_s, 3600)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app_backend
+        .resolve_api_token(&inv_tok_sha, None, now_s)
+        .await
+        .unwrap()
+        .is_none());
 
     let maint_jobs = app_backend.run_maintenance(30, 512).await.unwrap();
     assert!(
-        maint_jobs.iter().any(|j| j.title.contains("PG Overdue Cron")),
+        maint_jobs
+            .iter()
+            .any(|j| j.title.contains("PG Overdue Cron")),
         "PG run_maintenance must emit uptime_down alert job, got {maint_jobs:?}"
     );
     assert!(
-        app_backend.resolve_session(&expired_sha, 0, 86400).await.unwrap().is_none(),
+        app_backend
+            .resolve_session(&expired_sha, 0, 86400)
+            .await
+            .unwrap()
+            .is_none(),
         "Expired session must be deleted from sessions/session_lookup by run_maintenance"
     );
     assert!(
-        app_backend.list_quarantine(&ctx1, None).await.unwrap().is_empty(),
+        app_backend
+            .list_quarantine(&ctx1, None)
+            .await
+            .unwrap()
+            .is_empty(),
         "Expired shield_quarantine row must be deleted by run_maintenance"
     );
 
@@ -946,7 +1098,9 @@ async fn postgres_rls_live_isolation_test() {
     assert!(tg_rule.has_secret);
 
     let rules_org1 = app_backend.list_alert_rules(&ctx1).await.unwrap();
-    assert!(rules_org1.iter().any(|r| r.id == tg_rule.id && r.channel_type == "telegram"));
+    assert!(rules_org1
+        .iter()
+        .any(|r| r.id == tg_rule.id && r.channel_type == "telegram"));
 
     let ctx2 = bugfinder::domain::models::TenantCtx::from_session(
         org2_id,
@@ -957,7 +1111,116 @@ async fn postgres_rls_live_isolation_test() {
         None,
     );
     let rules_org2 = app_backend.list_alert_rules(&ctx2).await.unwrap();
-    assert!(rules_org2.is_empty(), "Org2 MUST NOT see Org1 telegram alert rules under FORCE RLS");
+    assert!(
+        rules_org2.is_empty(),
+        "Org2 MUST NOT see Org1 telegram alert rules under FORCE RLS"
+    );
+
+    // 12. Strict security invariants on live PG17 (`check_health`, append-only audit_logs, MFA/WebAuthn FORCE RLS)
+    let admin_health = admin_pg.check_health().await.unwrap();
+    assert!(
+        !admin_health.wal_or_rls_verified,
+        "Superuser/BYPASSRLS role must FAIL runtime check_health() RLS verification"
+    );
+    let app_health = app_pg.check_health().await.unwrap();
+    assert!(
+        app_health.ok && app_health.wal_or_rls_verified,
+        "NOBYPASSRLS role check_health() must verify FORCE RLS: {app_health:?}"
+    );
+
+    // audit_logs REVOKE UPDATE/DELETE check under bugfinder_app
+    {
+        let mut atx = app_pg.pool().begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+            .bind(org1.id.to_string())
+            .execute(&mut *atx)
+            .await
+            .unwrap();
+        let upd_err =
+            sqlx::query("UPDATE audit_logs SET action = 'tampered' WHERE organization_id = $1")
+                .bind(org1.id)
+                .execute(&mut *atx)
+                .await;
+        assert!(
+            upd_err.is_err(),
+            "bugfinder_app must NOT be allowed to UPDATE audit_logs"
+        );
+        let _ = atx.rollback().await;
+
+        let mut dtx = app_pg.pool().begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+            .bind(org1.id.to_string())
+            .execute(&mut *dtx)
+            .await
+            .unwrap();
+        let del_err = sqlx::query("DELETE FROM audit_logs WHERE organization_id = $1")
+            .bind(org1.id)
+            .execute(&mut *dtx)
+            .await;
+        assert!(
+            del_err.is_err(),
+            "bugfinder_app must NOT be allowed to DELETE audit_logs"
+        );
+        let _ = dtx.rollback().await;
+    }
+
+    // Seed MFA & WebAuthn rows through storage methods, then assert 0 rows without GUCs & WITH CHECK enforcement
+    app_backend
+        .upsert_pending_totp(owner_uid, "enc:v1:pg_totp_test", now_s)
+        .await
+        .unwrap();
+    app_backend
+        .enable_totp_with_recovery_codes(owner_uid, &["hash_rc_1".to_string()], now_s)
+        .await
+        .unwrap();
+    app_backend
+        .create_mfa_challenge("pg_mfa_chal_sha", owner_uid, org1.id, "iph", now_s + 300)
+        .await
+        .unwrap();
+    app_backend
+        .save_webauthn_challenge("pg_pk_chal_b64", Some(owner_uid), "reg", now_s + 300)
+        .await
+        .unwrap();
+    let _pk = app_backend
+        .create_webauthn_credential(owner_uid, "PG Passkey", "pg_cred_id_b64", -7, "cHVia2V5", 0)
+        .await
+        .unwrap();
+
+    for tbl in [
+        "user_mfa",
+        "user_mfa_recovery_codes",
+        "mfa_challenges",
+        "webauthn_credentials",
+        "webauthn_challenges",
+    ] {
+        let q = format!("SELECT COUNT(*) FROM {tbl}");
+        let n: i64 = sqlx::query_scalar(&q)
+            .fetch_one(app_pg.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "FORCE RLS fail-closed failed on {tbl} without GUCs");
+    }
+
+    // Cross-user INSERT WITH CHECK violation on user_mfa under NOBYPASSRLS
+    {
+        let mut rls_tx = app_pg.pool().begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.current_user_id', '999999', true)")
+            .execute(&mut *rls_tx)
+            .await
+            .unwrap();
+        let cross_ins = sqlx::query(
+            "INSERT INTO user_mfa (user_id, totp_secret_enc, is_enabled, updated_at) VALUES ($1, 'evil', true, $2)",
+        )
+        .bind(owner_uid)
+        .bind(now_s)
+        .execute(&mut *rls_tx)
+        .await;
+        assert!(
+            cross_ins.is_err(),
+            "user_mfa WITH CHECK must reject mismatched app.current_user_id"
+        );
+        let _ = rls_tx.rollback().await;
+    }
 }
 
 #[tokio::test]
@@ -965,14 +1228,22 @@ async fn self_check_monitor_probe_client_error_and_doctor_flow() {
     let (_dir, state, router, _dsn_key, _project_id) = setup_test_app().await;
 
     // 1. Unauthenticated access to self-check must return 401
-    let (unauth_st, _, _) = send_json(&router, "GET", "/api/0/organizations/alpha/self-check/", &[], Value::Null).await;
+    let (unauth_st, _, _) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/self-check/",
+        &[],
+        Value::Null,
+    )
+    .await;
     assert_eq!(unauth_st, StatusCode::UNAUTHORIZED);
 
     // 2. Public /api/health returns 200 OK when SQLite storage is healthy
     let (h_st, _, _) = send_raw(&router, "GET", "/api/health", &[], Vec::new()).await;
     assert_eq!(h_st, StatusCode::OK);
 
-    let (cookie, csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let (cookie, csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
     let auth_hdrs = [
         (header::COOKIE.as_str(), cookie.as_str()),
         ("x-csrf-token", csrf.as_str()),
@@ -990,10 +1261,7 @@ async fn self_check_monitor_probe_client_error_and_doctor_flow() {
     assert_eq!(sc_st, StatusCode::OK);
     let checks = sc_body["checks"].as_array().unwrap();
     let find_status = |id: &str| {
-        checks
-            .iter()
-            .find(|c| c["id"] == id)
-            .unwrap()["status"]
+        checks.iter().find(|c| c["id"] == id).unwrap()["status"]
             .as_str()
             .unwrap()
             .to_string()
@@ -1217,7 +1485,10 @@ async fn audit_security_and_stability_fixes_test() {
     let sm_files = std::fs::read_dir(state.config.sourcemaps_dir())
         .map(|it| it.count())
         .unwrap_or(0);
-    assert_eq!(sm_files, 0, "Orphan sourcemap blob must not be written for nonexistent project");
+    assert_eq!(
+        sm_files, 0,
+        "Orphan sourcemap blob must not be written for nonexistent project"
+    );
 
     // 5. Unknown tunnel slug -> 401 BEFORE gzip decompression (invalid gzip would be 400 if decompressed); >500 items direct log batch -> 413
     let (tun_unauth, _, _) = send_raw(
@@ -1406,7 +1677,11 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     let (sdk_st, sdk_hdrs, sdk_raw) =
         send_raw(&router, "GET", "/sdk/bugfinder-shield.js", &[], Vec::new()).await;
     assert_eq!(sdk_st, StatusCode::OK);
-    let sdk_ct = sdk_hdrs.get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+    let sdk_ct = sdk_hdrs
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(sdk_ct.contains("javascript"));
     let sdk_txt = String::from_utf8(sdk_raw).unwrap();
     assert!(sdk_txt.contains("BugFinderShield"));
@@ -1491,7 +1766,7 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
         "POST",
         "/api/0/api-tokens/",
         &owner_hdrs,
-        json!({ "name": "Shield Middleware", "role": "member" }),
+        json!({ "name": "Shield Middleware", "role": "admin" }),
     )
     .await;
     assert_eq!(tk_st, StatusCode::CREATED);
@@ -1522,7 +1797,12 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     )
     .await;
     assert_eq!(bl_st, StatusCode::OK);
-    let etag = bl_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let etag = bl_hdrs
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let ip_key = bl_body["ip_hmac_key"].as_str().unwrap();
     let mut mac = Hmac::<Sha256>::new_from_slice(ip_key.as_bytes()).unwrap();
     mac.update(b"203.0.113.42");
@@ -1566,7 +1846,10 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
         &router,
         "DELETE",
         &format!("/api/0/organizations/alpha/shield/quarantine/{session_q_id}/"),
-        &[(header::COOKIE.as_str(), &v_cookie), ("x-csrf-token", &v_csrf)],
+        &[
+            (header::COOKIE.as_str(), &v_cookie),
+            ("x-csrf-token", &v_csrf),
+        ],
         Value::Null,
     )
     .await;
@@ -1668,9 +1951,10 @@ async fn anti_rea_shield_secret_radar_log_ids_and_false_positives_test() {
     assert_eq!(ev_fp_st, StatusCode::OK);
     let fp_events = ev_fp_body["events"].as_array().unwrap();
     assert!(
-        !fp_events
-            .iter()
-            .any(|e| matches!(e["category"].as_str(), Some("secret_leak" | "log_ids" | "csp"))),
+        !fp_events.iter().any(|e| matches!(
+            e["category"].as_str(),
+            Some("secret_leak" | "log_ids" | "csp")
+        )),
         "False positive fired on benign telemetry: {fp_events:?}"
     );
 
@@ -1899,7 +2183,9 @@ async fn security_rbac_scopes_revocation_and_session_only_test() {
         )
         .unwrap();
     }
-    state.api_token_cache.invalidate_org(proj_ctx.organization_id);
+    state
+        .api_token_cache
+        .invalidate_org(proj_ctx.organization_id);
     let (exp_st, _, _) = send_raw(
         &router,
         "GET",
@@ -2088,7 +2374,8 @@ async fn security_rbac_scopes_revocation_and_session_only_test() {
     // 6. Step-Up Re-Authentication check
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("UPDATE sessions SET reauth_at = 1", []).unwrap();
+        conn.execute("UPDATE sessions SET reauth_at = 1", [])
+            .unwrap();
     }
     let (su_fail, _, su_body) = send_json(
         &router,
@@ -2212,8 +2499,11 @@ async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
     let db_path = state.config.sqlite_path();
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("UPDATE user_mfa SET failed_attempts = 0, locked_until = NULL", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE user_mfa SET failed_attempts = 0, locked_until = NULL",
+            [],
+        )
+        .unwrap();
     }
     // Replay of SAME code used at confirm must fail 401
     let (rep_st, _, _) = send_json(
@@ -2235,7 +2525,8 @@ async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
         )
         .unwrap();
     }
-    let fresh_code = bugfinder::security::mfa::totp_code_at(&secret_bytes, chrono::Utc::now().timestamp());
+    let fresh_code =
+        bugfinder::security::mfa::totp_code_at(&secret_bytes, chrono::Utc::now().timestamp());
     let (ok_mfa, ok_hdrs, _) = send_json(
         &router,
         "POST",
@@ -2291,7 +2582,8 @@ async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
     // 5. Real ES256 WebAuthn Passkey registration + assertion + counter rollback rejection
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let kp =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let pub_uncompressed = kp.public_key().as_ref();
     let cred_id = b"integ-passkey-id-001";
 
@@ -2316,7 +2608,11 @@ async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
 
     // Build minimal CBOR attestationObject with authData (rpHash(32)|flags=0x41|signCount=0|aaguid(16)|len|credId|COSE_P256)
     fn enc_bytes(b: &[u8]) -> Vec<u8> {
-        let mut o = if b.len() < 24 { vec![0x40 | (b.len() as u8)] } else { vec![0x58, b.len() as u8] };
+        let mut o = if b.len() < 24 {
+            vec![0x40 | (b.len() as u8)]
+        } else {
+            vec![0x58, b.len() as u8]
+        };
         o.extend_from_slice(b);
         o
     }
@@ -2334,7 +2630,10 @@ async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
     reg_auth_data.extend_from_slice(cred_id);
     reg_auth_data.extend_from_slice(&cose);
 
-    let mut att_obj = vec![0xA2, 0x63, b'f', b'm', b't', 0x64, b'n', b'o', b'n', b'e', 0x68, b'a', b'u', b't', b'h', b'D', b'a', b't', b'a'];
+    let mut att_obj = vec![
+        0xA2, 0x63, b'f', b'm', b't', 0x64, b'n', b'o', b'n', b'e', 0x68, b'a', b'u', b't', b'h',
+        b'D', b'a', b't', b'a',
+    ];
     if reg_auth_data.len() < 256 {
         att_obj.push(0x58);
         att_obj.push(reg_auth_data.len() as u8);
@@ -2368,7 +2667,7 @@ async fn security_mfa_totp_recovery_lockout_and_webauthn_test() {
         .unwrap();
         let mut ad = Vec::new();
         ad.extend_from_slice(&Sha256::digest(b"127.0.0.1"));
-        ad.push(0x01);
+        ad.push(0x05);
         ad.extend_from_slice(&count.to_be_bytes());
         let mut msg = ad.clone();
         msg.extend_from_slice(&Sha256::digest(&cdj));
@@ -2497,7 +2796,14 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
     ];
 
     // 1. AEAD sealing verification in raw SQLite for both MFA TOTP secret and Webhook HMAC secret
-    let (_, _, _) = send_json(&router, "POST", "/api/auth/mfa/totp/enroll", &owner_hdrs, json!({})).await;
+    let (_, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/enroll",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
     let plain_wh = "whsec_raw_plaintext_test_only_12345"; // gitleaks:allow
     let (al_st, _, al_b) = send_json(
         &router,
@@ -2520,10 +2826,16 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let mfa_enc: String = conn
-            .query_row("SELECT totp_secret_enc FROM user_mfa LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT totp_secret_enc FROM user_mfa LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let wh_enc: String = conn
-            .query_row("SELECT webhook_secret FROM alert_rules WHERE name = 'AEAD Hook'", [], |r| r.get(0))
+            .query_row(
+                "SELECT webhook_secret FROM alert_rules WHERE name = 'AEAD Hook'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(mfa_enc.starts_with("enc:v1:"), "got {mfa_enc}");
         assert!(wh_enc.starts_with("enc:v1:"), "got {wh_enc}");
@@ -2638,7 +2950,9 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
         json!({ "event_id": "22222222222222222222222222222221", "message": "cors deny" }),
     )
     .await;
-    assert!(bad_cors_hdrs.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    assert!(bad_cors_hdrs
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
     assert_eq!(bad_cors_hdrs.get(header::VARY).unwrap(), "Origin");
 
     let (_, ok_cors_hdrs, _) = send_json(
@@ -2653,7 +2967,9 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
     )
     .await;
     assert_eq!(
-        ok_cors_hdrs.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+        ok_cors_hdrs
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
         "https://app.example.com"
     );
     assert_eq!(ok_cors_hdrs.get(header::VARY).unwrap(), "Origin");
@@ -2731,8 +3047,14 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
     )
     .await;
     let payload_txt = ev_det["payload"].to_string();
-    assert!(!payload_txt.contains("198.51.100.42"), "Org IP scrub failed: {payload_txt}");
-    assert!(!payload_txt.contains("tok_leak_999"), "aggressive_key_match failed: {payload_txt}");
+    assert!(
+        !payload_txt.contains("198.51.100.42"),
+        "Org IP scrub failed: {payload_txt}"
+    );
+    assert!(
+        !payload_txt.contains("tok_leak_999"),
+        "aggressive_key_match failed: {payload_txt}"
+    );
 
     // 6. Negative DSN cache hits 401 and blocks bad key in-memory
     let (bad_dsn, _, _) = send_json(
@@ -2801,7 +3123,8 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     use std::io::Read;
 
     let (dir, state, router, dsn_key, project_id) = setup_test_app().await;
-    let (cookie, csrf) = login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let (cookie, csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
     let hdrs = [
         (header::COOKIE.as_str(), cookie.as_str()),
         ("x-csrf-token", csrf.as_str()),
@@ -2831,7 +3154,10 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     assert_eq!(ev_ok_st, StatusCode::OK);
     let temp_key_sha = sha256_hex(temp_pub_key.as_bytes());
     assert!(
-        state.dsn_auth_cache.get(project_id, &temp_key_sha).is_some(),
+        state
+            .dsn_auth_cache
+            .get(project_id, &temp_key_sha)
+            .is_some(),
         "Expected valid DSN key to populate DsnAuthCache"
     );
 
@@ -2845,7 +3171,10 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     .await;
     assert_eq!(uk_st, StatusCode::OK);
     assert!(
-        state.dsn_auth_cache.get(project_id, &temp_key_sha).is_none(),
+        state
+            .dsn_auth_cache
+            .get(project_id, &temp_key_sha)
+            .is_none(),
         "Deactivating key MUST invalidate DsnAuthCache synchronously"
     );
 
@@ -2885,7 +3214,10 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     let tok_sha = sha256_hex(raw_tok.as_bytes());
     let now_s = chrono::Utc::now().timestamp();
     assert!(
-        state.api_token_cache.get(&tok_sha, Some("alpha"), now_s).is_some(),
+        state
+            .api_token_cache
+            .get(&tok_sha, Some("alpha"), now_s)
+            .is_some(),
         "Expected valid Bearer token to populate ApiTokenCache"
     );
 
@@ -2926,19 +3258,18 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
         .to_str()
         .unwrap()
         .contains("Accept-Encoding"));
-    let sdk_etag = gz_sdk_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let sdk_etag = gz_sdk_hdrs
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let mut gz_dec = GzDecoder::new(&gz_sdk_bytes[..]);
     let mut sdk_decoded = Vec::new();
     gz_dec.read_to_end(&mut sdk_decoded).unwrap();
 
-    let (raw_sdk_st, raw_sdk_hdrs, raw_sdk_bytes) = send_raw(
-        &router,
-        "GET",
-        "/sdk/bugfinder-mini.js",
-        &[],
-        Vec::new(),
-    )
-    .await;
+    let (raw_sdk_st, raw_sdk_hdrs, raw_sdk_bytes) =
+        send_raw(&router, "GET", "/sdk/bugfinder-mini.js", &[], Vec::new()).await;
     assert_eq!(raw_sdk_st, StatusCode::OK);
     assert!(raw_sdk_hdrs.get(header::CONTENT_ENCODING).is_none());
     assert_eq!(raw_sdk_bytes, sdk_decoded);
@@ -3008,8 +3339,16 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     assert_eq!(iss_st, StatusCode::OK);
     assert_eq!(iss_hdrs.get(header::CONTENT_ENCODING).unwrap(), "gzip");
     assert_eq!(iss_hdrs.get("x-hits").unwrap(), "21"); // 1 warm info + 20 errors
-    let first_etag = iss_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
-    assert!(first_etag.starts_with("W/\"u-"), "unexpected ETag: {first_etag}");
+    let first_etag = iss_hdrs
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        first_etag.starts_with("W/\"u-"),
+        "unexpected ETag: {first_etag}"
+    );
 
     let mut iss_dec = GzDecoder::new(&iss_gz_body[..]);
     let mut iss_plain = Vec::new();
@@ -3055,8 +3394,17 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
         Vec::new(),
     )
     .await;
-    assert_eq!(iss_after_st, StatusCode::OK, "Resolving an issue must invalidate issues ETag immediately");
-    let second_etag = iss_after_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    assert_eq!(
+        iss_after_st,
+        StatusCode::OK,
+        "Resolving an issue must invalidate issues ETag immediately"
+    );
+    let second_etag = iss_after_hdrs
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert_ne!(first_etag, second_etag);
 
     // Filtered query ETag + 304
@@ -3069,7 +3417,12 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
     )
     .await;
     assert_eq!(filt_st, StatusCode::OK);
-    let filt_etag = filt_hdrs.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let filt_etag = filt_hdrs
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(filt_etag.starts_with("W/\"f-"));
     let (filt_304_st, _, _) = send_raw(
         &router,
@@ -3086,7 +3439,8 @@ async fn perf_cache_invalidation_compression_etag_and_backup_test() {
 
     // 5. SQLite Online Backup API + PRAGMA integrity_check
     let backup_path = dir.path().join("online_backup.db");
-    let copied_bytes = SqliteStorage::backup_to_file(&state.config.sqlite_path(), &backup_path).unwrap();
+    let copied_bytes =
+        SqliteStorage::backup_to_file(&state.config.sqlite_path(), &backup_path).unwrap();
     assert!(copied_bytes > 0);
     let b_conn = rusqlite::Connection::open(&backup_path).unwrap();
     let integrity: String = b_conn
@@ -3336,7 +3690,10 @@ async fn alerts_telegram_discord_and_oidc_flow_test() {
     )
     .await;
     let list_alerts_str = String::from_utf8_lossy(&list_alerts_raw);
-    assert!(!list_alerts_str.contains(tg_secret), "Bot token leaked in GET alerts response!");
+    assert!(
+        !list_alerts_str.contains(tg_secret),
+        "Bot token leaked in GET alerts response!"
+    );
     assert!(list_alerts_str.contains("telegram:-1001234567890"));
 
     // 2. OIDC /api/auth/status + login + CSRF state check + callback + fail-closed provisioning
@@ -3345,7 +3702,8 @@ async fn alerts_telegram_discord_and_oidc_flow_test() {
     assert_eq!(st_body["oidc_enabled"], true);
     assert_eq!(st_body["oidc_name"], "Corp SSO");
 
-    let (login_st, login_hdrs, _) = send_raw(&router, "GET", "/api/auth/oidc/login", &[], Vec::new()).await;
+    let (login_st, login_hdrs, _) =
+        send_raw(&router, "GET", "/api/auth/oidc/login", &[], Vec::new()).await;
     assert_eq!(login_st, StatusCode::FOUND);
     let loc = login_hdrs.get(header::LOCATION).unwrap().to_str().unwrap();
     assert!(loc.contains("code_challenge_method=S256"));
@@ -3445,7 +3803,8 @@ async fn alerts_telegram_discord_and_oidc_flow_test() {
         .any(|e| e["action"] == "auth.oidc_login"));
 
     // Unprovisioned SSO email fails closed with 403 Forbidden (no auto-provisioning)
-    let (l2_st, l2_hdrs, _) = send_raw(&router, "GET", "/api/auth/oidc/login", &[], Vec::new()).await;
+    let (l2_st, l2_hdrs, _) =
+        send_raw(&router, "GET", "/api/auth/oidc/login", &[], Vec::new()).await;
     assert_eq!(l2_st, StatusCode::FOUND);
     let loc2 = l2_hdrs.get(header::LOCATION).unwrap().to_str().unwrap();
     let tx2 = l2_hdrs
@@ -3764,9 +4123,13 @@ PHP Fatal error: Call to undefined foo()\n";
     );
     assert!(titles.iter().any(|t| t.contains("BugFinderOnboardingTest")));
     assert!(titles.iter().any(|t| t.contains("RuntimeError: boom")));
-    assert!(titles.iter().any(|t| t.contains("PHP Fatal error: Call to undefined foo()")));
+    assert!(titles
+        .iter()
+        .any(|t| t.contains("PHP Fatal error: Call to undefined foo()")));
     assert!(
-        !titles.iter().any(|t| t.contains("0 errors") || t.contains("ErrorHandler")),
+        !titles
+            .iter()
+            .any(|t| t.contains("0 errors") || t.contains("ErrorHandler")),
         "Benign lines must never create Issues: {titles:?}"
     );
 
@@ -3802,4 +4165,720 @@ PHP Fatal error: Call to undefined foo()\n";
     }
 
     srv_handle.abort();
+}
+
+#[tokio::test]
+async fn regression_shield_blocklist_viewer_hides_ip_hmac_key_and_passes_up_only_rejects() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    use sha2::{Digest, Sha256};
+
+    let (_dir, _state, router, _dsn, _pid) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+        (header::HOST.as_str(), "127.0.0.1:8090"),
+    ];
+
+    // 1. Invite Viewer and verify viewer get_shield_blocklist redacts ip_hmac_key while Owner gets it
+    let (v_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/members/",
+        &owner_hdrs,
+        json!({
+            "email": "viewer@alpha.test",
+            "name": "View",
+            "password": "StrongSecretPass!99",
+            "role": "viewer"
+        }),
+    )
+    .await;
+    assert_eq!(v_st, StatusCode::CREATED);
+    let (viewer_cookie, _) =
+        login_cookie_and_csrf(&router, "viewer@alpha.test", "StrongSecretPass!99").await;
+
+    let (vbl_st, _, vbl_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/projects/alpha/acme-web/shield/blocklist/",
+        &[(header::COOKIE.as_str(), viewer_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(vbl_st, StatusCode::OK);
+    assert!(
+        vbl_body["ip_hmac_key"].is_null(),
+        "Viewer must receive null ip_hmac_key, got {vbl_body}"
+    );
+
+    let (obl_st, _, obl_body) = send_json(
+        &router,
+        "GET",
+        "/api/0/projects/alpha/acme-web/shield/blocklist/",
+        &[(header::COOKIE.as_str(), owner_cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(obl_st, StatusCode::OK);
+    assert!(obl_body["ip_hmac_key"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+
+    // 2. Passkey assertion with UP-only flag (0x01, UV bit 0x04 unset) MUST return 401
+    let (rb_st, _, rb_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/register/begin",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
+    assert_eq!(rb_st, StatusCode::OK);
+    let chal = rb_b["challenge"].as_str().unwrap();
+
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let kp =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let pub_uncompressed = kp.public_key().as_ref();
+    let cred_id = b"up_only_cred_id_16";
+    let reg_cdj = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "type": "webauthn.create",
+            "challenge": chal,
+            "origin": "http://127.0.0.1:8090"
+        }))
+        .unwrap(),
+    );
+    fn enc_cose_b(b: &[u8]) -> Vec<u8> {
+        let mut o = if b.len() < 24 {
+            vec![0x40 | (b.len() as u8)]
+        } else {
+            vec![0x58, b.len() as u8]
+        };
+        o.extend_from_slice(b);
+        o
+    }
+    let mut cose = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21];
+    cose.extend_from_slice(&enc_cose_b(&pub_uncompressed[1..33]));
+    cose.push(0x22);
+    cose.extend_from_slice(&enc_cose_b(&pub_uncompressed[33..65]));
+
+    let mut reg_ad = Vec::new();
+    reg_ad.extend_from_slice(&Sha256::digest(b"127.0.0.1"));
+    reg_ad.push(0x45);
+    reg_ad.extend_from_slice(&0u32.to_be_bytes());
+    reg_ad.extend_from_slice(&[0u8; 16]);
+    reg_ad.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+    reg_ad.extend_from_slice(cred_id);
+    reg_ad.extend_from_slice(&cose);
+
+    let mut att_obj = vec![
+        0xA2,
+        0x63,
+        b'f',
+        b'm',
+        b't',
+        0x64,
+        b'n',
+        b'o',
+        b'n',
+        b'e',
+        0x68,
+        b'a',
+        b'u',
+        b't',
+        b'h',
+        b'D',
+        b'a',
+        b't',
+        b'a',
+        0x58,
+        reg_ad.len() as u8,
+    ];
+    att_obj.extend_from_slice(&reg_ad);
+    let (pf_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/register/finish",
+        &owner_hdrs,
+        json!({
+            "name": "UV Guard Key",
+            "clientDataJSON": reg_cdj,
+            "attestationObject": URL_SAFE_NO_PAD.encode(&att_obj),
+        }),
+    )
+    .await;
+    assert_eq!(pf_st, StatusCode::CREATED);
+
+    let (_, _, lb_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/login/begin",
+        &[(header::HOST.as_str(), "127.0.0.1:8090")],
+        json!({ "email": "owner@alpha.test" }),
+    )
+    .await;
+    let l_cdj = serde_json::to_vec(&json!({
+        "type": "webauthn.get",
+        "challenge": lb_b["challenge"].as_str().unwrap(),
+        "origin": "http://127.0.0.1:8090"
+    }))
+    .unwrap();
+    let mut up_only_ad = Vec::new();
+    up_only_ad.extend_from_slice(&Sha256::digest(b"127.0.0.1"));
+    up_only_ad.push(0x01); // UP=1, UV=0 MUST BE REJECTED
+    up_only_ad.extend_from_slice(&1u32.to_be_bytes());
+    let mut msg = up_only_ad.clone();
+    msg.extend_from_slice(&Sha256::digest(&l_cdj));
+    let sig = kp.sign(&rng, &msg).unwrap();
+
+    let (lf_st, _, lf_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/passkey/login/finish",
+        &[(header::HOST.as_str(), "127.0.0.1:8090")],
+        json!({
+            "credentialId": URL_SAFE_NO_PAD.encode(cred_id),
+            "clientDataJSON": URL_SAFE_NO_PAD.encode(&l_cdj),
+            "authenticatorData": URL_SAFE_NO_PAD.encode(&up_only_ad),
+            "signature": URL_SAFE_NO_PAD.encode(sig.as_ref()),
+        }),
+    )
+    .await;
+    assert_eq!(
+        lf_st,
+        StatusCode::UNAUTHORIZED,
+        "UP-only WebAuthn assertion must return 401: {lf_b}"
+    );
+}
+
+#[tokio::test]
+async fn regression_anti_ato_existing_user_invitation_and_mfa_replay_reauth_guards() {
+    let (_dir, state, router, _dsn, _pid) = setup_test_app().await;
+    let (owner_cookie, owner_csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let owner_hdrs = [
+        (header::COOKIE.as_str(), owner_cookie.as_str()),
+        ("x-csrf-token", owner_csrf.as_str()),
+    ];
+
+    // Seed an existing external account in a separate org ("beta") with known password
+    let ext_pw = hash_password("ExistingOriginalPass!11".into())
+        .await
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(state.config.sqlite_path()).unwrap();
+        let now_s = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO organizations (slug, name, created_at) VALUES ('beta', 'Org Beta', ?1)",
+            [now_s],
+        )
+        .unwrap();
+        let beta_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES ('existing@external.test', 'Ext', ?1, 1, ?2)",
+            rusqlite::params![ext_pw, now_s],
+        )
+        .unwrap();
+        let ext_uid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?1, ?2, 'owner')",
+            rusqlite::params![beta_id, ext_uid],
+        )
+        .unwrap();
+    }
+
+    // Create 72h invitation on Alpha for existing@external.test
+    let (inv_st, _, inv_b) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/invitations/",
+        &owner_hdrs,
+        json!({ "email": "existing@external.test", "role": "member" }),
+    )
+    .await;
+    assert_eq!(inv_st, StatusCode::CREATED);
+    let inv_tok = inv_b["token"].as_str().unwrap().to_string();
+
+    // Unauthenticated acceptance trying to hijack existing@external.test MUST return 409 and preserve password
+    let (ato_st, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/auth/invites/{inv_tok}/accept"),
+        &[],
+        json!({ "name": "Hijacker", "password": "AttackerNewPassword!99" }),
+    )
+    .await;
+    assert_eq!(ato_st, StatusCode::CONFLICT);
+
+    let (atk_lg, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/login",
+        &[],
+        json!({ "email": "existing@external.test", "password": "AttackerNewPassword!99" }),
+    )
+    .await;
+    assert_eq!(atk_lg, StatusCode::UNAUTHORIZED);
+
+    // Signing in with the legitimate original password and accepting cleanly works
+    let (ext_cookie, ext_csrf) =
+        login_cookie_and_csrf(&router, "existing@external.test", "ExistingOriginalPass!11").await;
+    let (ok_acc, _, _) = send_json(
+        &router,
+        "POST",
+        &format!("/api/auth/invites/{inv_tok}/accept"),
+        &[
+            (header::COOKIE.as_str(), &ext_cookie),
+            ("x-csrf-token", &ext_csrf),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(ok_acc, StatusCode::OK);
+
+    // mfa_totp_enroll requires fresh reauth, succeeds after reauth, then returns 409 when already enabled,
+    // and mfa_verify rejects replayed challenge tokens
+    {
+        let conn = rusqlite::Connection::open(state.config.sqlite_path()).unwrap();
+        conn.execute("UPDATE sessions SET reauth_at = reauth_at - 900", [])
+            .unwrap();
+    }
+    let (stale_st, _, stale_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/enroll",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
+    assert_eq!(stale_st, StatusCode::FORBIDDEN);
+    assert_eq!(stale_b["reauth_required"], true);
+
+    let (ra_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/reauth",
+        &owner_hdrs,
+        json!({ "password": "StrongPassword123!" }),
+    )
+    .await;
+    assert_eq!(ra_st, StatusCode::OK);
+
+    let (en_st, _, en_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/enroll",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
+    assert_eq!(en_st, StatusCode::OK);
+    let sec_bytes =
+        bugfinder::security::mfa::decode_base32(en_b["secret_b32"].as_str().unwrap()).unwrap();
+    let code = bugfinder::security::mfa::totp_code_at(&sec_bytes, chrono::Utc::now().timestamp());
+    let (cf_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/confirm",
+        &owner_hdrs,
+        json!({ "code": code }),
+    )
+    .await;
+    assert_eq!(cf_st, StatusCode::OK);
+
+    let (dup_en_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/enroll",
+        &owner_hdrs,
+        json!({}),
+    )
+    .await;
+    assert_eq!(dup_en_st, StatusCode::CONFLICT);
+
+    let (_, _, lg_b) = send_json(
+        &router,
+        "POST",
+        "/api/auth/login",
+        &[],
+        json!({ "email": "owner@alpha.test", "password": "StrongPassword123!" }),
+    )
+    .await;
+    let chal = lg_b["challenge_token"].as_str().unwrap().to_string();
+    {
+        let conn = rusqlite::Connection::open(state.config.sqlite_path()).unwrap();
+        conn.execute(
+            "UPDATE user_mfa SET last_used_step = last_used_step - 2",
+            [],
+        )
+        .unwrap();
+    }
+    let fresh_code =
+        bugfinder::security::mfa::totp_code_at(&sec_bytes, chrono::Utc::now().timestamp());
+    let (v1_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/verify",
+        &[],
+        json!({ "challenge_token": chal, "code": fresh_code }),
+    )
+    .await;
+    assert_eq!(v1_st, StatusCode::OK);
+    let (v2_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/verify",
+        &[],
+        json!({ "challenge_token": chal, "code": fresh_code }),
+    )
+    .await;
+    assert_eq!(v2_st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn regression_scanner_guard_forged_cookie_and_loopback_health_allowed_hosts() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = AppConfig::from_env_and_overrides(
+        Some("127.0.0.1:0".into()),
+        Some(dir.path().to_path_buf()),
+        None,
+        false,
+    )
+    .unwrap();
+    cfg.is_dev = false;
+    cfg.allowed_hosts = vec!["prod.example.com".to_string()];
+    let cfg = Arc::new(cfg);
+    let storage: Arc<dyn StorageBackend> =
+        SqliteStorage::open_with_key(&cfg.sqlite_path(), cfg.app_key).unwrap();
+    let state = build_app_state(cfg, storage);
+    let router = build_router(state);
+
+    // Loopback /api/health MUST pass even when ALLOWED_HOSTS restricts to prod.example.com
+    let (hl_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/health",
+        &[(header::HOST.as_str(), "127.0.0.1:8080")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(hl_st, StatusCode::OK);
+
+    let (non_h, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/status",
+        &[(header::HOST.as_str(), "127.0.0.1:8080")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(non_h, StatusCode::FORBIDDEN);
+    let (evil_h, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/health",
+        &[(header::HOST.as_str(), "evil.test")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(evil_h, StatusCode::FORBIDDEN);
+
+    // Forged session cookie hitting canary path MUST NOT bypass ScannerGuard and gets banned
+    let (canary_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/.env",
+        &[
+            (header::HOST.as_str(), "prod.example.com"),
+            (
+                header::COOKIE.as_str(),
+                "bf_session=forged_session_value_0123456789abcdef012345",
+            ),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert!(canary_st == StatusCode::NOT_FOUND || canary_st == StatusCode::FORBIDDEN);
+
+    let (ban_st, _, _) = send_raw(
+        &router,
+        "GET",
+        "/api/auth/status",
+        &[
+            (header::HOST.as_str(), "prod.example.com"),
+            (
+                header::COOKIE.as_str(),
+                "bf_session=forged_session_value_0123456789abcdef012345",
+            ),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        ban_st,
+        StatusCode::TOO_MANY_REQUESTS,
+        "Forged cookie must not exempt scanner ban"
+    );
+}
+
+#[tokio::test]
+async fn regression_self_monitor_csv_formula_regression_reopen_sourcemap_and_checkin_alerts() {
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (cookie, csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let hdrs = [
+        (header::COOKIE.as_str(), cookie.as_str()),
+        ("x-csrf-token", csrf.as_str()),
+    ];
+
+    // 1. SelfMonitor cross-org isolation
+    state
+        .self_monitor
+        .record_for_org(1, "ui_client", "error", "spa", "Org1 only error", None);
+    state
+        .self_monitor
+        .record_for_org(2, "ui_client", "error", "spa", "Org2 only error", None);
+    let (list1, unack1) = state.self_monitor.snapshot_for_org(1);
+    let (list2, unack2) = state.self_monitor.snapshot_for_org(2);
+    assert_eq!(unack1, 1);
+    assert_eq!(unack2, 1);
+    assert!(list1.iter().all(|e| e.message == "Org1 only error"));
+    assert!(list2.iter().all(|e| e.message == "Org2 only error"));
+    state.self_monitor.clear_for_org(1, false);
+    assert_eq!(state.self_monitor.snapshot_for_org(1).1, 0);
+    assert_eq!(state.self_monitor.snapshot_for_org(2).1, 1);
+
+    // 2. Upload SourceMap under release "1.0.0", then ingest same-release error + CSV leading whitespace formulas
+    let sm_bytes = br#"{
+        "version": 3,
+        "sources": ["src/billing.ts"],
+        "names": ["applyTax"],
+        "sourcesContent": ["export function applyTax() {\n  throw new Error('tax_fail');\n}\n"],
+        "mappings": "AAEIA"
+    }"#
+    .to_vec();
+    let (sm_st, _, _) = send_raw(
+        &router,
+        "POST",
+        "/api/0/projects/alpha/acme-web/releases/1.0.0/sourcemaps/?filename=bundle.min.js.map",
+        &hdrs,
+        sm_bytes,
+    )
+    .await;
+    assert_eq!(sm_st, StatusCode::CREATED);
+
+    let env1 = format!(
+        "{}\n{}\n{}\n",
+        json!({ "event_id": "aaaa1111aaaa1111aaaa1111aaaa1111", "sent_at": "2026-11-22T00:00:00Z" }),
+        json!({ "type": "event" }),
+        json!({
+            "event_id": "aaaa1111aaaa1111aaaa1111aaaa1111",
+            "platform": "javascript",
+            "level": "error",
+            "release": "1.0.0",
+            "exception": { "values": [{ "type": "\t=SUM(A1)", "value": "bad invoice", "stacktrace": { "frames": [{ "filename": "https://cdn.acme.example/bundle.min.js", "lineno": 1, "colno": 0, "in_app": true }] } }] }
+        })
+    );
+    let (i1_st, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/?sentry_key={dsn_key}"),
+        &[],
+        env1.into_bytes(),
+    )
+    .await;
+    assert_eq!(i1_st, StatusCode::OK);
+    let env_cr = format!(
+        "{}\n{}\n{}\n",
+        json!({ "event_id": "cccc3333cccc3333cccc3333cccc3333", "sent_at": "2026-11-22T00:00:10Z" }),
+        json!({ "type": "event" }),
+        json!({
+            "event_id": "cccc3333cccc3333cccc3333cccc3333",
+            "platform": "javascript",
+            "level": "error",
+            "exception": { "values": [{ "type": "\r+1+1", "value": "cr formula", "stacktrace": { "frames": [{ "filename": "https://cdn.acme.example/bundle.min.js", "lineno": 1, "colno": 0, "in_app": true }] } }] }
+        })
+    );
+    let (i_cr_st, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/?sentry_key={dsn_key}"),
+        &[],
+        env_cr.into_bytes(),
+    )
+    .await;
+    assert_eq!(i_cr_st, StatusCode::OK);
+    state.batch_writer.flush_now().await;
+
+    let (csv_st, _, csv_raw) = send_raw(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/export.csv",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(csv_st, StatusCode::OK);
+    let csv_txt = String::from_utf8(csv_raw).unwrap();
+    assert!(
+        csv_txt.contains("'\t=SUM(A1)"),
+        "Leading-tab formula in CSV must be prefixed with ': {csv_txt}"
+    );
+    assert!(
+        csv_txt.contains("'\r+1+1"),
+        "Leading-CR formula in CSV must be prefixed with ': {csv_txt}"
+    );
+
+    let (_, _, iss_list) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    let sum_issue = iss_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title"].as_str().unwrap_or("").contains("SUM(A1)"))
+        .unwrap();
+    let issue_id = sum_issue["id"].as_i64().unwrap();
+    let (res_st, _, _) = send_json(
+        &router,
+        "PUT",
+        &format!("/api/0/organizations/alpha/issues/{issue_id}/"),
+        &hdrs,
+        json!({ "status": "resolved" }),
+    )
+    .await;
+    assert_eq!(res_st, StatusCode::OK);
+
+    // Event with NO release triggers same-release resolved reopen AND sourcemap release fallback demangling
+    let env2 = format!(
+        "{}\n{}\n{}\n",
+        json!({ "event_id": "bbbb2222bbbb2222bbbb2222bbbb2222", "sent_at": "2026-11-22T00:01:00Z" }),
+        json!({ "type": "event" }),
+        json!({
+            "event_id": "bbbb2222bbbb2222bbbb2222bbbb2222",
+            "platform": "javascript",
+            "level": "error",
+            "exception": { "values": [{ "type": "\t=SUM(A1)", "value": "bad invoice", "stacktrace": { "frames": [{ "filename": "https://cdn.acme.example/bundle.min.js", "lineno": 1, "colno": 0, "in_app": true }] } }] }
+        })
+    );
+    let (i2_st, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/?sentry_key={dsn_key}"),
+        &[],
+        env2.into_bytes(),
+    )
+    .await;
+    assert_eq!(i2_st, StatusCode::OK);
+    state.batch_writer.flush_now().await;
+
+    let (reopen_st, _, reopen_b) = send_json(
+        &router,
+        "GET",
+        &format!("/api/0/organizations/alpha/issues/{issue_id}/"),
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(reopen_st, StatusCode::OK);
+    assert_eq!(
+        reopen_b["status"], "unresolved",
+        "Resolved issue must reopen on repeat error"
+    );
+
+    let (_, _, ev_b) = send_json(
+        &router,
+        "GET",
+        &format!("/api/0/organizations/alpha/issues/{issue_id}/events/latest/"),
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    let frame_file = ev_b["payload"]["exception"]["values"][0]["stacktrace"]["frames"][0]
+        ["filename"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        frame_file, "src/billing.ts",
+        "SourceMap release fallback should demangle to src/billing.ts"
+    );
+
+    // 3. CheckIn `error` status flips monitor to `down` and triggers `uptime_down` alert job
+    let (mon_st, _, mon_b) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/monitors/",
+        &hdrs,
+        json!({ "project_id": project_id, "name": "nightly-sync", "expected_interval_sec": 300 }),
+    )
+    .await;
+    assert_eq!(mon_st, StatusCode::CREATED);
+    let mon_id = mon_b["id"].as_i64().unwrap();
+
+    let (al_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/0/organizations/alpha/alerts/",
+        &hdrs,
+        json!({
+            "project_id": project_id,
+            "name": "Cron Down Webhook",
+            "trigger_type": "uptime_down",
+            "threshold_count": 1,
+            "window_sec": 60,
+            "cooldown_sec": 60,
+            "channel_type": "email",
+            "email_to": "ops@example.com"
+        }),
+    )
+    .await;
+    assert_eq!(al_st, StatusCode::CREATED);
+
+    let alert_jobs = state
+        .storage
+        .flush_ingest_batch(vec![bugfinder::storage::IngestWriteItem::CheckIn {
+            organization_id: 1,
+            project_id,
+            check_in: bugfinder::domain::envelope::CheckInItem {
+                monitor_slug: "nightly-sync".into(),
+                status: "error".into(),
+                duration_ms: Some(420),
+            },
+            received_ms: chrono::Utc::now().timestamp_millis(),
+        }])
+        .await
+        .unwrap();
+    assert!(
+        alert_jobs.iter().any(|j| j.title.contains("nightly-sync")),
+        "CheckIn error must trigger uptime_down alert job: {alert_jobs:?}"
+    );
+
+    let (ml_st, _, ml_b) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/monitors/",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ml_st, StatusCode::OK);
+    let mon_row = ml_b
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == mon_id)
+        .unwrap();
+    assert_eq!(mon_row["status"], "down");
 }
