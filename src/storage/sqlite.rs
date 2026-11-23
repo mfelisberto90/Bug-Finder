@@ -2,7 +2,9 @@ use crate::alerts::dispatcher::AlertDispatchJob;
 use crate::domain::fingerprint::{extract_issue_metadata, should_reopen_on_regression};
 use crate::domain::models::*;
 use crate::runtime::trim_heap;
-use crate::security::auth::{compute_audit_entry_hash, compute_lockout_seconds};
+use crate::security::auth::{
+    compute_audit_entry_hash, compute_lockout_seconds, AuditEntryHashInput,
+};
 use crate::security::crypto::{open_secret, seal_secret};
 use crate::storage::*;
 use async_trait::async_trait;
@@ -69,17 +71,61 @@ impl SqliteStorage {
 
         // Idempotent upgrades for pre-existing SQLite databases
         let upgrades = [
-            ("organizations", "settings_json", "ALTER TABLE organizations ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'"),
-            ("sessions", "user_agent", "ALTER TABLE sessions ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''"),
-            ("sessions", "ip_hmac", "ALTER TABLE sessions ADD COLUMN ip_hmac TEXT NOT NULL DEFAULT ''"),
-            ("sessions", "last_seen_at", "ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0"),
-            ("sessions", "reauth_at", "ALTER TABLE sessions ADD COLUMN reauth_at INTEGER"),
-            ("api_tokens", "expires_at", "ALTER TABLE api_tokens ADD COLUMN expires_at INTEGER"),
-            ("audit_logs", "actor_email", "ALTER TABLE audit_logs ADD COLUMN actor_email TEXT NOT NULL DEFAULT ''"),
-            ("audit_logs", "ip_hmac", "ALTER TABLE audit_logs ADD COLUMN ip_hmac TEXT NOT NULL DEFAULT ''"),
-            ("audit_logs", "metadata_json", "ALTER TABLE audit_logs ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"),
-            ("audit_logs", "prev_hash", "ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'GENESIS'"),
-            ("audit_logs", "entry_hash", "ALTER TABLE audit_logs ADD COLUMN entry_hash TEXT NOT NULL DEFAULT ''"),
+            (
+                "organizations",
+                "settings_json",
+                "ALTER TABLE organizations ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "sessions",
+                "user_agent",
+                "ALTER TABLE sessions ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "sessions",
+                "ip_hmac",
+                "ALTER TABLE sessions ADD COLUMN ip_hmac TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "sessions",
+                "last_seen_at",
+                "ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "sessions",
+                "reauth_at",
+                "ALTER TABLE sessions ADD COLUMN reauth_at INTEGER",
+            ),
+            (
+                "api_tokens",
+                "expires_at",
+                "ALTER TABLE api_tokens ADD COLUMN expires_at INTEGER",
+            ),
+            (
+                "audit_logs",
+                "actor_email",
+                "ALTER TABLE audit_logs ADD COLUMN actor_email TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "audit_logs",
+                "ip_hmac",
+                "ALTER TABLE audit_logs ADD COLUMN ip_hmac TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "audit_logs",
+                "metadata_json",
+                "ALTER TABLE audit_logs ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "audit_logs",
+                "prev_hash",
+                "ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'GENESIS'",
+            ),
+            (
+                "audit_logs",
+                "entry_hash",
+                "ALTER TABLE audit_logs ADD COLUMN entry_hash TEXT NOT NULL DEFAULT ''",
+            ),
         ];
         for (tbl, col, ddl) in upgrades {
             if !sqlite_has_column(&writer, tbl, col) {
@@ -256,7 +302,10 @@ impl SqliteStorage {
 
     pub fn backup_to_file(src_path: &Path, dst_path: &Path) -> Result<u64, String> {
         if !src_path.is_file() {
-            return Err(format!("Source SQLite database not found: {}", src_path.display()));
+            return Err(format!(
+                "Source SQLite database not found: {}",
+                src_path.display()
+            ));
         }
         if dst_path.as_os_str().is_empty() {
             return Err("Backup destination path cannot be empty".into());
@@ -274,7 +323,11 @@ impl SqliteStorage {
             }
         } else if let (Some(dst_parent), Some(dst_name), Some(src_parent), Some(src_name)) = (
             dst_path.parent().and_then(|p| {
-                let eff = if p.as_os_str().is_empty() { Path::new(".") } else { p };
+                let eff = if p.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    p
+                };
                 std::fs::canonicalize(eff).ok()
             }),
             dst_path.file_name(),
@@ -300,11 +353,8 @@ impl SqliteStorage {
         };
         let _ = std::fs::remove_file(&tmp_path);
 
-        let src_conn = Connection::open_with_flags(
-            &canon_src,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| format!("Open source SQLite for backup: {e}"))?;
+        let src_conn = Connection::open_with_flags(&canon_src, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("Open source SQLite for backup: {e}"))?;
         let _ = src_conn.execute_batch("PRAGMA busy_timeout = 5000;");
 
         {
@@ -369,7 +419,7 @@ impl SqliteStorage {
             return true;
         }
         let every = filters.storm_sample_every.max(2);
-        entry.count % every == 0
+        entry.count.is_multiple_of(every)
     }
 }
 
@@ -377,18 +427,22 @@ fn map_sqlite_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn build_alert_jobs_for_event(
-    tx: &Transaction<'_>,
-    app_key: &[u8; 32],
+struct EventAlertContext<'a> {
     organization_id: i64,
     project_id: i64,
-    project_slug: &str,
-    short_id: &str,
-    title: &str,
-    level: &str,
+    project_slug: &'a str,
+    short_id: &'a str,
+    title: &'a str,
+    level: &'a str,
     is_new_issue: bool,
     is_regression: bool,
     now_sec: i64,
+}
+
+fn build_alert_jobs_for_event(
+    tx: &Transaction<'_>,
+    app_key: &[u8; 32],
+    ctx: &EventAlertContext<'_>,
 ) -> Result<Vec<AlertDispatchJob>, String> {
     let mut stmt = tx
         .prepare(
@@ -400,7 +454,7 @@ fn build_alert_jobs_for_event(
         .map_err(map_sqlite_err)?;
 
     let mut rows = stmt
-        .query(params![organization_id, project_id])
+        .query(params![ctx.organization_id, ctx.project_id])
         .map_err(map_sqlite_err)?;
     let mut jobs = Vec::new();
     let mut triggered_ids = Vec::new();
@@ -416,28 +470,28 @@ fn build_alert_jobs_for_event(
         let target_url: String = r.get(7).map_err(map_sqlite_err)?;
         let webhook_secret: String = open_webhook_secret(
             app_key,
-            organization_id,
+            ctx.organization_id,
             &r.get::<_, String>(8).map_err(map_sqlite_err)?,
         );
         let email_to: String = r.get(9).map_err(map_sqlite_err)?;
         let last_triggered_at: Option<i64> = r.get(10).map_err(map_sqlite_err)?;
 
         if let Some(last) = last_triggered_at {
-            if now_sec - last < cooldown_sec {
+            if ctx.now_sec - last < cooldown_sec {
                 continue;
             }
         }
 
         let matched = match trigger_type.as_str() {
-            "new_issue" => is_new_issue,
-            "regression" => is_regression,
-            "fatal_log" => level == "fatal",
+            "new_issue" => ctx.is_new_issue,
+            "regression" => ctx.is_regression,
+            "fatal_log" => ctx.level == "fatal",
             "threshold" => {
-                let since_ms = (now_sec - window_sec) * 1000;
+                let since_ms = (ctx.now_sec - window_sec) * 1000;
                 let recent: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM issue_events WHERE organization_id = ?1 AND project_id = ?2 AND timestamp_ms >= ?3",
-                        params![organization_id, project_id, since_ms],
+                        params![ctx.organization_id, ctx.project_id, since_ms],
                         |c| c.get(0),
                     )
                     .unwrap_or(0);
@@ -449,17 +503,18 @@ fn build_alert_jobs_for_event(
         if matched {
             triggered_ids.push(id);
             jobs.push(AlertDispatchJob {
+                organization_id: ctx.organization_id,
                 rule_id: id,
                 rule_name: name,
                 channel_type,
                 target_url,
                 webhook_secret,
                 email_to,
-                title: title.to_string(),
-                message: format!("Trigger: {trigger_type} | Issue {short_id}"),
-                level: level.to_string(),
-                project_slug: project_slug.to_string(),
-                short_id: Some(short_id.to_string()),
+                title: ctx.title.to_string(),
+                message: format!("Trigger: {trigger_type} | Issue {}", ctx.short_id),
+                level: ctx.level.to_string(),
+                project_slug: ctx.project_slug.to_string(),
+                short_id: Some(ctx.short_id.to_string()),
             });
         }
     }
@@ -469,7 +524,7 @@ fn build_alert_jobs_for_event(
     for id in triggered_ids {
         tx.execute(
             "UPDATE alert_rules SET last_triggered_at = ?1 WHERE id = ?2 AND organization_id = ?3",
-            params![now_sec, id, organization_id],
+            params![ctx.now_sec, id, ctx.organization_id],
         )
         .map_err(map_sqlite_err)?;
     }
@@ -504,8 +559,13 @@ fn insert_event_in_txn(
                      ON CONFLICT(project_id, version) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)",
                 )
                 .map_err(map_sqlite_err)?;
-            st.execute(params![auth.organization_id, auth.project_id, rel, received_ms])
-                .map_err(map_sqlite_err)?;
+            st.execute(params![
+                auth.organization_id,
+                auth.project_id,
+                rel,
+                received_ms
+            ])
+            .map_err(map_sqlite_err)?;
         }
     }
 
@@ -541,7 +601,11 @@ fn insert_event_in_txn(
                 resolved_in_release.as_deref(),
                 meta.release.as_deref(),
             );
-            let new_status = if reopen { "unresolved" } else { status.as_str() };
+            let new_status = if reopen {
+                "unresolved"
+            } else {
+                status.as_str()
+            };
             let reg_flag = if reopen { 1 } else { 0 };
 
             let mut st = tx
@@ -633,7 +697,9 @@ fn insert_event_in_txn(
     if let Some(uh) = &meta.user_hash {
         let changed = {
             let mut st = tx
-                .prepare_cached("INSERT OR IGNORE INTO issue_users (issue_id, user_hash) VALUES (?1, ?2)")
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO issue_users (issue_id, user_hash) VALUES (?1, ?2)",
+                )
                 .map_err(map_sqlite_err)?;
             st.execute(params![issue_id, uh]).map_err(map_sqlite_err)?
         };
@@ -709,25 +775,17 @@ impl StorageBackend for SqliteStorage {
 
     async fn initial_setup(
         &self,
-        org_name: &str,
-        org_slug: &str,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-        first_project_name: &str,
-        first_project_slug: &str,
-        dsn_public_key: &str,
-        dsn_key_sha256: &str,
+        input: &InitialSetupInput<'_>,
     ) -> Result<(OrganizationDto, ProjectDto), String> {
-        let org_name = org_name.to_string();
-        let org_slug = org_slug.to_string();
-        let email = email.to_ascii_lowercase();
-        let name = name.to_string();
-        let password_hash = password_hash.to_string();
-        let proj_name = first_project_name.to_string();
-        let proj_slug = first_project_slug.to_string();
-        let dsn_pub = dsn_public_key.to_string();
-        let dsn_sha = dsn_key_sha256.to_string();
+        let org_name = input.org_name.to_string();
+        let org_slug = input.org_slug.to_string();
+        let email = input.email.to_ascii_lowercase();
+        let name = input.name.to_string();
+        let password_hash = input.password_hash.to_string();
+        let proj_name = input.first_project_name.to_string();
+        let proj_slug = input.first_project_slug.to_string();
+        let dsn_pub = input.dsn_public_key.to_string();
+        let dsn_sha = input.dsn_key_sha256.to_string();
 
         self.write(move |conn| {
             let now = now_ms();
@@ -834,7 +892,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn check_login_lockout(&self, key_hmac: &str, now_sec: i64) -> Result<Option<i64>, String> {
+    async fn check_login_lockout(
+        &self,
+        key_hmac: &str,
+        now_sec: i64,
+    ) -> Result<Option<i64>, String> {
         let key_hmac = key_hmac.to_string();
         self.read(move |conn| {
             let locked: Option<Option<i64>> = conn
@@ -855,7 +917,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn record_login_failure(&self, key_hmac: &str, now_sec: i64) -> Result<Option<i64>, String> {
+    async fn record_login_failure(
+        &self,
+        key_hmac: &str,
+        now_sec: i64,
+    ) -> Result<Option<i64>, String> {
         let key_hmac = key_hmac.to_string();
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
@@ -897,21 +963,15 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn create_session(
-        &self,
-        token_sha256: &str,
-        user_id: i64,
-        org_id: i64,
-        csrf_token: &str,
-        user_agent: &str,
-        ip_hmac: &str,
-        now_sec: i64,
-        expires_at: i64,
-    ) -> Result<i64, String> {
-        let sha = token_sha256.to_string();
-        let csrf = csrf_token.to_string();
-        let ua = user_agent.chars().take(160).collect::<String>();
-        let iph = ip_hmac.to_string();
+    async fn create_session(&self, input: &NewSessionInput<'_>) -> Result<i64, String> {
+        let sha = input.token_sha256.to_string();
+        let user_id = input.user_id;
+        let org_id = input.org_id;
+        let csrf = input.csrf_token.to_string();
+        let ua = input.user_agent.chars().take(160).collect::<String>();
+        let iph = input.ip_hmac.to_string();
+        let now_sec = input.now_sec;
+        let expires_at = input.expires_at;
         self.write(move |conn| {
             conn.execute(
                 "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, user_agent, ip_hmac, last_seen_at, reauth_at, expires_at, created_at)
@@ -1076,7 +1136,11 @@ impl StorageBackend for SqliteStorage {
         Ok(None)
     }
 
-    async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
+    async fn resolve_dsn(
+        &self,
+        project_id: i64,
+        key_sha256: &str,
+    ) -> Result<Option<ProjectAuthInfo>, String> {
         let sha = key_sha256.to_string();
         self.read(move |conn| {
             let mut stmt = conn
@@ -1127,7 +1191,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn resolve_tunnel(&self, tunnel_slug: &str, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
+    async fn resolve_tunnel(
+        &self,
+        tunnel_slug: &str,
+        project_id: i64,
+        key_sha256: &str,
+    ) -> Result<Option<ProjectAuthInfo>, String> {
         let tslug = tunnel_slug.to_string();
         let sha = key_sha256.to_string();
         self.read(move |conn| {
@@ -1195,7 +1264,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn resolve_tenant_for_user(&self, user_id: i64, org_slug: &str) -> Result<Option<TenantCtx>, String> {
+    async fn resolve_tenant_for_user(
+        &self,
+        user_id: i64,
+        org_slug: &str,
+    ) -> Result<Option<TenantCtx>, String> {
         let slug = org_slug.to_string();
         self.read(move |conn| {
             conn.query_row(
@@ -1363,7 +1436,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_project_keys(&self, ctx: &TenantCtx, project_slug: &str) -> Result<Vec<ProjectKeyDto>, String> {
+    async fn list_project_keys(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+    ) -> Result<Vec<ProjectKeyDto>, String> {
         let org_id = ctx.organization_id;
         let pslug = project_slug.to_string();
         self.read(move |conn| {
@@ -1444,7 +1521,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn delete_project_key(&self, ctx: &TenantCtx, project_slug: &str, key_id: i64) -> Result<bool, String> {
+    async fn delete_project_key(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+        key_id: i64,
+    ) -> Result<bool, String> {
         let org_id = ctx.organization_id;
         let pslug = project_slug.to_string();
         self.write(move |conn| {
@@ -1504,7 +1586,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn issues_etag_watermark(&self, ctx: &TenantCtx, project_id: Option<i64>) -> Result<(i64, i64), String> {
+    async fn issues_etag_watermark(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+    ) -> Result<(i64, i64), String> {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
@@ -1536,7 +1622,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_issues(&self, ctx: &TenantCtx, params_in: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64, i64), String> {
+    async fn list_issues(
+        &self,
+        ctx: &TenantCtx,
+        params_in: &IssueQueryParams,
+    ) -> Result<(Vec<IssueSummaryDto>, i64, i64), String> {
         let org_id = ctx.organization_id;
         let org_slug = ctx.organization_slug.clone();
         let p = params_in.clone();
@@ -1685,7 +1775,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_issue(&self, ctx: &TenantCtx, issue_id: i64) -> Result<Option<IssueSummaryDto>, String> {
+    async fn get_issue(
+        &self,
+        ctx: &TenantCtx,
+        issue_id: i64,
+    ) -> Result<Option<IssueSummaryDto>, String> {
         let org_id = ctx.organization_id;
         let org_slug = ctx.organization_slug.clone();
         self.read(move |conn| {
@@ -1746,7 +1840,7 @@ impl StorageBackend for SqliteStorage {
                     .execute(
                         "UPDATE issues
                          SET status = ?1,
-                             resolved_in_release = CASE WHEN ?1 = 'resolved' THEN COALESCE(?2, last_release) ELSE NULL END,
+                             resolved_in_release = CASE WHEN ?1 = 'resolved' THEN ?2 ELSE NULL END,
                              is_regression = CASE WHEN ?1 = 'resolved' THEN 0 ELSE is_regression END
                          WHERE id = ?3 AND organization_id = ?4",
                         params![status_s, rel, issue_id, org_id],
@@ -1761,7 +1855,12 @@ impl StorageBackend for SqliteStorage {
         self.get_issue(ctx, issue_id).await
     }
 
-    async fn list_issue_events(&self, ctx: &TenantCtx, issue_id: i64, limit: i64) -> Result<Vec<IssueEventDetailDto>, String> {
+    async fn list_issue_events(
+        &self,
+        ctx: &TenantCtx,
+        issue_id: i64,
+        limit: i64,
+    ) -> Result<Vec<IssueEventDetailDto>, String> {
         let org_id = ctx.organization_id;
         let lim = limit.clamp(1, 100);
         self.read(move |conn| {
@@ -1780,7 +1879,8 @@ impl StorageBackend for SqliteStorage {
                     let blob: Vec<u8> = r.get(11)?;
                     let comp: i64 = r.get(12)?;
                     let decoded = decompress_payload(&blob, comp != 0).unwrap_or(blob);
-                    let payload: Value = serde_json::from_slice(&decoded).unwrap_or_else(|_| json!({}));
+                    let payload: Value =
+                        serde_json::from_slice(&decoded).unwrap_or_else(|_| json!({}));
                     Ok(IssueEventDetailDto {
                         id: r.get(0)?,
                         event_id: r.get(1)?,
@@ -1806,7 +1906,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_issue_event(&self, ctx: &TenantCtx, issue_id: i64, event_id_or_latest: &str) -> Result<Option<IssueEventDetailDto>, String> {
+    async fn get_issue_event(
+        &self,
+        ctx: &TenantCtx,
+        issue_id: i64,
+        event_id_or_latest: &str,
+    ) -> Result<Option<IssueEventDetailDto>, String> {
         let org_id = ctx.organization_id;
         let target = event_id_or_latest.to_string();
         self.read(move |conn| {
@@ -1829,7 +1934,8 @@ impl StorageBackend for SqliteStorage {
                     let blob: Vec<u8> = r.get(11)?;
                     let comp: i64 = r.get(12)?;
                     let decoded = decompress_payload(&blob, comp != 0).unwrap_or(blob);
-                    let payload: Value = serde_json::from_slice(&decoded).unwrap_or_else(|_| json!({}));
+                    let payload: Value =
+                        serde_json::from_slice(&decoded).unwrap_or_else(|_| json!({}));
                     Ok(IssueEventDetailDto {
                         id: r.get(0)?,
                         event_id: r.get(1)?,
@@ -1852,7 +1958,8 @@ impl StorageBackend for SqliteStorage {
                     let blob: Vec<u8> = r.get(11)?;
                     let comp: i64 = r.get(12)?;
                     let decoded = decompress_payload(&blob, comp != 0).unwrap_or(blob);
-                    let payload: Value = serde_json::from_slice(&decoded).unwrap_or_else(|_| json!({}));
+                    let payload: Value =
+                        serde_json::from_slice(&decoded).unwrap_or_else(|_| json!({}));
                     Ok(IssueEventDetailDto {
                         id: r.get(0)?,
                         event_id: r.get(1)?,
@@ -1875,7 +1982,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn query_logs(&self, ctx: &TenantCtx, params_in: &LogQueryParams) -> Result<Vec<LogEventDto>, String> {
+    async fn query_logs(
+        &self,
+        ctx: &TenantCtx,
+        params_in: &LogQueryParams,
+    ) -> Result<Vec<LogEventDto>, String> {
         let org_id = ctx.organization_id;
         let p = params_in.clone();
         self.read(move |conn| {
@@ -2011,7 +2122,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_log_stats(&self, ctx: &TenantCtx, since_ms: i64, until_ms: i64) -> Result<Value, String> {
+    async fn get_log_stats(
+        &self,
+        ctx: &TenantCtx,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Value, String> {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
@@ -2023,8 +2139,11 @@ impl StorageBackend for SqliteStorage {
                      ORDER BY b ASC",
                 )
                 .map_err(map_sqlite_err)?;
-            let mut rows = stmt.query(params![org_id, since_ms, until_ms]).map_err(map_sqlite_err)?;
-            let mut buckets: std::collections::BTreeMap<i64, [i64; 6]> = std::collections::BTreeMap::new();
+            let mut rows = stmt
+                .query(params![org_id, since_ms, until_ms])
+                .map_err(map_sqlite_err)?;
+            let mut buckets: std::collections::BTreeMap<i64, [i64; 6]> =
+                std::collections::BTreeMap::new();
             while let Some(r) = rows.next().map_err(map_sqlite_err)? {
                 let b: i64 = r.get(0).map_err(map_sqlite_err)?;
                 let lvl: i32 = r.get(1).map_err(map_sqlite_err)?;
@@ -2055,7 +2174,13 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_stats_v2(&self, ctx: &TenantCtx, category: &str, since_ms: i64, until_ms: i64) -> Result<Value, String> {
+    async fn get_stats_v2(
+        &self,
+        ctx: &TenantCtx,
+        category: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Value, String> {
         let org_id = ctx.organization_id;
         let cat = category.to_string();
         self.read(move |conn| {
@@ -2092,7 +2217,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_transactions(&self, ctx: &TenantCtx, since_ms: i64) -> Result<Vec<TransactionSummaryDto>, String> {
+    async fn list_transactions(
+        &self,
+        ctx: &TenantCtx,
+        since_ms: i64,
+    ) -> Result<Vec<TransactionSummaryDto>, String> {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
@@ -2103,7 +2232,9 @@ impl StorageBackend for SqliteStorage {
                      ORDER BY timestamp_ms DESC LIMIT 2000",
                 )
                 .map_err(map_sqlite_err)?;
-            let mut rows = stmt.query(params![org_id, since_ms]).map_err(map_sqlite_err)?;
+            let mut rows = stmt
+                .query(params![org_id, since_ms])
+                .map_err(map_sqlite_err)?;
             struct Acc {
                 op: String,
                 durations: Vec<f64>,
@@ -2134,11 +2265,16 @@ impl StorageBackend for SqliteStorage {
             let mut out: Vec<TransactionSummaryDto> = map
                 .into_iter()
                 .map(|(name, mut acc)| {
-                    acc.durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    acc.durations
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let n = acc.durations.len();
                     let p50 = acc.durations.get(n / 2).copied().unwrap_or(0.0);
                     let p95 = acc.durations.get((n * 95) / 100).copied().unwrap_or(p50);
-                    let avg = if n == 0 { 0.0 } else { acc.durations.iter().sum::<f64>() / n as f64 };
+                    let avg = if n == 0 {
+                        0.0
+                    } else {
+                        acc.durations.iter().sum::<f64>() / n as f64
+                    };
                     TransactionSummaryDto {
                         name,
                         op: acc.op,
@@ -2151,7 +2287,7 @@ impl StorageBackend for SqliteStorage {
                     }
                 })
                 .collect();
-            out.sort_by(|a, b| b.count.cmp(&a.count));
+            out.sort_by_key(|t| std::cmp::Reverse(t.count));
             Ok(out)
         })
         .await
@@ -2305,19 +2441,15 @@ impl StorageBackend for SqliteStorage {
     async fn save_source_map(
         &self,
         ctx: &TenantCtx,
-        project_slug: &str,
-        release_version: &str,
-        debug_id: &str,
-        filename: &str,
-        blob_sha256: &str,
-        size_bytes: i64,
+        input: &SaveSourceMapInput<'_>,
     ) -> Result<SourceMapRecord, String> {
         let org_id = ctx.organization_id;
-        let pslug = project_slug.to_string();
-        let rel = release_version.to_string();
-        let did = debug_id.to_string();
-        let fname = filename.to_string();
-        let bsha = blob_sha256.to_string();
+        let pslug = input.project_slug.to_string();
+        let rel = input.release_version.to_string();
+        let did = input.debug_id.to_string();
+        let fname = input.filename.to_string();
+        let bsha = input.blob_sha256.to_string();
+        let size_bytes = input.size_bytes;
         self.write(move |conn| {
             let pid: i64 = conn
                 .query_row(
@@ -2384,15 +2516,42 @@ impl StorageBackend for SqliteStorage {
             }
             let map_name = format!("{fname}.map");
             let rel_s = rel.unwrap_or_default();
+            if !rel_s.is_empty() {
+                if let Some(rec) = conn
+                    .query_row(
+                        "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
+                         FROM source_maps
+                         WHERE organization_id = ?1 AND project_id = ?2
+                           AND (filename = ?3 OR filename = ?4)
+                           AND (release_version = ?5 OR release_version = '')
+                         ORDER BY CASE WHEN release_version = ?5 THEN 0 ELSE 1 END, id DESC
+                         LIMIT 1",
+                        params![organization_id, project_id, map_name, fname, rel_s],
+                        |r| {
+                            Ok(SourceMapRecord {
+                                id: r.get(0)?,
+                                release_version: r.get(1)?,
+                                debug_id: r.get(2)?,
+                                filename: r.get(3)?,
+                                blob_sha256: r.get(4)?,
+                                size_bytes: r.get(5)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(map_sqlite_err)?
+                {
+                    return Ok(Some(rec));
+                }
+            }
             conn.query_row(
                 "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
                  FROM source_maps
                  WHERE organization_id = ?1 AND project_id = ?2
                    AND (filename = ?3 OR filename = ?4)
-                   AND (release_version = ?5 OR release_version = '')
-                 ORDER BY CASE WHEN release_version = ?5 THEN 0 ELSE 1 END, id DESC
+                 ORDER BY CASE WHEN release_version = '' THEN 0 ELSE 1 END, id DESC
                  LIMIT 1",
-                params![organization_id, project_id, map_name, fname, rel_s],
+                params![organization_id, project_id, map_name, fname],
                 |r| {
                     Ok(SourceMapRecord {
                         id: r.get(0)?,
@@ -2504,7 +2663,13 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn record_heartbeat(&self, ctx: &TenantCtx, uuid: &str, is_up: bool, message: &str) -> Result<Option<UptimeMonitorDto>, String> {
+    async fn record_heartbeat(
+        &self,
+        ctx: &TenantCtx,
+        uuid: &str,
+        is_up: bool,
+        message: &str,
+    ) -> Result<Option<UptimeMonitorDto>, String> {
         let org_id = ctx.organization_id;
         let uuid = uuid.to_string();
         let msg = message.to_string();
@@ -2551,7 +2716,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_heartbeat(&self, ctx: &TenantCtx, uuid: &str) -> Result<Option<UptimeMonitorDto>, String> {
+    async fn get_heartbeat(
+        &self,
+        ctx: &TenantCtx,
+        uuid: &str,
+    ) -> Result<Option<UptimeMonitorDto>, String> {
         let org_id = ctx.organization_id;
         let uuid = uuid.to_string();
         self.read(move |conn| {
@@ -2620,7 +2789,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn create_alert_rule(&self, ctx: &TenantCtx, rule: &NewAlertRule) -> Result<AlertRuleDto, String> {
+    async fn create_alert_rule(
+        &self,
+        ctx: &TenantCtx,
+        rule: &NewAlertRule,
+    ) -> Result<AlertRuleDto, String> {
         let org_id = ctx.organization_id;
         let r = rule.clone();
         let enc_secret = seal_secret(&self.app_key, &webhook_aad(org_id), &r.webhook_secret)?;
@@ -2681,11 +2854,22 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<AlertRuleDto>, String> {
-        Ok(self.get_alert_rule_for_dispatch(ctx, rule_id).await?.map(|(dto, _)| dto))
+    async fn get_alert_rule(
+        &self,
+        ctx: &TenantCtx,
+        rule_id: i64,
+    ) -> Result<Option<AlertRuleDto>, String> {
+        Ok(self
+            .get_alert_rule_for_dispatch(ctx, rule_id)
+            .await?
+            .map(|(dto, _)| dto))
     }
 
-    async fn get_alert_rule_for_dispatch(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<(AlertRuleDto, String)>, String> {
+    async fn get_alert_rule_for_dispatch(
+        &self,
+        ctx: &TenantCtx,
+        rule_id: i64,
+    ) -> Result<Option<(AlertRuleDto, String)>, String> {
         let org_id = ctx.organization_id;
         let app_key = self.app_key;
         self.read(move |conn| {
@@ -2756,23 +2940,39 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
+    async fn get_api_token_role(
+        &self,
+        ctx: &TenantCtx,
+        token_id: i64,
+    ) -> Result<Option<UserRole>, String> {
+        let org_id = ctx.organization_id;
+        self.read(move |conn| {
+            let role_str: Option<String> = conn
+                .query_row(
+                    "SELECT role FROM api_tokens WHERE id = ?1 AND organization_id = ?2",
+                    params![token_id, org_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_sqlite_err)?;
+            Ok(role_str.as_deref().and_then(UserRole::from_db))
+        })
+        .await
+    }
+
     async fn create_api_token(
         &self,
         ctx: &TenantCtx,
-        name: &str,
-        token_sha256: &str,
-        token_prefix: &str,
-        role: UserRole,
-        scopes: &str,
-        expires_at: Option<i64>,
+        input: &NewApiTokenInput<'_>,
     ) -> Result<ApiTokenDto, String> {
         let org_id = ctx.organization_id;
         let user_id = ctx.user_id.ok_or("Missing actor user_id")?;
-        let name = name.to_string();
-        let sha = token_sha256.to_string();
-        let pref = token_prefix.to_string();
-        let role_s = role.as_str().to_string();
-        let scopes_s = scopes.to_string();
+        let name = input.name.to_string();
+        let sha = input.token_sha256.to_string();
+        let pref = input.token_prefix.to_string();
+        let role_s = input.role.as_str().to_string();
+        let scopes_s = input.scopes.to_string();
+        let expires_at = input.expires_at;
         self.write(move |conn| {
             let now = now_ms();
             conn.execute(
@@ -2872,12 +3072,16 @@ impl StorageBackend for SqliteStorage {
                     tx.last_insert_rowid()
                 }
             };
-            tx.execute(
-                "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(organization_id, user_id) DO UPDATE SET role = ?3",
-                params![org_id, uid, role_s],
-            )
-            .map_err(map_sqlite_err)?;
+            let added = tx
+                .execute(
+                    "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(organization_id, user_id) DO NOTHING",
+                    params![org_id, uid, role_s],
+                )
+                .map_err(map_sqlite_err)?;
+            if added == 0 {
+                return Err("ALREADY_MEMBER".into());
+            }
             tx.commit().map_err(map_sqlite_err)?;
             Ok(MemberDto {
                 user_id: uid,
@@ -2890,7 +3094,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn update_member_role(&self, ctx: &TenantCtx, target_user_id: i64, role: UserRole) -> Result<Result<MemberDto, String>, String> {
+    async fn update_member_role(
+        &self,
+        ctx: &TenantCtx,
+        target_user_id: i64,
+        role: UserRole,
+    ) -> Result<Result<MemberDto, String>, String> {
         let org_id = ctx.organization_id;
         let role_s = role.as_str().to_string();
         self.write(move |conn| {
@@ -2967,7 +3176,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn remove_member(&self, ctx: &TenantCtx, target_user_id: i64) -> Result<Result<bool, String>, String> {
+    async fn remove_member(
+        &self,
+        ctx: &TenantCtx,
+        target_user_id: i64,
+    ) -> Result<Result<bool, String>, String> {
         let org_id = ctx.organization_id;
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
@@ -3092,7 +3305,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn flush_ingest_batch(&self, items: Vec<IngestWriteItem>) -> Result<Vec<AlertDispatchJob>, String> {
+    async fn flush_ingest_batch(
+        &self,
+        items: Vec<IngestWriteItem>,
+    ) -> Result<Vec<AlertDispatchJob>, String> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -3149,15 +3365,17 @@ impl StorageBackend for SqliteStorage {
                             let jobs = build_alert_jobs_for_event(
                                 &tx,
                                 &app_key,
-                                auth.organization_id,
-                                auth.project_id,
-                                &auth.project_slug,
-                                &short_id,
-                                &meta.title,
-                                &meta.level,
-                                is_new,
-                                is_reg,
-                                now_sec,
+                                &EventAlertContext {
+                                    organization_id: auth.organization_id,
+                                    project_id: auth.project_id,
+                                    project_slug: &auth.project_slug,
+                                    short_id: &short_id,
+                                    title: &meta.title,
+                                    level: &meta.level,
+                                    is_new_issue: is_new,
+                                    is_regression: is_reg,
+                                    now_sec,
+                                },
                             )?;
                             alert_jobs.extend(jobs);
                         }
@@ -3260,15 +3478,17 @@ impl StorageBackend for SqliteStorage {
                                         let jobs = build_alert_jobs_for_event(
                                             &tx,
                                             &app_key,
-                                            organization_id,
-                                            project_id,
-                                            &project_slug,
-                                            &short_id,
-                                            &meta.title,
-                                            l.level.as_str(),
-                                            is_new,
-                                            is_reg,
-                                            now_sec,
+                                            &EventAlertContext {
+                                                organization_id,
+                                                project_id,
+                                                project_slug: &project_slug,
+                                                short_id: &short_id,
+                                                title: &meta.title,
+                                                level: l.level.as_str(),
+                                                is_new_issue: is_new,
+                                                is_regression: is_reg,
+                                                now_sec,
+                                            },
                                         )?;
                                         alert_jobs.extend(jobs);
                                         fatal_alert_checked = true;
@@ -3279,15 +3499,17 @@ impl StorageBackend for SqliteStorage {
                                 let jobs = build_alert_jobs_for_event(
                                     &tx,
                                     &app_key,
-                                    organization_id,
-                                    project_id,
-                                    &project_slug,
-                                    "LOG",
-                                    &l.body,
-                                    "fatal",
-                                    false,
-                                    false,
-                                    now_sec,
+                                    &EventAlertContext {
+                                        organization_id,
+                                        project_id,
+                                        project_slug: &project_slug,
+                                        short_id: "LOG",
+                                        title: &l.body,
+                                        level: "fatal",
+                                        is_new_issue: false,
+                                        is_regression: false,
+                                        now_sec,
+                                    },
                                 )?;
                                 alert_jobs.extend(jobs);
                             }
@@ -3345,11 +3567,14 @@ impl StorageBackend for SqliteStorage {
                     IngestWriteItem::CheckIn { organization_id, project_id, check_in, received_ms } => {
                         let is_up = check_in.status != "error";
                         let status = if is_up { "up" } else { "down" };
-                        if let Some(mon_id) = tx
+                        if let Some((mon_id, mon_uuid, mon_name, proj_slug)) = tx
                             .query_row(
-                                "SELECT id FROM uptime_monitors WHERE organization_id = ?1 AND project_id = ?2 AND (uuid = ?3 OR name = ?3)",
+                                "SELECT m.id, m.uuid, m.name, p.slug
+                                 FROM uptime_monitors m
+                                 JOIN projects p ON p.id = m.project_id
+                                 WHERE m.organization_id = ?1 AND m.project_id = ?2 AND (m.uuid = ?3 OR m.name = ?3)",
                                 params![organization_id, project_id, check_in.monitor_slug],
-                                |r| r.get::<_, i64>(0),
+                                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)),
                             )
                             .optional()
                             .map_err(map_sqlite_err)?
@@ -3365,6 +3590,54 @@ impl StorageBackend for SqliteStorage {
                                 params![organization_id, mon_id, if is_up { 1 } else { 0 }, check_in.duration_ms, received_ms],
                             )
                             .map_err(map_sqlite_err)?;
+                            if !is_up {
+                                let mut rstmt = tx
+                                    .prepare(
+                                        "SELECT id, name, channel_type, target_url, webhook_secret, email_to, cooldown_sec, last_triggered_at
+                                         FROM alert_rules
+                                         WHERE organization_id = ?1 AND project_id = ?2 AND is_active = 1 AND trigger_type = 'uptime_down'",
+                                    )
+                                    .map_err(map_sqlite_err)?;
+                                let mut rrows = rstmt
+                                    .query(params![organization_id, project_id])
+                                    .map_err(map_sqlite_err)?;
+                                let mut fired = Vec::new();
+                                while let Some(rr) = rrows.next().map_err(map_sqlite_err)? {
+                                    let rid: i64 = rr.get(0).map_err(map_sqlite_err)?;
+                                    let cd: i64 = rr.get(6).map_err(map_sqlite_err)?;
+                                    let lt: Option<i64> = rr.get(7).map_err(map_sqlite_err)?;
+                                    if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                                        fired.push(rid);
+                                        alert_jobs.push(AlertDispatchJob {
+                                            organization_id,
+                                            rule_id: rid,
+                                            rule_name: rr.get(1).map_err(map_sqlite_err)?,
+                                            channel_type: rr.get(2).map_err(map_sqlite_err)?,
+                                            target_url: rr.get(3).map_err(map_sqlite_err)?,
+                                            webhook_secret: open_webhook_secret(
+                                                &app_key,
+                                                organization_id,
+                                                &rr.get::<_, String>(4).map_err(map_sqlite_err)?,
+                                            ),
+                                            email_to: rr.get(5).map_err(map_sqlite_err)?,
+                                            title: format!("Uptime check-in failed: {mon_name}"),
+                                            message: format!("Cron/check-in error reported for monitor {mon_uuid}"),
+                                            level: "fatal".into(),
+                                            project_slug: proj_slug.clone(),
+                                            short_id: None,
+                                        });
+                                    }
+                                }
+                                drop(rrows);
+                                drop(rstmt);
+                                for rid in fired {
+                                    tx.execute(
+                                        "UPDATE alert_rules SET last_triggered_at = ?1 WHERE id = ?2 AND organization_id = ?3",
+                                        params![now_sec, rid, organization_id],
+                                    )
+                                    .map_err(map_sqlite_err)?;
+                                }
+                            }
                         }
                     }
                 }
@@ -3426,7 +3699,11 @@ impl StorageBackend for SqliteStorage {
         .map_err(|e| format!("Batch flush join: {e}"))?
     }
 
-    async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String> {
+    async fn run_maintenance(
+        &self,
+        retention_days: u32,
+        max_db_mb: u64,
+    ) -> Result<Vec<AlertDispatchJob>, String> {
         let size_bytes = self.db_size_bytes().await;
         let app_key = self.app_key;
         self.write(move |conn| {
@@ -3552,6 +3829,7 @@ impl StorageBackend for SqliteStorage {
                     if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
                         fired.push(rid);
                         alerts.push(AlertDispatchJob {
+                            organization_id: org_id,
                             rule_id: rid,
                             rule_name: rr.get(1).map_err(map_sqlite_err)?,
                             channel_type: rr.get(2).map_err(map_sqlite_err)?,
@@ -3600,13 +3878,18 @@ impl StorageBackend for SqliteStorage {
     }
 
     async fn db_size_bytes(&self) -> u64 {
-        let main = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        let mut wal_os = self.path.as_os_str().to_os_string();
-        wal_os.push("-wal");
-        let wal = std::fs::metadata(PathBuf::from(wal_os))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        main + wal
+        let p = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let main = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let mut wal_os = p.as_os_str().to_os_string();
+            wal_os.push("-wal");
+            let wal = std::fs::metadata(PathBuf::from(wal_os))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            main + wal
+        })
+        .await
+        .unwrap_or(0)
     }
 
     async fn check_health(&self) -> Result<StorageHealthInfo, String> {
@@ -3727,6 +4010,7 @@ impl StorageBackend for SqliteStorage {
                     let trig: String = r.get(2).map_err(map_sqlite_err)?;
                     fired.push(rid);
                     alerts.push(AlertDispatchJob {
+                        organization_id: ev.organization_id,
                         rule_id: rid,
                         rule_name: r.get(1).map_err(map_sqlite_err)?,
                         channel_type: r.get(4).map_err(map_sqlite_err)?,
@@ -4041,22 +4325,37 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn upsert_pending_totp(&self, user_id: i64, totp_secret_enc: &str, now_sec: i64) -> Result<(), String> {
+    async fn upsert_pending_totp(
+        &self,
+        user_id: i64,
+        totp_secret_enc: &str,
+        now_sec: i64,
+    ) -> Result<(), String> {
         let enc = totp_secret_enc.to_string();
         self.write(move |conn| {
-            conn.execute(
-                "INSERT INTO user_mfa (user_id, totp_secret_enc, is_enabled, failed_attempts, updated_at)
-                 VALUES (?1, ?2, 0, 0, ?3)
-                 ON CONFLICT(user_id) DO UPDATE SET totp_secret_enc = ?2, is_enabled = 0, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = ?3",
-                params![user_id, enc, now_sec],
-            )
-            .map_err(map_sqlite_err)?;
+            let changed = conn
+                .execute(
+                    "INSERT INTO user_mfa (user_id, totp_secret_enc, is_enabled, failed_attempts, updated_at)
+                     VALUES (?1, ?2, 0, 0, ?3)
+                     ON CONFLICT(user_id) DO UPDATE SET totp_secret_enc = ?2, is_enabled = 0, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = ?3
+                     WHERE user_mfa.is_enabled = 0",
+                    params![user_id, enc, now_sec],
+                )
+                .map_err(map_sqlite_err)?;
+            if changed == 0 {
+                return Err("MFA_ALREADY_ENABLED".into());
+            }
             Ok(())
         })
         .await
     }
 
-    async fn enable_totp_with_recovery_codes(&self, user_id: i64, code_hashes: &[String], now_sec: i64) -> Result<(), String> {
+    async fn enable_totp_with_recovery_codes(
+        &self,
+        user_id: i64,
+        code_hashes: &[String],
+        now_sec: i64,
+    ) -> Result<(), String> {
         let hashes = code_hashes.to_vec();
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
@@ -4098,7 +4397,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn replace_recovery_codes(&self, user_id: i64, code_hashes: &[String], _now_sec: i64) -> Result<(), String> {
+    async fn replace_recovery_codes(
+        &self,
+        user_id: i64,
+        code_hashes: &[String],
+        _now_sec: i64,
+    ) -> Result<(), String> {
         let hashes = code_hashes.to_vec();
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
@@ -4118,15 +4422,33 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn record_mfa_attempt(&self, user_id: i64, success_step: Option<i64>, now_sec: i64) -> Result<Option<i64>, String> {
+    async fn record_mfa_attempt(
+        &self,
+        user_id: i64,
+        success_step: Option<i64>,
+        now_sec: i64,
+    ) -> Result<Option<i64>, String> {
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
             if let Some(step) = success_step {
-                tx.execute(
-                    "UPDATE user_mfa SET last_used_step = ?1, failed_attempts = 0, locked_until = NULL, updated_at = ?2 WHERE user_id = ?3",
-                    params![step, now_sec, user_id],
-                )
-                .map_err(map_sqlite_err)?;
+                let changed = if step > 0 {
+                    tx.execute(
+                        "UPDATE user_mfa
+                         SET last_used_step = ?1, failed_attempts = 0, locked_until = NULL, updated_at = ?2
+                         WHERE user_id = ?3 AND (last_used_step IS NULL OR last_used_step < ?1)",
+                        params![step, now_sec, user_id],
+                    )
+                    .map_err(map_sqlite_err)?
+                } else {
+                    tx.execute(
+                        "UPDATE user_mfa SET failed_attempts = 0, locked_until = NULL, updated_at = ?1 WHERE user_id = ?2",
+                        params![now_sec, user_id],
+                    )
+                    .map_err(map_sqlite_err)?
+                };
+                if step > 0 && changed == 0 {
+                    return Err("TOTP_STEP_REUSED".into());
+                }
                 tx.commit().map_err(map_sqlite_err)?;
                 return Ok(None);
             }
@@ -4155,7 +4477,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_unused_recovery_codes(&self, user_id: i64) -> Result<Vec<RecoveryCodeRecord>, String> {
+    async fn list_unused_recovery_codes(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<RecoveryCodeRecord>, String> {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare("SELECT id, code_hash FROM user_mfa_recovery_codes WHERE user_id = ?1 AND used_at IS NULL")
@@ -4170,7 +4495,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn mark_recovery_code_used(&self, user_id: i64, code_id: i64, now_sec: i64) -> Result<bool, String> {
+    async fn mark_recovery_code_used(
+        &self,
+        user_id: i64,
+        code_id: i64,
+        now_sec: i64,
+    ) -> Result<bool, String> {
         self.write(move |conn| {
             let changed = conn
                 .execute(
@@ -4183,7 +4513,14 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn create_mfa_challenge(&self, token_sha256: &str, user_id: i64, target_org_id: i64, ip_hmac: &str, expires_at: i64) -> Result<(), String> {
+    async fn create_mfa_challenge(
+        &self,
+        token_sha256: &str,
+        user_id: i64,
+        target_org_id: i64,
+        ip_hmac: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
         let sha = token_sha256.to_string();
         let iph = ip_hmac.to_string();
         self.write(move |conn| {
@@ -4198,7 +4535,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn consume_mfa_challenge(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String> {
+    async fn consume_mfa_challenge(
+        &self,
+        token_sha256: &str,
+        now_sec: i64,
+    ) -> Result<Option<MfaChallengeRecord>, String> {
         let sha = token_sha256.to_string();
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
@@ -4230,7 +4571,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_mfa_challenge_user(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String> {
+    async fn get_mfa_challenge_user(
+        &self,
+        token_sha256: &str,
+        now_sec: i64,
+    ) -> Result<Option<MfaChallengeRecord>, String> {
         let sha = token_sha256.to_string();
         self.read(move |conn| {
             conn.query_row(
@@ -4251,7 +4596,13 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn save_webauthn_challenge(&self, challenge_b64: &str, user_id: Option<i64>, flow_kind: &str, expires_at: i64) -> Result<(), String> {
+    async fn save_webauthn_challenge(
+        &self,
+        challenge_b64: &str,
+        user_id: Option<i64>,
+        flow_kind: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
         let cb = challenge_b64.to_string();
         let fk = flow_kind.to_string();
         self.write(move |conn| {
@@ -4265,7 +4616,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn consume_webauthn_challenge(&self, challenge_b64: &str, flow_kind: &str, now_sec: i64) -> Result<Option<WebAuthnChallengeRecord>, String> {
+    async fn consume_webauthn_challenge(
+        &self,
+        challenge_b64: &str,
+        flow_kind: &str,
+        now_sec: i64,
+    ) -> Result<Option<WebAuthnChallengeRecord>, String> {
         let cb = challenge_b64.to_string();
         let fk = flow_kind.to_string();
         self.write(move |conn| {
@@ -4298,7 +4654,15 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn create_webauthn_credential(&self, user_id: i64, name: &str, credential_id_b64: &str, cose_alg: i32, public_key_b64: &str, sign_count: u32) -> Result<PasskeyDto, String> {
+    async fn create_webauthn_credential(
+        &self,
+        user_id: i64,
+        name: &str,
+        credential_id_b64: &str,
+        cose_alg: i32,
+        public_key_b64: &str,
+        sign_count: u32,
+    ) -> Result<PasskeyDto, String> {
         let nm = name.to_string();
         let cid = credential_id_b64.to_string();
         let pk = public_key_b64.to_string();
@@ -4323,7 +4687,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_webauthn_credentials(&self, user_id: i64) -> Result<Vec<WebAuthnCredRecord>, String> {
+    async fn list_webauthn_credentials(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<WebAuthnCredRecord>, String> {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
@@ -4351,7 +4718,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn find_webauthn_credential(&self, credential_id_b64: &str) -> Result<Option<WebAuthnCredRecord>, String> {
+    async fn find_webauthn_credential(
+        &self,
+        credential_id_b64: &str,
+    ) -> Result<Option<WebAuthnCredRecord>, String> {
         let cid = credential_id_b64.to_string();
         self.read(move |conn| {
             conn.query_row(
@@ -4378,7 +4748,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn update_webauthn_sign_count(&self, cred_id: i64, sign_count: u32, now_sec: i64) -> Result<(), String> {
+    async fn update_webauthn_sign_count(
+        &self,
+        cred_id: i64,
+        sign_count: u32,
+        now_sec: i64,
+    ) -> Result<(), String> {
         self.write(move |conn| {
             conn.execute(
                 "UPDATE webauthn_credentials SET sign_count = ?1, last_used_at = ?2 WHERE id = ?3",
@@ -4403,7 +4778,13 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_user_sessions(&self, user_id: i64, org_id: i64, current_token_sha256: &str, now_sec: i64) -> Result<Vec<ActiveSessionDto>, String> {
+    async fn list_user_sessions(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        current_token_sha256: &str,
+        now_sec: i64,
+    ) -> Result<Vec<ActiveSessionDto>, String> {
         let cur = current_token_sha256.to_string();
         self.read(move |conn| {
             let mut stmt = conn
@@ -4435,7 +4816,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn revoke_session_by_id(&self, user_id: i64, org_id: i64, session_id: i64) -> Result<bool, String> {
+    async fn revoke_session_by_id(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        session_id: i64,
+    ) -> Result<bool, String> {
         self.write(move |conn| {
             let changed = conn
                 .execute(
@@ -4448,7 +4834,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn revoke_other_sessions(&self, user_id: i64, org_id: i64, keep_token_sha256: &str) -> Result<usize, String> {
+    async fn revoke_other_sessions(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        keep_token_sha256: &str,
+    ) -> Result<usize, String> {
         let keep = keep_token_sha256.to_string();
         self.write(move |conn| {
             conn.execute(
@@ -4460,7 +4851,12 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn mark_session_reauth(&self, token_sha256: &str, org_id: i64, now_sec: i64) -> Result<(), String> {
+    async fn mark_session_reauth(
+        &self,
+        token_sha256: &str,
+        org_id: i64,
+        now_sec: i64,
+    ) -> Result<(), String> {
         let sha = token_sha256.to_string();
         self.write(move |conn| {
             conn.execute(
@@ -4473,7 +4869,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn find_user_password_hash(&self, user_id: i64) -> Result<Option<(String, String, String)>, String> {
+    async fn find_user_password_hash(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<(String, String, String)>, String> {
         self.read(move |conn| {
             conn.query_row(
                 "SELECT email, name, password_hash FROM users WHERE id = ?1 AND is_active = 1",
@@ -4486,25 +4885,17 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn change_user_password(
-        &self,
-        user_id: i64,
-        org_id: i64,
-        new_password_hash: &str,
-        old_session_sha: &str,
-        new_session_sha: &str,
-        new_csrf: &str,
-        user_agent: &str,
-        ip_hmac: &str,
-        now_sec: i64,
-        expires_at: i64,
-    ) -> Result<(), String> {
-        let npw = new_password_hash.to_string();
-        let old_s = old_session_sha.to_string();
-        let new_s = new_session_sha.to_string();
-        let csrf = new_csrf.to_string();
-        let ua = user_agent.chars().take(160).collect::<String>();
-        let iph = ip_hmac.to_string();
+    async fn change_user_password(&self, input: &PasswordChangeInput<'_>) -> Result<(), String> {
+        let user_id = input.user_id;
+        let org_id = input.org_id;
+        let npw = input.new_password_hash.to_string();
+        let old_s = input.old_session_sha.to_string();
+        let new_s = input.new_session_sha.to_string();
+        let csrf = input.new_csrf.to_string();
+        let ua = input.user_agent.chars().take(160).collect::<String>();
+        let iph = input.ip_hmac.to_string();
+        let now_sec = input.now_sec;
+        let expires_at = input.expires_at;
         self.write(move |conn| {
             let tx = conn.transaction().map_err(map_sqlite_err)?;
             tx.execute(
@@ -4527,7 +4918,14 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn create_invitation(&self, ctx: &TenantCtx, email: &str, role: UserRole, token_sha256: &str, expires_at: i64) -> Result<InvitationDto, String> {
+    async fn create_invitation(
+        &self,
+        ctx: &TenantCtx,
+        email: &str,
+        role: UserRole,
+        token_sha256: &str,
+        expires_at: i64,
+    ) -> Result<InvitationDto, String> {
         let org_id = ctx.organization_id;
         let uid = ctx.user_id;
         let email_norm = email.trim().to_ascii_lowercase();
@@ -4603,7 +5001,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn lookup_invitation(&self, token_sha256: &str) -> Result<Option<InvitationLookupInfo>, String> {
+    async fn lookup_invitation(
+        &self,
+        token_sha256: &str,
+    ) -> Result<Option<InvitationLookupInfo>, String> {
         let sha = token_sha256.to_string();
         self.read(move |conn| {
             conn.query_row(
@@ -4635,8 +5036,9 @@ impl StorageBackend for SqliteStorage {
         token_sha256: &str,
         name: &str,
         password_hash: &str,
+        authenticated_user_id: Option<i64>,
         now_sec: i64,
-    ) -> Result<Result<(i64, i64, String, String, UserRole), String>, String> {
+    ) -> Result<AcceptInvitationOutcome, String> {
         let sha = token_sha256.to_string();
         let nm = name.to_string();
         let pwh = password_hash.to_string();
@@ -4654,13 +5056,50 @@ impl StorageBackend for SqliteStorage {
                 .optional()
                 .map_err(map_sqlite_err)?;
             let Some((inv_id, org_id, org_slug, email, role_s, exp, acc)) = inv else {
-                return Ok(Err("Invitation not found".into()));
+                return Ok(AcceptInvitationOutcome::InvalidOrExpired("Invitation not found".into()));
             };
             if acc.is_some() {
-                return Ok(Err("Invitation has already been used".into()));
+                return Ok(AcceptInvitationOutcome::InvalidOrExpired("Invitation has already been used".into()));
             }
             if exp <= now_sec {
-                return Ok(Err("Invitation has expired".into()));
+                return Ok(AcceptInvitationOutcome::InvalidOrExpired("Invitation has expired".into()));
+            }
+            let existing_uid: Option<i64> = tx
+                .query_row("SELECT id FROM users WHERE email = ?1", params![email], |r| r.get(0))
+                .optional()
+                .map_err(map_sqlite_err)?;
+            let role = UserRole::from_db(&role_s).unwrap_or(UserRole::Member);
+            if let Some(uid) = existing_uid {
+                if authenticated_user_id != Some(uid) {
+                    return Ok(AcceptInvitationOutcome::ExistingAccountRequiresSignIn);
+                }
+                let added = tx
+                    .execute(
+                        "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(organization_id, user_id) DO NOTHING",
+                        params![org_id, uid, role.as_str()],
+                    )
+                    .map_err(map_sqlite_err)?;
+                if added == 0 {
+                    return Ok(AcceptInvitationOutcome::AlreadyMember);
+                }
+                let updated = tx
+                    .execute(
+                        "UPDATE org_invitations SET accepted_at = ?1 WHERE id = ?2 AND accepted_at IS NULL",
+                        params![now_sec, inv_id],
+                    )
+                    .map_err(map_sqlite_err)?;
+                if updated == 0 {
+                    return Ok(AcceptInvitationOutcome::InvalidOrExpired("Invitation already claimed".into()));
+                }
+                tx.commit().map_err(map_sqlite_err)?;
+                return Ok(AcceptInvitationOutcome::AcceptedExistingUser {
+                    user_id: uid,
+                    org_id,
+                    org_slug,
+                    email,
+                    role,
+                });
             }
             let updated = tx
                 .execute(
@@ -4669,32 +5108,28 @@ impl StorageBackend for SqliteStorage {
                 )
                 .map_err(map_sqlite_err)?;
             if updated == 0 {
-                return Ok(Err("Invitation already claimed".into()));
+                return Ok(AcceptInvitationOutcome::InvalidOrExpired("Invitation already claimed".into()));
             }
-            let existing_uid: Option<i64> = tx
-                .query_row("SELECT id FROM users WHERE email = ?1", params![email], |r| r.get(0))
-                .optional()
-                .map_err(map_sqlite_err)?;
-            let uid = match existing_uid {
-                Some(id) => id,
-                None => {
-                    tx.execute(
-                        "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
-                        params![email, nm, pwh, now_ms()],
-                    )
-                    .map_err(map_sqlite_err)?;
-                    tx.last_insert_rowid()
-                }
-            };
-            let role = UserRole::from_db(&role_s).unwrap_or(UserRole::Member);
+            tx.execute(
+                "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
+                params![email, nm, pwh, now_ms()],
+            )
+            .map_err(map_sqlite_err)?;
+            let uid = tx.last_insert_rowid();
             tx.execute(
                 "INSERT INTO organization_members (organization_id, user_id, role) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(organization_id, user_id) DO UPDATE SET role = ?3",
+                 ON CONFLICT(organization_id, user_id) DO NOTHING",
                 params![org_id, uid, role.as_str()],
             )
             .map_err(map_sqlite_err)?;
             tx.commit().map_err(map_sqlite_err)?;
-            Ok(Ok((uid, org_id, org_slug, email, role)))
+            Ok(AcceptInvitationOutcome::AcceptedNewUser {
+                user_id: uid,
+                org_id,
+                org_slug,
+                email,
+                role,
+            })
         })
         .await
     }
@@ -4715,16 +5150,16 @@ impl StorageBackend for SqliteStorage {
                 .unwrap_or_else(|| "GENESIS".to_string());
             let created_at = now_ms();
             let meta_str = serde_json::to_string(&e.metadata).unwrap_or_else(|_| "{}".into());
-            let entry_hash = compute_audit_entry_hash(
-                &prev_hash,
-                e.organization_id,
-                e.actor_user_id,
-                &e.action,
-                &e.target_type,
-                &e.target_id,
-                &e.metadata,
+            let entry_hash = compute_audit_entry_hash(&AuditEntryHashInput {
+                prev_hash: &prev_hash,
+                org_id: e.organization_id,
+                actor_user_id: e.actor_user_id,
+                action: &e.action,
+                target_type: &e.target_type,
+                target_id: &e.target_id,
+                metadata: &e.metadata,
                 created_at,
-            );
+            });
             tx.execute(
                 "INSERT INTO audit_logs (organization_id, actor_user_id, actor_email, action, target_type, target_id, ip_hmac, metadata_json, prev_hash, entry_hash, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -4740,9 +5175,17 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn list_audit_logs(&self, ctx: &TenantCtx, action_filter: Option<&str>, limit: i64, offset: i64) -> Result<Vec<AuditLogDto>, String> {
+    async fn list_audit_logs(
+        &self,
+        ctx: &TenantCtx,
+        action_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogDto>, String> {
         let org_id = ctx.organization_id;
-        let act = action_filter.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let act = action_filter
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let lim = limit.clamp(1, 200);
         let off = offset.max(0);
         self.read(move |conn| {
@@ -4782,51 +5225,61 @@ impl StorageBackend for SqliteStorage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, actor_user_id, action, target_type, target_id, metadata_json, prev_hash, entry_hash, created_at
-                     FROM audit_logs WHERE organization_id = ?1 ORDER BY id ASC",
+                     FROM audit_logs WHERE organization_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT 500",
                 )
                 .map_err(map_sqlite_err)?;
-            let mut rows = stmt.query(params![org_id]).map_err(map_sqlite_err)?;
             let mut expected_prev = "GENESIS".to_string();
             let mut count = 0usize;
-            while let Some(r) = rows.next().map_err(map_sqlite_err)? {
-                let id: i64 = r.get(0).map_err(map_sqlite_err)?;
-                let actor_uid: Option<i64> = r.get(1).map_err(map_sqlite_err)?;
-                let action: String = r.get(2).map_err(map_sqlite_err)?;
-                let target_type: String = r.get(3).map_err(map_sqlite_err)?;
-                let target_id: String = r.get(4).map_err(map_sqlite_err)?;
-                let metadata_json: String = r.get(5).map_err(map_sqlite_err)?;
-                let prev_hash: String = r.get(6).map_err(map_sqlite_err)?;
-                let entry_hash: String = r.get(7).map_err(map_sqlite_err)?;
-                let created_at: i64 = r.get(8).map_err(map_sqlite_err)?;
-                count += 1;
-                if prev_hash != expected_prev {
-                    return Ok(AuditVerifyDto {
-                        valid: false,
-                        checked_entries: count,
-                        broken_at_id: Some(id),
-                        detail: format!("Previous hash link mismatch at audit_logs.id={id}"),
+            let mut last_id = 0i64;
+            loop {
+                let mut rows = stmt.query(params![org_id, last_id]).map_err(map_sqlite_err)?;
+                let mut batch_len = 0usize;
+                while let Some(r) = rows.next().map_err(map_sqlite_err)? {
+                    batch_len += 1;
+                    let id: i64 = r.get(0).map_err(map_sqlite_err)?;
+                    last_id = id;
+                    let actor_uid: Option<i64> = r.get(1).map_err(map_sqlite_err)?;
+                    let action: String = r.get(2).map_err(map_sqlite_err)?;
+                    let target_type: String = r.get(3).map_err(map_sqlite_err)?;
+                    let target_id: String = r.get(4).map_err(map_sqlite_err)?;
+                    let metadata_json: String = r.get(5).map_err(map_sqlite_err)?;
+                    let prev_hash: String = r.get(6).map_err(map_sqlite_err)?;
+                    let entry_hash: String = r.get(7).map_err(map_sqlite_err)?;
+                    let created_at: i64 = r.get(8).map_err(map_sqlite_err)?;
+                    count += 1;
+                    if prev_hash != expected_prev {
+                        return Ok(AuditVerifyDto {
+                            valid: false,
+                            checked_entries: count,
+                            broken_at_id: Some(id),
+                            detail: format!("Previous hash link mismatch at audit_logs.id={id}"),
+                        });
+                    }
+                    let meta_val: Value =
+                        serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({}));
+                    let recomputed = compute_audit_entry_hash(&AuditEntryHashInput {
+                        prev_hash: &prev_hash,
+                        org_id,
+                        actor_user_id: actor_uid,
+                        action: &action,
+                        target_type: &target_type,
+                        target_id: &target_id,
+                        metadata: &meta_val,
+                        created_at,
                     });
+                    if recomputed != entry_hash {
+                        return Ok(AuditVerifyDto {
+                            valid: false,
+                            checked_entries: count,
+                            broken_at_id: Some(id),
+                            detail: format!("SHA-256 tamper detected at audit_logs.id={id}"),
+                        });
+                    }
+                    expected_prev = entry_hash;
                 }
-                let meta_val: Value = serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({}));
-                let recomputed = compute_audit_entry_hash(
-                    &prev_hash,
-                    org_id,
-                    actor_uid,
-                    &action,
-                    &target_type,
-                    &target_id,
-                    &meta_val,
-                    created_at,
-                );
-                if recomputed != entry_hash {
-                    return Ok(AuditVerifyDto {
-                        valid: false,
-                        checked_entries: count,
-                        broken_at_id: Some(id),
-                        detail: format!("SHA-256 tamper detected at audit_logs.id={id}"),
-                    });
+                if batch_len < 500 {
+                    break;
                 }
-                expected_prev = entry_hash;
             }
             Ok(AuditVerifyDto {
                 valid: true,
@@ -4842,7 +5295,10 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn get_org_security_settings(&self, ctx: &TenantCtx) -> Result<OrgSecuritySettings, String> {
+    async fn get_org_security_settings(
+        &self,
+        ctx: &TenantCtx,
+    ) -> Result<OrgSecuritySettings, String> {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let s: String = conn
@@ -4857,7 +5313,11 @@ impl StorageBackend for SqliteStorage {
         .await
     }
 
-    async fn update_org_security_settings(&self, ctx: &TenantCtx, settings: &OrgSecuritySettings) -> Result<OrgSecuritySettings, String> {
+    async fn update_org_security_settings(
+        &self,
+        ctx: &TenantCtx,
+        settings: &OrgSecuritySettings,
+    ) -> Result<OrgSecuritySettings, String> {
         let org_id = ctx.organization_id;
         let mut clean = settings.clone();
         clean.event_throttle_rate = clean.event_throttle_rate.min(100);

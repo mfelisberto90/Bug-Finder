@@ -2,19 +2,24 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
-    Serve { desktop_app: bool },
+    Serve {
+        desktop_app: bool,
+    },
     Migrate,
-    Backup { out_path: PathBuf },
+    Backup {
+        out_path: PathBuf,
+    },
     Doctor {
         url: Option<String>,
         json: bool,
     },
-    Healthcheck { url: String },
+    Healthcheck {
+        url: String,
+    },
     Tail {
         base_url: String,
         token: String,
@@ -27,8 +32,12 @@ pub enum CliCommand {
         org: String,
         token: Option<String>,
     },
-    TestEvent { dsn: String },
-    TestLog { dsn: String },
+    TestEvent {
+        dsn: String,
+    },
+    TestLog {
+        dsn: String,
+    },
     Init {
         dir: PathBuf,
         dsn: String,
@@ -68,8 +77,12 @@ impl CidrBlock {
             return Err("Wildcard '*' in BUGFINDER_TRUSTED_PROXIES is forbidden".into());
         }
         if let Some((ip_part, mask_part)) = s.split_once('/') {
-            let ip: IpAddr = ip_part.parse().map_err(|e| format!("Invalid CIDR IP '{s}': {e}"))?;
-            let prefix: u8 = mask_part.parse().map_err(|e| format!("Invalid CIDR mask '{s}': {e}"))?;
+            let ip: IpAddr = ip_part
+                .parse()
+                .map_err(|e| format!("Invalid CIDR IP '{s}': {e}"))?;
+            let prefix: u8 = mask_part
+                .parse()
+                .map_err(|e| format!("Invalid CIDR mask '{s}': {e}"))?;
             let max_bits = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
@@ -77,14 +90,22 @@ impl CidrBlock {
             if prefix > max_bits {
                 return Err(format!("CIDR prefix out of range in '{s}'"));
             }
-            Ok(Self { network: ip, prefix })
+            Ok(Self {
+                network: ip,
+                prefix,
+            })
         } else {
-            let ip: IpAddr = s.parse().map_err(|e| format!("Invalid proxy IP '{s}': {e}"))?;
+            let ip: IpAddr = s
+                .parse()
+                .map_err(|e| format!("Invalid proxy IP '{s}': {e}"))?;
             let prefix = match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
             };
-            Ok(Self { network: ip, prefix })
+            Ok(Self {
+                network: ip,
+                prefix,
+            })
         }
     }
 
@@ -192,6 +213,7 @@ pub struct AppConfig {
     pub max_db_mb: u64,
     pub retention_days: u32,
     pub trusted_proxies: Vec<CidrBlock>,
+    pub trust_cf_header: bool,
     pub allowed_hosts: Vec<String>,
     pub public_url: Option<String>,
     pub session_ttl_sec: i64,
@@ -245,17 +267,11 @@ impl AppConfig {
         let is_loopback_bind = bind_addr.starts_with("127.0.0.1:")
             || bind_addr.starts_with("localhost:")
             || bind_addr.starts_with("[::1]:");
-        let is_dev = match env::var("BUGFINDER_ENV") {
-            Ok(v) => v.eq_ignore_ascii_case("dev") || v.eq_ignore_ascii_case("development"),
-            Err(_) => desktop_app_mode || is_loopback_bind,
-        };
-
-        let app_key = load_or_create_app_key(&data_dir)?;
 
         let max_unzipped_bytes = env::var("BUGFINDER_MAX_UNZIPPED_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v >= 4096 && v <= 32 * 1024 * 1024)
+            .filter(|&v| (4096..=32 * 1024 * 1024).contains(&v))
             .unwrap_or(2 * 1024 * 1024);
 
         let max_db_mb = env::var("BUGFINDER_MAX_DB_MB")
@@ -271,8 +287,14 @@ impl AppConfig {
             .unwrap_or(30);
 
         let mut trusted_proxies = Vec::new();
+        let mut trust_cf_header = env::var("BUGFINDER_TRUST_CF_HEADER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         if let Ok(raw) = env::var("BUGFINDER_TRUSTED_PROXIES") {
             for part in raw.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                if part.eq_ignore_ascii_case("cloudflare") {
+                    trust_cf_header = true;
+                }
                 trusted_proxies.extend(CidrBlock::expand_keyword_or_cidr(part)?);
             }
         }
@@ -325,6 +347,24 @@ impl AppConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let has_prod_signals = force_secure_cookies
+            || !trusted_proxies.is_empty()
+            || !allowed_hosts.is_empty()
+            || database_url.is_some()
+            || public_url
+                .as_deref()
+                .map(|u| u.starts_with("https://"))
+                .unwrap_or(false);
+        let is_dev = match env::var("BUGFINDER_ENV") {
+            Ok(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "dev" | "development" | "local"
+            ),
+            Err(_) => !has_prod_signals && (desktop_app_mode || is_loopback_bind),
+        };
+
+        let app_key = load_or_create_app_key(&data_dir, is_dev)?;
+
         let dev_allow_http_webhooks = env::var("BUGFINDER_DEV_ALLOW_HTTP_WEBHOOKS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -357,7 +397,8 @@ impl AppConfig {
 
         let oidc = match (oidc_issuer, oidc_client_id, oidc_client_secret, &public_url) {
             (Some(issuer), Some(client_id), Some(client_secret), Some(pub_url)) => {
-                if !is_dev && (!issuer.starts_with("https://") || !pub_url.starts_with("https://")) {
+                if !is_dev && (!issuer.starts_with("https://") || !pub_url.starts_with("https://"))
+                {
                     return Err("BUGFINDER_OIDC_ISSUER and BUGFINDER_PUBLIC_URL must use https:// outside dev mode".into());
                 }
                 if !(issuer.starts_with("https://") || issuer.starts_with("http://")) {
@@ -368,7 +409,10 @@ impl AppConfig {
                     client_id,
                     client_secret,
                     display_name: oidc_display_name,
-                    redirect_uri: format!("{}/api/auth/oidc/callback", pub_url.trim_end_matches('/')),
+                    redirect_uri: format!(
+                        "{}/api/auth/oidc/callback",
+                        pub_url.trim_end_matches('/')
+                    ),
                 })
             }
             _ => None,
@@ -389,8 +433,12 @@ impl AppConfig {
                 SmtpConfig {
                     host,
                     port,
-                    user: env::var("BUGFINDER_SMTP_USER").ok().filter(|s| !s.is_empty()),
-                    password: env::var("BUGFINDER_SMTP_PASS").ok().filter(|s| !s.is_empty()),
+                    user: env::var("BUGFINDER_SMTP_USER")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    password: env::var("BUGFINDER_SMTP_PASS")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
                     from: env::var("BUGFINDER_SMTP_FROM")
                         .unwrap_or_else(|_| "alerts@bugfinder.local".to_string()),
                     implicit_tls,
@@ -406,6 +454,7 @@ impl AppConfig {
             max_db_mb,
             retention_days,
             trusted_proxies,
+            trust_cf_header,
             allowed_hosts,
             public_url,
             session_ttl_sec,
@@ -447,10 +496,16 @@ impl AppConfig {
     }
 }
 
-fn load_or_create_app_key(data_dir: &Path) -> Result<[u8; 32], String> {
+fn load_or_create_app_key(data_dir: &Path, is_dev: bool) -> Result<[u8; 32], String> {
     if let Ok(raw) = env::var("BUGFINDER_APP_KEY") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
+            if !is_dev && trimmed.len() < 32 {
+                return Err(
+                    "BUGFINDER_APP_KEY must be at least 32 characters (64 hex chars recommended) in production"
+                        .into(),
+                );
+            }
             return decode_key_bytes(trimmed);
         }
     }
@@ -468,18 +523,21 @@ fn load_or_create_app_key(data_dir: &Path) -> Result<[u8; 32], String> {
     let hex_key = hex::encode(bytes);
 
     let tmp_path = data_dir.join(".app_key.tmp");
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(&tmp_path)
         .map_err(|e| format!("Failed creating .app_key.tmp: {e}"))?;
     f.write_all(hex_key.as_bytes())
         .map_err(|e| format!("Failed writing .app_key.tmp: {e}"))?;
-    f.sync_all().map_err(|e| format!("Failed syncing .app_key.tmp: {e}"))?;
-    fs::rename(&tmp_path, &key_file)
-        .map_err(|e| format!("Failed renaming .app_key: {e}"))?;
+    f.sync_all()
+        .map_err(|e| format!("Failed syncing .app_key.tmp: {e}"))?;
+    fs::rename(&tmp_path, &key_file).map_err(|e| format!("Failed renaming .app_key: {e}"))?;
 
     Ok(bytes)
 }
@@ -529,7 +587,9 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
         });
     }
 
-    if args.get(1).map(|s| s.as_str()) == Some("--version") || args.get(1).map(|s| s.as_str()) == Some("-V") {
+    if args.get(1).map(|s| s.as_str()) == Some("--version")
+        || args.get(1).map(|s| s.as_str()) == Some("-V")
+    {
         return Ok(ParsedArgs {
             command: CliCommand::Version,
             bind_override: None,
@@ -546,11 +606,13 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                     match args[j].as_str() {
                         "--data" => {
                             j += 1;
-                            data_override = Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
+                            data_override =
+                                Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
                         }
                         "--db" => {
                             j += 1;
-                            db_override = Some(args.get(j).cloned().ok_or("--db requires a value")?);
+                            db_override =
+                                Some(args.get(j).cloned().ok_or("--db requires a value")?);
                         }
                         other => return Err(format!("Unknown migrate option: {other}")),
                     }
@@ -570,15 +632,18 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                     match args[j].as_str() {
                         "--out" => {
                             j += 1;
-                            out_path = Some(PathBuf::from(args.get(j).ok_or("--out requires a path")?));
+                            out_path =
+                                Some(PathBuf::from(args.get(j).ok_or("--out requires a path")?));
                         }
                         "--data" => {
                             j += 1;
-                            data_override = Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
+                            data_override =
+                                Some(PathBuf::from(args.get(j).ok_or("--data requires a value")?));
                         }
                         "--db" => {
                             j += 1;
-                            db_override = Some(args.get(j).cloned().ok_or("--db requires a value")?);
+                            db_override =
+                                Some(args.get(j).cloned().ok_or("--db requires a value")?);
                         }
                         other => return Err(format!("Unknown backup option: {other}")),
                     }
@@ -651,16 +716,31 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 let mut j = 2;
                 while j < args.len() {
                     match args[j].as_str() {
-                        "--url" => { j += 1; base_url = args.get(j).cloned().ok_or("--url requires value")?; }
-                        "--token" => { j += 1; token = args.get(j).cloned().ok_or("--token requires value")?; }
-                        "--org" => { j += 1; org = args.get(j).cloned().ok_or("--org requires value")?; }
+                        "--url" => {
+                            j += 1;
+                            base_url = args.get(j).cloned().ok_or("--url requires value")?;
+                        }
+                        "--token" => {
+                            j += 1;
+                            token = args.get(j).cloned().ok_or("--token requires value")?;
+                        }
+                        "--org" => {
+                            j += 1;
+                            org = args.get(j).cloned().ok_or("--org requires value")?;
+                        }
                         "--project" => {
                             j += 1;
                             let val = args.get(j).ok_or("--project requires value")?;
                             project = Some(val.parse::<i64>().map_err(|_| "invalid --project id")?);
                         }
-                        "--level" => { j += 1; level = Some(args.get(j).cloned().ok_or("--level requires value")?); }
-                        "--query" => { j += 1; query = Some(args.get(j).cloned().ok_or("--query requires value")?); }
+                        "--level" => {
+                            j += 1;
+                            level = Some(args.get(j).cloned().ok_or("--level requires value")?);
+                        }
+                        "--query" => {
+                            j += 1;
+                            query = Some(args.get(j).cloned().ok_or("--query requires value")?);
+                        }
                         other => return Err(format!("Unknown tail option: {other}")),
                     }
                     j += 1;
@@ -669,7 +749,14 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                     return Err("tail requires --token or BUGFINDER_API_TOKEN".into());
                 }
                 return Ok(ParsedArgs {
-                    command: CliCommand::Tail { base_url, token, org, project, level, query },
+                    command: CliCommand::Tail {
+                        base_url,
+                        token,
+                        org,
+                        project,
+                        level,
+                        query,
+                    },
                     bind_override: None,
                     data_override: None,
                     db_override: None,
@@ -681,10 +768,23 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 let mut j = 2;
                 while j < args.len() {
                     match args[j].as_str() {
-                        "--org" => { j += 1; org = args.get(j).cloned().ok_or("--org requires value")?; }
-                        "--token" => { j += 1; token = Some(args.get(j).cloned().ok_or("--token requires value")?); }
-                        "--data" => { j += 1; data_override = Some(PathBuf::from(args.get(j).ok_or("--data requires value")?)); }
-                        "--db" => { j += 1; db_override = Some(args.get(j).cloned().ok_or("--db requires value")?); }
+                        "--org" => {
+                            j += 1;
+                            org = args.get(j).cloned().ok_or("--org requires value")?;
+                        }
+                        "--token" => {
+                            j += 1;
+                            token = Some(args.get(j).cloned().ok_or("--token requires value")?);
+                        }
+                        "--data" => {
+                            j += 1;
+                            data_override =
+                                Some(PathBuf::from(args.get(j).ok_or("--data requires value")?));
+                        }
+                        "--db" => {
+                            j += 1;
+                            db_override = Some(args.get(j).cloned().ok_or("--db requires value")?);
+                        }
                         other => return Err(format!("Unknown mcp option: {other}")),
                     }
                     j += 1;
@@ -732,10 +832,22 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 let mut j = 2;
                 while j < args.len() {
                     match args[j].as_str() {
-                        "--dir" => { j += 1; dir = PathBuf::from(args.get(j).ok_or("--dir requires value")?); }
-                        "--dsn" => { j += 1; dsn = args.get(j).cloned().ok_or("--dsn requires value")?; }
-                        "--stack" => { j += 1; stack = args.get(j).cloned().ok_or("--stack requires value")?; }
-                        "--sdk" => { j += 1; sdk = args.get(j).cloned().ok_or("--sdk requires value")?; }
+                        "--dir" => {
+                            j += 1;
+                            dir = PathBuf::from(args.get(j).ok_or("--dir requires value")?);
+                        }
+                        "--dsn" => {
+                            j += 1;
+                            dsn = args.get(j).cloned().ok_or("--dsn requires value")?;
+                        }
+                        "--stack" => {
+                            j += 1;
+                            stack = args.get(j).cloned().ok_or("--stack requires value")?;
+                        }
+                        "--sdk" => {
+                            j += 1;
+                            sdk = args.get(j).cloned().ok_or("--sdk requires value")?;
+                        }
                         "--dry-run" => dry_run = true,
                         "--force" => force = true,
                         "--no-test" => no_test = true,
@@ -775,11 +887,27 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                             cmd.extend(args[j + 1..].iter().cloned());
                             break;
                         }
-                        "--dsn" => { j += 1; dsn = args.get(j).cloned().ok_or("--dsn requires value")?; }
-                        "--service" => { j += 1; service = Some(args.get(j).cloned().ok_or("--service requires value")?); }
-                        "--env" => { j += 1; env_name = args.get(j).cloned().ok_or("--env requires value")?; }
+                        "--dsn" => {
+                            j += 1;
+                            dsn = args.get(j).cloned().ok_or("--dsn requires value")?;
+                        }
+                        "--service" => {
+                            j += 1;
+                            service = Some(args.get(j).cloned().ok_or("--service requires value")?);
+                        }
+                        "--env" => {
+                            j += 1;
+                            env_name = args.get(j).cloned().ok_or("--env requires value")?;
+                        }
                         "--capture-stdout" => capture_stdout = true,
-                        "--heartbeat-url" => { j += 1; heartbeat_url = Some(args.get(j).cloned().ok_or("--heartbeat-url requires value")?); }
+                        "--heartbeat-url" => {
+                            j += 1;
+                            heartbeat_url = Some(
+                                args.get(j)
+                                    .cloned()
+                                    .ok_or("--heartbeat-url requires value")?,
+                            );
+                        }
                         other if !other.starts_with('-') => {
                             cmd.extend(args[j..].iter().cloned());
                             break;
@@ -815,9 +943,18 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 let mut j = 2;
                 while j < args.len() {
                     match args[j].as_str() {
-                        "--dsn" => { j += 1; dsn = args.get(j).cloned().ok_or("--dsn requires value")?; }
-                        "--service" => { j += 1; service = Some(args.get(j).cloned().ok_or("--service requires value")?); }
-                        "--env" => { j += 1; env_name = args.get(j).cloned().ok_or("--env requires value")?; }
+                        "--dsn" => {
+                            j += 1;
+                            dsn = args.get(j).cloned().ok_or("--dsn requires value")?;
+                        }
+                        "--service" => {
+                            j += 1;
+                            service = Some(args.get(j).cloned().ok_or("--service requires value")?);
+                        }
+                        "--env" => {
+                            j += 1;
+                            env_name = args.get(j).cloned().ok_or("--env requires value")?;
+                        }
                         other => return Err(format!("Unknown pipe option: {other}")),
                     }
                     j += 1;

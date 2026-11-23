@@ -44,7 +44,9 @@ pub fn decompress_bounded(
             let dec = flate2::read::ZlibDecoder::new(raw);
             match read_with_limit(dec, max_bytes) {
                 Ok(v) => Ok(v),
-                Err(DecompressError::TooLarge { limit }) => Err(DecompressError::TooLarge { limit }),
+                Err(DecompressError::TooLarge { limit }) => {
+                    Err(DecompressError::TooLarge { limit })
+                }
                 Err(_) => {
                     // Fallback to raw deflate stream (RFC 1951) if no zlib header
                     let raw_dec = flate2::read::DeflateDecoder::new(raw);

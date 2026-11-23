@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 enum WriterMsg {
-    Item(IngestWriteItem),
+    Item(Box<IngestWriteItem>),
     Flush(oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -44,32 +44,48 @@ impl BatchWriter {
                     maybe_msg = rx.recv() => {
                         match maybe_msg {
                             Some(WriterMsg::Item(item)) => {
-                                buffer.push(item);
+                                buffer.push(*item);
                                 if buffer.len() >= 128 {
                                     flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
                             }
                             Some(WriterMsg::Flush(ack)) => {
+                                let mut acks = vec![ack];
+                                let mut should_shutdown = false;
                                 while let Ok(msg) = rx.try_recv() {
-                                    if let WriterMsg::Item(it) = msg {
-                                        buffer.push(it);
+                                    match msg {
+                                        WriterMsg::Item(it) => buffer.push(*it),
+                                        WriterMsg::Flush(a) => acks.push(a),
+                                        WriterMsg::Shutdown(a) => {
+                                            acks.push(a);
+                                            should_shutdown = true;
+                                        }
                                     }
                                 }
                                 if !buffer.is_empty() {
                                     flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
-                                let _ = ack.send(());
+                                for a in acks {
+                                    let _ = a.send(());
+                                }
+                                if should_shutdown {
+                                    break;
+                                }
                             }
                             Some(WriterMsg::Shutdown(ack)) => {
+                                let mut acks = vec![ack];
                                 while let Ok(msg) = rx.try_recv() {
-                                    if let WriterMsg::Item(it) = msg {
-                                        buffer.push(it);
+                                    match msg {
+                                        WriterMsg::Item(it) => buffer.push(*it),
+                                        WriterMsg::Flush(a) | WriterMsg::Shutdown(a) => acks.push(a),
                                     }
                                 }
                                 if !buffer.is_empty() {
                                     flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
                                 }
-                                let _ = ack.send(());
+                                for a in acks {
+                                    let _ = a.send(());
+                                }
                                 break;
                             }
                             None => {
@@ -97,13 +113,15 @@ impl BatchWriter {
     }
 
     pub fn try_enqueue(&self, item: IngestWriteItem) -> Result<(), &'static str> {
-        match self.tx.try_send(WriterMsg::Item(item)) {
+        match self.tx.try_send(WriterMsg::Item(Box::new(item))) {
             Ok(()) => {
                 self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .self_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 self.self_monitor.record(
                     "batch_writer",
                     "error",
@@ -114,7 +132,9 @@ impl BatchWriter {
                 Err("queue_full")
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .self_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 self.self_monitor.record(
                     "batch_writer",
                     "error",
@@ -151,10 +171,21 @@ async fn flush_vec(
 ) {
     let drained: Vec<IngestWriteItem> = std::mem::take(buffer);
     let count = drained.len() as u64;
-    let prev = metrics.queue_depth.load(Ordering::Relaxed);
-    metrics
-        .queue_depth
-        .store(prev.saturating_sub(count), Ordering::Relaxed);
+    loop {
+        let prev = metrics.queue_depth.load(Ordering::Relaxed);
+        if metrics
+            .queue_depth
+            .compare_exchange_weak(
+                prev,
+                prev.saturating_sub(count),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            break;
+        }
+    }
     metrics.batch_flushes_total.fetch_add(1, Ordering::Relaxed);
 
     match storage.flush_ingest_batch(drained).await {
@@ -186,13 +217,15 @@ pub fn spawn_alert_jobs(
         let m = metrics.clone();
         let mon = self_monitor.clone();
         tokio::spawn(async move {
+            let org_id = job.organization_id;
             match dispatch_alert(cfg, job).await {
                 Ok(()) => {
                     m.alerts_sent_total.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
                     m.self_errors_total.fetch_add(1, Ordering::Relaxed);
-                    mon.record(
+                    mon.record_for_org(
+                        org_id,
                         "alerts",
                         "warn",
                         "dispatcher",

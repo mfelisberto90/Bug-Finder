@@ -1,5 +1,9 @@
-use crate::domain::models::{LogLevel, NormalizedLog, now_ms};
+use crate::domain::models::{now_ms, LogLevel, NormalizedLog};
 use serde_json::{Map, Value};
+
+pub const MAX_OTLP_LOGS_PER_REQ: usize = 500;
+pub const MAX_OTLP_RESOURCE_ATTRS: usize = 64;
+pub const MAX_OTLP_RECORD_ATTRS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtlpDecodeError(pub String);
@@ -10,7 +14,10 @@ impl std::fmt::Display for OtlpDecodeError {
     }
 }
 
-pub fn decode_otlp_logs(body: &[u8], content_type: &str) -> Result<Vec<NormalizedLog>, OtlpDecodeError> {
+pub fn decode_otlp_logs(
+    body: &[u8],
+    content_type: &str,
+) -> Result<Vec<NormalizedLog>, OtlpDecodeError> {
     if content_type.to_ascii_lowercase().contains("json") {
         decode_otlp_json(body)
     } else {
@@ -78,13 +85,7 @@ fn unwrap_otel_json_anyvalue(val: &Value, depth: usize) -> Value {
 
 fn parse_nano_to_ms(v: Option<&Value>) -> Option<i64> {
     let val = v?;
-    let nanos: u64 = if let Some(n) = val.as_u64() {
-        n
-    } else if let Some(s) = val.as_str() {
-        s.parse::<u64>().ok()?
-    } else {
-        return None;
-    };
+    let nanos: u64 = val.as_u64().or_else(|| val.as_str()?.parse::<u64>().ok())?;
     if nanos == 0 {
         None
     } else {
@@ -97,8 +98,8 @@ fn is_all_zero_hex(s: &str) -> bool {
 }
 
 fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> {
-    let root: Value =
-        serde_json::from_slice(body).map_err(|e| OtlpDecodeError(format!("Invalid OTLP JSON: {e}")))?;
+    let root: Value = serde_json::from_slice(body)
+        .map_err(|e| OtlpDecodeError(format!("Invalid OTLP JSON: {e}")))?;
     let rls = root
         .get("resourceLogs")
         .or_else(|| root.get("resource_logs"))
@@ -114,6 +115,9 @@ fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> 
             .and_then(|a| a.as_array())
         {
             for attr in attrs {
+                if res_attrs.len() >= MAX_OTLP_RESOURCE_ATTRS {
+                    break;
+                }
                 if let Some(k) = attr.get("key").and_then(|v| v.as_str()) {
                     if !should_skip_resource_attr(k) {
                         let v = attr
@@ -142,14 +146,22 @@ fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> 
                 .unwrap_or_default();
 
             for rec in recs {
-                let ts_ms = parse_nano_to_ms(rec.get("timeUnixNano").or_else(|| rec.get("time_unix_nano")))
-                    .or_else(|| {
-                        parse_nano_to_ms(
-                            rec.get("observedTimeUnixNano")
-                                .or_else(|| rec.get("observed_time_unix_nano")),
-                        )
-                    })
-                    .unwrap_or_else(now_ms);
+                if out.len() >= MAX_OTLP_LOGS_PER_REQ {
+                    return Err(OtlpDecodeError(format!(
+                        "OTLP log record count exceeds limit ({MAX_OTLP_LOGS_PER_REQ})"
+                    )));
+                }
+                let ts_ms = parse_nano_to_ms(
+                    rec.get("timeUnixNano")
+                        .or_else(|| rec.get("time_unix_nano")),
+                )
+                .or_else(|| {
+                    parse_nano_to_ms(
+                        rec.get("observedTimeUnixNano")
+                            .or_else(|| rec.get("observed_time_unix_nano")),
+                    )
+                })
+                .unwrap_or_else(now_ms);
 
                 let sev_num = rec
                     .get("severityNumber")
@@ -196,7 +208,7 @@ fn decode_otlp_json(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeError> 
                     attrs_map.insert(k.clone(), v.clone());
                 }
                 if let Some(rec_attrs) = rec.get("attributes").and_then(|v| v.as_array()) {
-                    for attr in rec_attrs {
+                    for attr in rec_attrs.iter().take(MAX_OTLP_RECORD_ATTRS) {
                         if let Some(k) = attr.get("key").and_then(|v| v.as_str()) {
                             let v = attr
                                 .get("value")
@@ -333,7 +345,11 @@ impl<'a> PbCursor<'a> {
             5 => {
                 let _ = self.read_fixed32()?;
             }
-            _ => return Err(OtlpDecodeError(format!("Unsupported wire type {wire_type}"))),
+            _ => {
+                return Err(OtlpDecodeError(format!(
+                    "Unsupported wire type {wire_type}"
+                )))
+            }
         }
         Ok(())
     }
@@ -359,7 +375,10 @@ fn decode_otlp_protobuf(body: &[u8]) -> Result<Vec<NormalizedLog>, OtlpDecodeErr
     Ok(out)
 }
 
-fn decode_pb_resource_logs(buf: &[u8], out: &mut Vec<NormalizedLog>) -> Result<(), OtlpDecodeError> {
+fn decode_pb_resource_logs(
+    buf: &[u8],
+    out: &mut Vec<NormalizedLog>,
+) -> Result<(), OtlpDecodeError> {
     let mut cur = PbCursor::new(buf);
     let mut res_attrs: Vec<(String, Value)> = Vec::new();
     let mut scope_slices: Vec<&[u8]> = Vec::new();
@@ -390,6 +409,10 @@ fn decode_pb_resource(buf: &[u8]) -> Result<Vec<(String, Value)>, OtlpDecodeErro
     while !cur.eof() {
         let (field, wt) = cur.read_tag()?;
         if field == 1 && wt == 2 {
+            if attrs.len() >= MAX_OTLP_RESOURCE_ATTRS {
+                cur.skip_field(wt)?;
+                continue;
+            }
             let kv = decode_pb_key_value(cur.read_bytes()?, 0)?;
             if !should_skip_resource_attr(&kv.0) {
                 attrs.push(kv);
@@ -410,6 +433,11 @@ fn decode_pb_scope_logs(
     while !cur.eof() {
         let (field, wt) = cur.read_tag()?;
         if field == 2 && wt == 2 {
+            if out.len() >= MAX_OTLP_LOGS_PER_REQ {
+                return Err(OtlpDecodeError(format!(
+                    "OTLP log record count exceeds limit ({MAX_OTLP_LOGS_PER_REQ})"
+                )));
+            }
             let rec_bytes = cur.read_bytes()?;
             out.push(decode_pb_log_record(rec_bytes, res_attrs)?);
         } else {
@@ -437,6 +465,7 @@ fn decode_pb_log_record(
         attrs_map.insert(k.clone(), v.clone());
     }
 
+    let mut rec_attr_count = 0usize;
     while !cur.eof() {
         let (field, wt) = cur.read_tag()?;
         match (field, wt) {
@@ -463,8 +492,13 @@ fn decode_pb_log_record(
                 };
             }
             (6, 2) => {
-                let (k, v) = decode_pb_key_value(cur.read_bytes()?, 0)?;
-                attrs_map.insert(k, v);
+                if rec_attr_count < MAX_OTLP_RECORD_ATTRS {
+                    let (k, v) = decode_pb_key_value(cur.read_bytes()?, 0)?;
+                    attrs_map.insert(k, v);
+                    rec_attr_count += 1;
+                } else {
+                    cur.skip_field(wt)?;
+                }
             }
             (9, 2) => {
                 let bytes = cur.read_bytes()?;
@@ -482,7 +516,11 @@ fn decode_pb_log_record(
         }
     }
 
-    let eff_nano = if time_nano > 0 { time_nano } else { observed_nano };
+    let eff_nano = if time_nano > 0 {
+        time_nano
+    } else {
+        observed_nano
+    };
     let ts_ms = if eff_nano > 0 {
         (eff_nano / 1_000_000) as i64
     } else {
@@ -682,7 +720,10 @@ mod tests {
         assert_eq!(logs[0].service, "worker-rs");
         assert_eq!(logs[0].level, LogLevel::Warn);
         assert_eq!(logs[0].body, "Queue drained");
-        assert_eq!(logs[0].trace_id.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            logs[0].trace_id.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(logs[0].span_id.as_deref(), Some("bbbbbbbbbbbbbbbb"));
     }
 
@@ -704,11 +745,33 @@ mod tests {
         let req = pb_bytes(1, &pb_bytes(2, &pb_bytes(2, &log_rec)));
         let logs = decode_otlp_logs(&req, "application/x-protobuf").unwrap();
         assert_eq!(logs[0].level, LogLevel::Error);
-        assert!(serde_json::to_string(&logs[0].attributes["deep"]).unwrap().contains("[MaxDepth]"));
+        assert!(serde_json::to_string(&logs[0].attributes["deep"])
+            .unwrap()
+            .contains("[MaxDepth]"));
 
         // 2. Varint overflow / huge length field must return Err cleanly (never panic)
         let mut bad_bytes = vec![0x0a]; // field 1, wire type 2 (length-delimited)
         push_varint(&mut bad_bytes, u64::MAX);
         assert!(decode_otlp_logs(&bad_bytes, "application/x-protobuf").is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_log_records_in_json_and_protobuf() {
+        let recs: Vec<serde_json::Value> = (0..=MAX_OTLP_LOGS_PER_REQ)
+            .map(|_| serde_json::json!({ "body": { "stringValue": "flood" } }))
+            .collect();
+        let json_payload = serde_json::to_vec(&serde_json::json!({
+            "resourceLogs": [{ "scopeLogs": [{ "logRecords": recs }] }]
+        }))
+        .unwrap();
+        assert!(decode_otlp_logs(&json_payload, "application/json").is_err());
+
+        let log_rec = pb_bytes(5, &pb_bytes(1, b"flood"));
+        let mut scope_logs = Vec::new();
+        for _ in 0..=MAX_OTLP_LOGS_PER_REQ {
+            scope_logs.extend(pb_bytes(2, &log_rec));
+        }
+        let pb_payload = pb_bytes(1, &pb_bytes(2, &scope_logs));
+        assert!(decode_otlp_logs(&pb_payload, "application/x-protobuf").is_err());
     }
 }

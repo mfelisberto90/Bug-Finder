@@ -4,24 +4,35 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const MAX_SMTP_RESPONSE_LINES: usize = 64;
 const MAX_SMTP_RESPONSE_BYTES: usize = 16 * 1024;
+static SMTP_TLS_CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
 fn sanitize_header_val(s: &str) -> String {
-    s.chars().filter(|&c| c != '\r' && c != '\n' && c != '\0').collect()
+    s.chars()
+        .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+        .collect()
 }
 
 fn extract_smtp_addr(raw: &str) -> String {
     let safe = sanitize_header_val(raw);
-    if let (Some(start), Some(end)) = (safe.find('<'), safe.rfind('>')) {
+    let inner = if let (Some(start), Some(end)) = (safe.find('<'), safe.rfind('>')) {
         if start < end {
-            return safe[start + 1..end].trim().to_string();
+            &safe[start + 1..end]
+        } else {
+            &safe
         }
-    }
-    safe.trim().to_string()
+    } else {
+        &safe
+    };
+    inner
+        .trim()
+        .chars()
+        .filter(|&c| c != '<' && c != '>' && !c.is_whitespace())
+        .collect()
 }
 
 fn read_smtp_response<R: Read>(reader: &mut BufReader<R>) -> Result<(u16, String), String> {
@@ -62,13 +73,17 @@ fn expect_code(res: (u16, String), expected_prefix: u16) -> Result<(), String> {
 }
 
 fn make_tls_config() -> Arc<ClientConfig> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+    SMTP_TLS_CFG
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
 }
 
 fn smtp_transaction<S: Read + Write>(
@@ -133,6 +148,12 @@ fn smtp_transaction<S: Read + Write>(
     let safe_from = sanitize_header_val(&cfg.from);
     let safe_from_addr = extract_smtp_addr(&safe_from);
     let safe_to = extract_smtp_addr(to);
+    if safe_from_addr.is_empty() || !safe_from_addr.contains('@') {
+        return Err("Invalid SMTP sender address".into());
+    }
+    if safe_to.is_empty() || !safe_to.contains('@') {
+        return Err("Invalid SMTP recipient address".into());
+    }
     let safe_subj = sanitize_header_val(subject);
 
     let mail_from = format!("MAIL FROM:<{safe_from_addr}>\r\n");
@@ -184,13 +205,18 @@ fn smtp_transaction<S: Read + Write>(
 }
 
 /// Zero-crate native TLS SMTP sender (`STARTTLS` on 587 or Implicit TLS on 465).
-pub fn send_smtp_alert(cfg: &SmtpConfig, to: &str, subject: &str, body_text: &str) -> Result<(), String> {
+pub fn send_smtp_alert(
+    cfg: &SmtpConfig,
+    to: &str,
+    subject: &str,
+    body_text: &str,
+) -> Result<(), String> {
     let addrs = (cfg.host.as_str(), cfg.port)
         .to_socket_addrs()
         .map_err(|e| format!("SMTP DNS resolve failed: {e}"))?;
     let mut tcp_opt: Option<TcpStream> = None;
     let mut last_err = String::new();
-    for addr in addrs {
+    for addr in addrs.take(3) {
         match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
             Ok(s) => {
                 tcp_opt = Some(s);
@@ -230,6 +256,9 @@ pub fn send_smtp_alert(cfg: &SmtpConfig, to: &str, subject: &str, body_text: &st
         .map_err(|e| format!("SMTP STARTTLS: {e}"))?;
     reader.get_mut().flush().ok();
     expect_code(read_smtp_response(&mut reader)?, 2)?;
+    if !reader.buffer().is_empty() {
+        return Err("Unexpected trailing plaintext bytes before STARTTLS upgrade".into());
+    }
 
     let plain_tcp = reader.into_inner();
     let conn = ClientConnection::new(tls_cfg, server_name)

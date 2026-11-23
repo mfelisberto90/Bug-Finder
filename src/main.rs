@@ -82,7 +82,9 @@ fn main() -> ExitCode {
                 };
                 let url = cfg.database_url.as_deref().unwrap_or("").to_string();
                 let app_key = cfg.app_key;
-                match rt.block_on(async move { PostgresStorage::connect_with_key(&url, true, app_key).await }) {
+                match rt.block_on(async move {
+                    PostgresStorage::connect_with_key(&url, true, app_key).await
+                }) {
                     Ok(_) => {
                         println!("PostgreSQL schema migrations verified/applied.");
                         ExitCode::SUCCESS
@@ -95,7 +97,10 @@ fn main() -> ExitCode {
             } else {
                 match SqliteStorage::open_with_key(&cfg.sqlite_path(), cfg.app_key) {
                     Ok(_) => {
-                        println!("SQLite schema migrations verified/applied: {}", cfg.sqlite_path().display());
+                        println!(
+                            "SQLite schema migrations verified/applied: {}",
+                            cfg.sqlite_path().display()
+                        );
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
@@ -325,15 +330,23 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
     let state = build_app_state(config.clone(), storage.clone());
 
     // Periodic maintenance task (retention, DB size circuit-breaker, missed heartbeats)
+    let maint_stop = Arc::new(tokio::sync::Notify::new());
+    let maint_stop_rx = maint_stop.clone();
     let maint_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = maint_stop_rx.notified() => break,
+            }
             match maint_state
                 .storage
-                .run_maintenance(maint_state.config.retention_days, maint_state.config.max_db_mb)
+                .run_maintenance(
+                    maint_state.config.retention_days,
+                    maint_state.config.max_db_mb,
+                )
                 .await
             {
                 Ok(alerts) => {
@@ -364,7 +377,10 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
     let listener = match TcpListener::bind(&config.bind_addr).await {
         Ok(l) => l,
         Err(err) if desktop_app => {
-            eprintln!("Port {} busy ({err}), falling back to ephemeral loopback port", config.bind_addr);
+            eprintln!(
+                "Port {} busy ({err}), falling back to ephemeral loopback port",
+                config.bind_addr
+            );
             match TcpListener::bind("127.0.0.1:0").await {
                 Ok(l) => l,
                 Err(e2) => {
@@ -379,7 +395,9 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
         }
     };
 
-    let local_addr = listener.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 8080)));
+    let local_addr = listener
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 8080)));
     let listen_url = format!("http://{local_addr}");
     println!("Bug-Finder listening on {listen_url}");
 
@@ -392,14 +410,15 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
     let app = build_router(state.clone());
     let svc = app.into_make_service_with_connect_info::<SocketAddr>();
 
-    let shutdown_state = state.clone();
     let shutdown_fut = async move {
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
         };
         #[cfg(unix)]
         let sigterm = async {
-            if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            if let Ok(mut s) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
                 let _ = s.recv().await;
             } else {
                 std::future::pending::<()>().await;
@@ -421,19 +440,22 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
             _ = sigterm => {}
             _ = desktop_exit => {}
         }
-        shutdown_state.batch_writer.shutdown().await;
-        shutdown_state.storage.shutdown_checkpoint().await;
     };
 
     // Pin the server future cleanly so LTO does not bloat worker thread stack
     use std::future::IntoFuture;
-    if let Err(e) = Box::pin(
+    let serve_res = Box::pin(
         axum::serve(listener, svc)
             .with_graceful_shutdown(shutdown_fut)
             .into_future(),
     )
-    .await
-    {
+    .await;
+
+    maint_stop.notify_waiters();
+    state.batch_writer.shutdown().await;
+    state.storage.shutdown_checkpoint().await;
+
+    if let Err(e) = serve_res {
         eprintln!("server error: {e}");
         return 1;
     }

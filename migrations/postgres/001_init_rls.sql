@@ -633,6 +633,85 @@ CREATE POLICY cap_invite ON invitation_lookup
     )
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint);
 
+ALTER TABLE mfa_challenges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mfa_challenges FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS cap_mfa_challenge ON mfa_challenges;
+CREATE POLICY cap_mfa_challenge ON mfa_challenges
+    USING (
+        token_sha256 = NULLIF(current_setting('app.mfa_challenge_sha256', true), '')
+        OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        OR target_org_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+        OR (
+            NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
+            AND expires_at <= EXTRACT(EPOCH FROM NOW())::bigint
+        )
+    )
+    WITH CHECK (
+        token_sha256 = NULLIF(current_setting('app.mfa_challenge_sha256', true), '')
+        OR user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+    );
+
+ALTER TABLE user_mfa ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_mfa FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS user_mfa_isolation ON user_mfa;
+CREATE POLICY user_mfa_isolation ON user_mfa
+    USING (
+        user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        OR EXISTS (
+            SELECT 1 FROM organization_members om
+            WHERE om.user_id = user_mfa.user_id
+              AND om.organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+        )
+    )
+    WITH CHECK (
+        user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+    );
+
+ALTER TABLE user_mfa_recovery_codes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_mfa_recovery_codes FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS user_mfa_recovery_isolation ON user_mfa_recovery_codes;
+CREATE POLICY user_mfa_recovery_isolation ON user_mfa_recovery_codes
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint)
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint);
+
+ALTER TABLE webauthn_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webauthn_credentials FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS user_webauthn_cred_isolation ON webauthn_credentials;
+CREATE POLICY user_webauthn_cred_isolation ON webauthn_credentials
+    USING (
+        user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        OR credential_id_b64 = NULLIF(current_setting('app.webauthn_cred_id', true), '')
+        OR id = NULLIF(current_setting('app.webauthn_cred_pk', true), '')::bigint
+        OR EXISTS (
+            SELECT 1 FROM organization_members om
+            WHERE om.user_id = webauthn_credentials.user_id
+              AND om.organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+        )
+    )
+    WITH CHECK (
+        user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        OR id = NULLIF(current_setting('app.webauthn_cred_pk', true), '')::bigint
+    );
+
+ALTER TABLE webauthn_challenges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webauthn_challenges FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS cap_webauthn_challenge ON webauthn_challenges;
+CREATE POLICY cap_webauthn_challenge ON webauthn_challenges
+    USING (
+        challenge_b64 = NULLIF(current_setting('app.webauthn_challenge_b64', true), '')
+        OR (
+            NULLIF(current_setting('app.current_user_id', true), '')::bigint IS NOT NULL
+            AND user_id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        )
+        OR (
+            NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
+            AND expires_at <= EXTRACT(EPOCH FROM NOW())::bigint
+        )
+    )
+    WITH CHECK (
+        challenge_b64 = NULLIF(current_setting('app.webauthn_challenge_b64', true), '')
+    );
+
 CREATE TABLE IF NOT EXISTS bugfinder_schema_meta (
     id SMALLINT PRIMARY KEY CHECK (id = 1),
     schema_sha256 TEXT NOT NULL,
@@ -646,3 +725,4 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO bugfinder_app;
 REVOKE INSERT, UPDATE, DELETE ON bugfinder_schema_meta FROM bugfinder_app;
 GRANT SELECT ON bugfinder_schema_meta TO bugfinder_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs FROM bugfinder_app;

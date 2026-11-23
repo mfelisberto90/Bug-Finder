@@ -34,12 +34,15 @@ impl ureq::Resolver for PinnedResolver {
     }
 }
 
-fn webhook_semaphore() -> Arc<Semaphore> {
-    WEBHOOK_SEM.get_or_init(|| Arc::new(Semaphore::new(4))).clone()
+fn alert_semaphore() -> Arc<Semaphore> {
+    WEBHOOK_SEM
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .clone()
 }
 
 #[derive(Debug, Clone)]
 pub struct AlertDispatchJob {
+    pub organization_id: i64,
     pub rule_id: i64,
     pub rule_name: String,
     pub channel_type: String, // "webhook" | "slack" | "discord" | "telegram" | "email"
@@ -186,12 +189,25 @@ pub async fn dispatch_alert(config: Arc<AppConfig>, job: AlertDispatchJob) -> Re
         let Some(smtp_cfg) = config.smtp.clone() else {
             return Err("SMTP is not configured".into());
         };
+        let permit = alert_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("alert semaphore: {e}"))?;
         let to = job.email_to.clone();
         let subj = format!("[Bug-Finder][{}] {}", job.project_slug, job.title);
-        let body = format!("{}\n\nProject: {}\nLevel: {}\nShort ID: {}", job.message, job.project_slug, job.level, job.short_id.as_deref().unwrap_or("-"));
-        return tokio::task::spawn_blocking(move || send_smtp_alert(&smtp_cfg, &to, &subj, &body))
-            .await
-            .map_err(|e| format!("SMTP join error: {e}"))?;
+        let body = format!(
+            "{}\n\nProject: {}\nLevel: {}\nShort ID: {}",
+            job.message,
+            job.project_slug,
+            job.level,
+            job.short_id.as_deref().unwrap_or("-")
+        );
+        return tokio::task::spawn_blocking(move || {
+            let _guard = permit;
+            send_smtp_alert(&smtp_cfg, &to, &subj, &body)
+        })
+        .await
+        .map_err(|e| format!("SMTP join error: {e}"))?;
     }
 
     let effective_url = if job.channel_type == "telegram" {
@@ -208,16 +224,17 @@ pub async fn dispatch_alert(config: Arc<AppConfig>, job: AlertDispatchJob) -> Re
         job.target_url.clone()
     };
 
-    let permit = webhook_semaphore()
+    let permit = alert_semaphore()
         .acquire_owned()
         .await
-        .map_err(|e| format!("webhook semaphore: {e}"))?;
+        .map_err(|e| format!("alert semaphore: {e}"))?;
 
     let allow_http_dev = config.dev_allow_http_webhooks;
     tokio::task::spawn_blocking(move || {
         let _guard = permit;
-        let target = validate_webhook_url(&effective_url, allow_http_dev)
-            .map_err(|e| redact_secret(&format!("SSRF blocked webhook: {e}"), &job.webhook_secret))?;
+        let target = validate_webhook_url(&effective_url, allow_http_dev).map_err(|e| {
+            redact_secret(&format!("SSRF blocked webhook: {e}"), &job.webhook_secret)
+        })?;
 
         let pinned = PinnedResolver {
             expected_plain: format!("{}:{}", target.host, target.port),
@@ -245,6 +262,7 @@ mod tests {
 
     fn sample_job(channel_type: &str, level: &str) -> AlertDispatchJob {
         AlertDispatchJob {
+            organization_id: 1,
             rule_id: 42,
             rule_name: "Critical Errors".into(),
             channel_type: channel_type.into(),
@@ -273,10 +291,16 @@ mod tests {
     #[test]
     fn discord_rich_embed_payload_format() {
         let p = format_alert_payload(&sample_job("discord", "error"));
-        assert!(p["content"].as_str().unwrap().contains("[ERROR] checkout-web"));
+        assert!(p["content"]
+            .as_str()
+            .unwrap()
+            .contains("[ERROR] checkout-web"));
         let embed = &p["embeds"][0];
         assert_eq!(embed["color"].as_u64(), Some(0xEF4444));
-        assert_eq!(embed["footer"]["text"].as_str(), Some("Bug-Finder Alerting"));
+        assert_eq!(
+            embed["footer"]["text"].as_str(),
+            Some("Bug-Finder Alerting")
+        );
         let fields = embed["fields"].as_array().unwrap();
         assert_eq!(fields.len(), 4);
         assert_eq!(fields[3]["name"], "Issue");
@@ -367,18 +391,22 @@ mod tests {
         send_http_payload(&agent, &url_ok, &discord_job).expect("discord wire ok");
 
         let mut tg_job = sample_job("telegram", "fatal");
-        tg_job.target_url = format!("telegram:-100999888");
+        tg_job.target_url = "telegram:-100999888".to_string();
         let url_tg_err = format!("http://{addr}/bot{}/sendMessage", tg_job.webhook_secret);
         let err = send_http_payload(&agent, &url_tg_err, &tg_job).unwrap_err();
         assert!(!err.contains(&tg_job.webhook_secret));
 
         let captured = handle.join().unwrap();
         let hdrs_and_body_0 = &captured[0];
-        assert!(hdrs_and_body_0.to_ascii_lowercase().contains("x-bugfinder-signature:"));
+        assert!(hdrs_and_body_0
+            .to_ascii_lowercase()
+            .contains("x-bugfinder-signature:"));
         assert!(hdrs_and_body_0.contains("\"embeds\""));
 
         let hdrs_and_body_1 = &captured[1];
-        assert!(!hdrs_and_body_1.to_ascii_lowercase().contains("x-bugfinder-signature:"));
+        assert!(!hdrs_and_body_1
+            .to_ascii_lowercase()
+            .contains("x-bugfinder-signature:"));
         assert!(hdrs_and_body_1.contains("-100999888"));
         assert!(hdrs_and_body_1.contains("disable_web_page_preview"));
     }

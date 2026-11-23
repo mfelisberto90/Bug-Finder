@@ -5,14 +5,21 @@ use crate::security::auth::{
     validate_password_strength, verify_password,
 };
 use crate::security::crypto::{open_secret, seal_secret};
-use crate::security::headers::{is_https_request, normalize_host_header, validate_same_origin, ClientIp};
+use crate::security::headers::{
+    is_https_request, normalize_host_header, validate_same_origin, ClientIp, PeerIp,
+};
 use crate::security::mfa::{
     build_otpauth_uri, decode_base32, generate_recovery_codes, generate_totp_secret_b32,
     render_qr_svg, verify_recovery_code, verify_totp_window,
 };
 use crate::security::oidc::{open_oidc_tx_cookie, seal_oidc_tx_cookie, OidcTxState};
-use crate::security::webauthn::{b64url_decode, verify_assertion, verify_registration};
-use crate::storage::{AuthenticatedSession, NewAuditLog};
+use crate::security::webauthn::{
+    b64url_decode, verify_assertion, verify_registration, WebAuthnAssertionInput,
+};
+use crate::storage::{
+    AcceptInvitationOutcome, AuthenticatedSession, InitialSetupInput, NewAuditLog, NewSessionInput,
+    PasswordChangeInput,
+};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -77,8 +84,15 @@ pub fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-pub fn build_session_cookie(token: &str, max_age_sec: i64, state: &AppState, headers: &HeaderMap) -> String {
-    let secure = !state.config.is_dev && is_https_request(headers, &state.config);
+pub fn build_session_cookie(
+    token: &str,
+    max_age_sec: i64,
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+) -> String {
+    let secure = state.config.force_secure_cookies
+        || (!state.config.is_dev && is_https_request(headers, peer_ip, &state.config));
     let same_site = if state.config.desktop_app_mode {
         "Strict"
     } else {
@@ -102,7 +116,7 @@ pub async fn resolve_request_session(
     let now_sec = chrono::Utc::now().timestamp();
     state
         .storage
-        .resolve_session(&sha, now_sec, state.config.session_idle_sec as i64)
+        .resolve_session(&sha, now_sec, state.config.session_idle_sec)
         .await
         .ok()?
 }
@@ -123,16 +137,25 @@ pub fn request_client_ip(ext: &axum::http::Extensions) -> String {
         .unwrap_or_else(|| "127.0.0.1".into())
 }
 
+pub fn request_peer_ip(ext: &axum::http::Extensions) -> std::net::IpAddr {
+    ext.get::<PeerIp>()
+        .map(|c| c.0)
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]))
+}
+
 pub fn require_session_mutation(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<(), Response> {
-    if !validate_same_origin(headers, &state.config) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Cross-origin state-changing request rejected" })),
-        )
-            .into_response());
+    peer_ip: std::net::IpAddr,
+) -> Result<(), Box<Response>> {
+    if !validate_same_origin(headers, peer_ip, &state.config) {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "Cross-origin state-changing request rejected" })),
+            )
+                .into_response(),
+        ));
     }
     Ok(())
 }
@@ -140,72 +163,107 @@ pub fn require_session_mutation(
 async fn require_authenticated_session(
     state: &AppState,
     headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
     require_csrf: bool,
-) -> Result<(AuthenticatedSession, String), Response> {
+) -> Result<(AuthenticatedSession, String), Box<Response>> {
     let Some(raw) = extract_cookie(headers, "bf_session") else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Authentication required" })),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Authentication required" })),
+            )
+                .into_response(),
+        ));
     };
     let sha = sha256_hex(raw.as_bytes());
     let now_sec = chrono::Utc::now().timestamp();
     let Some(sess) = state
         .storage
-        .resolve_session(&sha, now_sec, state.config.session_idle_sec as i64)
+        .resolve_session(&sha, now_sec, state.config.session_idle_sec)
         .await
         .ok()
         .flatten()
     else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Session expired or invalid" })),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Session expired or invalid" })),
+            )
+                .into_response(),
+        ));
     };
     if require_csrf {
-        require_session_mutation(state, headers)?;
+        require_session_mutation(state, headers, peer_ip)?;
         if !verify_csrf_for_session(&sess, headers) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "Invalid CSRF token" })),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Invalid CSRF token" })),
+                )
+                    .into_response(),
+            ));
         }
     }
     Ok((sess, sha))
 }
 
-fn webauthn_rp_and_origins(state: &AppState, headers: &HeaderMap) -> (String, Vec<String>) {
-    let mut origins = Vec::new();
-    let mut rp_id = String::new();
+fn require_fresh_reauth(sess: &AuthenticatedSession, now_sec: i64) -> Result<(), Box<Response>> {
+    let fresh = sess
+        .reauth_at
+        .map(|t| now_sec.saturating_sub(t) <= 600)
+        .unwrap_or(false);
+    if !fresh {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "Step-up re-authentication required",
+                    "reauth_required": true
+                })),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(())
+}
+
+fn webauthn_rp_and_origins(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+) -> (String, Vec<String>) {
     if let Some(ref pub_url) = state.config.public_url {
         let trimmed = pub_url.trim().trim_end_matches('/');
         if !trimmed.is_empty() {
-            origins.push(trimmed.to_string());
-            let rest = trimmed
+            let origin = trimmed.split('/').take(3).collect::<Vec<_>>().join("/");
+            let rest = origin
                 .strip_prefix("https://")
-                .or_else(|| trimmed.strip_prefix("http://"))
-                .unwrap_or(trimmed)
-                .split('/')
-                .next()
-                .unwrap_or("");
-            rp_id = normalize_host_header(rest);
+                .or_else(|| origin.strip_prefix("http://"))
+                .unwrap_or(&origin);
+            let norm = normalize_host_header(rest);
+            let rp_id = if norm.is_empty() {
+                "localhost".to_string()
+            } else {
+                norm.trim_matches(|c| c == '[' || c == ']').to_string()
+            };
+            return (rp_id, vec![origin]);
         }
     }
+    let mut origins = Vec::new();
+    let mut rp_id = String::new();
     if let Some(host_hdr) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
         let trimmed_host = host_hdr.trim();
         let norm_host = normalize_host_header(trimmed_host);
-        if rp_id.is_empty() && !norm_host.is_empty() {
+        if !norm_host.is_empty() {
             rp_id = norm_host.trim_matches(|c| c == '[' || c == ']').to_string();
         }
         if !trimmed_host.is_empty() {
             let https_orig = format!("https://{trimmed_host}");
-            if !origins.iter().any(|o| o.eq_ignore_ascii_case(&https_orig)) {
-                origins.push(https_orig);
-            }
-            if state.config.is_dev || state.config.desktop_app_mode || !is_https_request(headers, &state.config) {
+            origins.push(https_orig);
+            if state.config.is_dev
+                || state.config.desktop_app_mode
+                || !is_https_request(headers, peer_ip, &state.config)
+            {
                 let http_orig = format!("http://{trimmed_host}");
                 if !origins.iter().any(|o| o.eq_ignore_ascii_case(&http_orig)) {
                     origins.push(http_orig);
@@ -219,9 +277,11 @@ fn webauthn_rp_and_origins(state: &AppState, headers: &HeaderMap) -> (String, Ve
     (rp_id, origins)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mint_session_response(
     state: &AppState,
     headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
     client_ip: &str,
     user_id: i64,
     email: &str,
@@ -232,7 +292,7 @@ async fn mint_session_response(
     audit_action: &str,
 ) -> Response {
     let now_sec = chrono::Utc::now().timestamp();
-    let ttl_sec = state.config.session_ttl_sec as i64;
+    let ttl_sec = state.config.session_ttl_sec;
     let sess_raw = random_token_b64(32);
     let sess_sha = sha256_hex(sess_raw.as_bytes());
     let csrf = random_token_b64(24);
@@ -241,16 +301,16 @@ async fn mint_session_response(
     let ip_hmac = state.rate_limiter.hash_key("session_ip", client_ip);
     if state
         .storage
-        .create_session(
-            &sess_sha,
+        .create_session(&NewSessionInput {
+            token_sha256: &sess_sha,
             user_id,
             org_id,
-            &csrf,
-            &ua,
-            &ip_hmac,
+            csrf_token: &csrf,
+            user_agent: &ua,
+            ip_hmac: &ip_hmac,
             now_sec,
             expires_at,
-        )
+        })
         .await
         .is_err()
     {
@@ -260,6 +320,7 @@ async fn mint_session_response(
         )
             .into_response();
     }
+    state.scanner_guard.track_session(&sess_sha, expires_at);
 
     let _ = state
         .storage
@@ -275,7 +336,7 @@ async fn mint_session_response(
         })
         .await;
 
-    let cookie = build_session_cookie(&sess_raw, ttl_sec, state, headers);
+    let cookie = build_session_cookie(&sess_raw, ttl_sec, state, headers, peer_ip);
     let mut resp = Json(json!({
         "user": {
             "id": user_id,
@@ -310,12 +371,23 @@ pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
-fn build_oidc_tx_cookie(val: &str, max_age_sec: i64, state: &AppState, headers: &HeaderMap) -> String {
-    let secure = !state.config.is_dev && is_https_request(headers, &state.config);
+fn build_oidc_tx_cookie(
+    val: &str,
+    max_age_sec: i64,
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+) -> String {
+    let secure = state.config.force_secure_cookies
+        || (!state.config.is_dev && is_https_request(headers, peer_ip, &state.config));
     let mut cookie = format!(
         "bf_oidc_tx={val}; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age={max_age_sec}"
     );
@@ -330,8 +402,9 @@ fn oidc_error_clearing_tx(
     msg: &str,
     state: &AppState,
     headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
 ) -> Response {
-    let clear_tx = build_oidc_tx_cookie("", 0, state, headers);
+    let clear_tx = build_oidc_tx_cookie("", 0, state, headers, peer_ip);
     let mut resp = (status, Json(json!({ "error": msg }))).into_response();
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -355,10 +428,12 @@ pub async fn oidc_login(
         )
             .into_response();
     };
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = request_client_ip(&ext);
-    let ip_dec = state
-        .rate_limiter
-        .check_and_record("oidc_ip", &client_ip, 30, Duration::from_secs(60));
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("oidc_ip", &client_ip, 30, Duration::from_secs(60));
     if !ip_dec.allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -406,7 +481,7 @@ pub async fn oidc_login(
         }
     };
 
-    let tx_cookie = build_oidc_tx_cookie(&sealed, 300, &state, &headers);
+    let tx_cookie = build_oidc_tx_cookie(&sealed, 300, &state, &headers, peer_ip);
     let mut resp = StatusCode::FOUND.into_response();
     if let Ok(loc) = HeaderValue::from_str(&authorize_url) {
         resp.headers_mut().insert(header::LOCATION, loc);
@@ -433,18 +508,22 @@ pub async fn oidc_callback(
             "OIDC SSO is not configured",
             &state,
             &headers,
+            request_peer_ip(&ext),
         );
     };
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = request_client_ip(&ext);
-    let ip_dec = state
-        .rate_limiter
-        .check_and_record("oidc_ip", &client_ip, 30, Duration::from_secs(60));
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("oidc_ip", &client_ip, 30, Duration::from_secs(60));
     if !ip_dec.allowed {
         return oidc_error_clearing_tx(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many SSO callback attempts",
             &state,
             &headers,
+            peer_ip,
         );
     }
 
@@ -454,6 +533,7 @@ pub async fn oidc_callback(
             &format!("OIDC provider rejected login: {idp_err}"),
             &state,
             &headers,
+            peer_ip,
         );
     }
 
@@ -463,6 +543,7 @@ pub async fn oidc_callback(
             "Missing OIDC login transaction cookie",
             &state,
             &headers,
+            peer_ip,
         );
     };
 
@@ -470,7 +551,13 @@ pub async fn oidc_callback(
     let tx = match open_oidc_tx_cookie(&state.config.app_key, &sealed, now_sec) {
         Ok(t) => t,
         Err(msg) => {
-            return oidc_error_clearing_tx(StatusCode::BAD_REQUEST, &msg, &state, &headers);
+            return oidc_error_clearing_tx(
+                StatusCode::BAD_REQUEST,
+                &msg,
+                &state,
+                &headers,
+                peer_ip,
+            );
         }
     };
 
@@ -481,14 +568,20 @@ pub async fn oidc_callback(
             "Invalid OIDC state parameter",
             &state,
             &headers,
+            peer_ip,
         );
     }
-    let Some(code) = q.get("code").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let Some(code) = q
+        .get("code")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
         return oidc_error_clearing_tx(
             StatusCode::BAD_REQUEST,
             "Missing OIDC authorization code",
             &state,
             &headers,
+            peer_ip,
         );
     };
 
@@ -501,7 +594,13 @@ pub async fn oidc_callback(
     {
         Ok(Ok(c)) => c,
         Ok(Err(msg)) => {
-            return oidc_error_clearing_tx(StatusCode::UNAUTHORIZED, &msg, &state, &headers);
+            return oidc_error_clearing_tx(
+                StatusCode::UNAUTHORIZED,
+                &msg,
+                &state,
+                &headers,
+                peer_ip,
+            );
         }
         Err(e) => {
             return oidc_error_clearing_tx(
@@ -509,6 +608,7 @@ pub async fn oidc_callback(
                 &format!("OIDC worker failed: {e}"),
                 &state,
                 &headers,
+                peer_ip,
             );
         }
     };
@@ -522,6 +622,7 @@ pub async fn oidc_callback(
                 "No active Bug-Finder account exists for this SSO email; ask an administrator to invite you first",
                 &state,
                 &headers,
+                peer_ip,
             );
         }
         Err(e) => {
@@ -530,6 +631,7 @@ pub async fn oidc_callback(
                 &e,
                 &state,
                 &headers,
+                peer_ip,
             );
         }
     };
@@ -544,16 +646,16 @@ pub async fn oidc_callback(
 
     if state
         .storage
-        .create_session(
-            &sess_sha,
-            user.user_id,
-            user.organization_id,
-            &csrf,
-            &ua,
-            &ip_hmac,
+        .create_session(&NewSessionInput {
+            token_sha256: &sess_sha,
+            user_id: user.user_id,
+            org_id: user.organization_id,
+            csrf_token: &csrf,
+            user_agent: &ua,
+            ip_hmac: &ip_hmac,
             now_sec,
             expires_at,
-        )
+        })
         .await
         .is_err()
     {
@@ -562,8 +664,10 @@ pub async fn oidc_callback(
             "Session creation failed",
             &state,
             &headers,
+            peer_ip,
         );
     }
+    state.scanner_guard.track_session(&sess_sha, expires_at);
 
     let _ = state
         .storage
@@ -583,8 +687,8 @@ pub async fn oidc_callback(
         })
         .await;
 
-    let sess_cookie = build_session_cookie(&sess_raw, ttl_sec, &state, &headers);
-    let clear_tx = build_oidc_tx_cookie("", 0, &state, &headers);
+    let sess_cookie = build_session_cookie(&sess_raw, ttl_sec, &state, &headers, peer_ip);
+    let clear_tx = build_oidc_tx_cookie("", 0, &state, &headers, peer_ip);
     let mut resp = StatusCode::FOUND.into_response();
     resp.headers_mut()
         .insert(header::LOCATION, HeaderValue::from_static("/"));
@@ -607,8 +711,17 @@ pub async fn auth_setup(
     ext: axum::http::Extensions,
     Json(req): Json<SetupRequest>,
 ) -> Response {
-    if req.website.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid submission" }))).into_response();
+    if req
+        .website
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid submission" })),
+        )
+            .into_response();
     }
     let client_ip = ext
         .get::<ClientIp>()
@@ -621,14 +734,26 @@ pub async fn auth_setup(
         Duration::from_secs(60),
     );
     if !setup_dec.allowed {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Too many setup requests" }))).into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many setup requests" })),
+        )
+            .into_response();
     }
     match state.storage.needs_setup().await {
         Ok(false) => {
-            return (StatusCode::CONFLICT, Json(json!({ "error": "Setup already completed" }))).into_response();
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "Setup already completed" })),
+            )
+                .into_response();
         }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response();
         }
         Ok(true) => {}
     }
@@ -641,11 +766,7 @@ pub async fn auth_setup(
             .into_response();
     }
     if let Err(msg) = validate_password_strength(&req.password, &req.email, &req.name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": msg })),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
     let org_slug = sanitize_slug(&req.org_slug);
     let proj_slug = sanitize_slug(req.project_slug.as_deref().unwrap_or("app-main"));
@@ -658,7 +779,11 @@ pub async fn auth_setup(
     }
 
     let Ok(pw_hash) = hash_password(req.password).await else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Password hashing failed" }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Password hashing failed" })),
+        )
+            .into_response();
     };
 
     let dsn_pub = generate_dsn_public_key();
@@ -667,17 +792,17 @@ pub async fn auth_setup(
 
     let (org, proj) = match state
         .storage
-        .initial_setup(
-            req.org_name.trim(),
-            &org_slug,
-            req.email.trim(),
-            req.name.trim(),
-            &pw_hash,
-            proj_name.trim(),
-            &proj_slug,
-            &dsn_pub,
-            &dsn_sha,
-        )
+        .initial_setup(&InitialSetupInput {
+            org_name: req.org_name.trim(),
+            org_slug: &org_slug,
+            email: req.email.trim(),
+            name: req.name.trim(),
+            password_hash: &pw_hash,
+            first_project_name: proj_name.trim(),
+            first_project_slug: &proj_slug,
+            dsn_public_key: &dsn_pub,
+            dsn_key_sha256: &dsn_sha,
+        })
         .await
     {
         Ok(res) => res,
@@ -692,12 +817,23 @@ pub async fn auth_setup(
     };
 
     // Log the new owner in right away
-    let Some(user) = state.storage.find_user_for_login(req.email.trim()).await.ok().flatten() else {
-        return (StatusCode::CREATED, Json(json!({ "organization": org, "project": proj }))).into_response();
+    let Some(user) = state
+        .storage
+        .find_user_for_login(req.email.trim())
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::CREATED,
+            Json(json!({ "organization": org, "project": proj })),
+        )
+            .into_response();
     };
 
+    let peer_ip = request_peer_ip(&ext);
     let now_sec = chrono::Utc::now().timestamp();
-    let ttl_sec = state.config.session_ttl_sec as i64;
+    let ttl_sec = state.config.session_ttl_sec;
     let sess_raw = random_token_b64(32);
     let sess_sha = sha256_hex(sess_raw.as_bytes());
     let csrf = random_token_b64(24);
@@ -706,12 +842,26 @@ pub async fn auth_setup(
     let ip_hmac = state.rate_limiter.hash_key("session_ip", &client_ip);
     if state
         .storage
-        .create_session(&sess_sha, user.user_id, org.id, &csrf, &ua, &ip_hmac, now_sec, exp)
+        .create_session(&NewSessionInput {
+            token_sha256: &sess_sha,
+            user_id: user.user_id,
+            org_id: org.id,
+            csrf_token: &csrf,
+            user_agent: &ua,
+            ip_hmac: &ip_hmac,
+            now_sec,
+            expires_at: exp,
+        })
         .await
         .is_err()
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Session create failed" }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Session create failed" })),
+        )
+            .into_response();
     }
+    state.scanner_guard.track_session(&sess_sha, exp);
 
     let _ = state
         .storage
@@ -727,7 +877,7 @@ pub async fn auth_setup(
         })
         .await;
 
-    let cookie = build_session_cookie(&sess_raw, ttl_sec, &state, &headers);
+    let cookie = build_session_cookie(&sess_raw, ttl_sec, &state, &headers, peer_ip);
     let mut resp = (
         StatusCode::CREATED,
         Json(json!({
@@ -749,9 +899,19 @@ pub async fn auth_login(
     ext: axum::http::Extensions,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    if req.website.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid submission" }))).into_response();
+    if req
+        .website
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid submission" })),
+        )
+            .into_response();
     }
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = ext
         .get::<ClientIp>()
         .map(|c| c.0.to_string())
@@ -759,14 +919,16 @@ pub async fn auth_login(
     let email_norm = req.email.trim().to_ascii_lowercase();
 
     // 1. Check IP rate limiter (preserved even after successful login against password spraying)
-    let ip_dec = state.rate_limiter.check_and_record(
-        "auth_ip",
-        &client_ip,
-        60,
-        Duration::from_secs(60),
-    );
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 60, Duration::from_secs(60));
     if !ip_dec.allowed {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Too many login requests" }))).into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many login requests" })),
+        )
+            .into_response();
     }
 
     // 2. Check principal rate limiter
@@ -777,7 +939,11 @@ pub async fn auth_login(
         Duration::from_secs(60),
     );
     if !prin_dec.allowed {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Too many login attempts for account" }))).into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many login attempts for account" })),
+        )
+            .into_response();
     }
 
     // 3. Persistent exponential lockout check
@@ -796,16 +962,33 @@ pub async fn auth_login(
         Ok(None) => {
             // Equalize scrypt work & timing against account enumeration before recording strike
             let _ = verify_password(req.password, dummy_scrypt_hash()).await;
-            let _ = state.storage.record_login_failure(&lock_hmac, now_sec).await;
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid credentials" }))).into_response();
+            let _ = state
+                .storage
+                .record_login_failure(&lock_hmac, now_sec)
+                .await;
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid credentials" })),
+            )
+                .into_response();
         }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response();
         }
     };
 
-    if !user.is_active || !verify_password(req.password, user.password_hash).await {
-        let locked = state.storage.record_login_failure(&lock_hmac, now_sec).await.ok().flatten();
+    let pw_ok = verify_password(req.password, user.password_hash).await;
+    if !user.is_active || !pw_ok {
+        let locked = state
+            .storage
+            .record_login_failure(&lock_hmac, now_sec)
+            .await
+            .ok()
+            .flatten();
         if let Some(secs) = locked {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -813,15 +996,26 @@ pub async fn auth_login(
             )
                 .into_response();
         }
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid credentials" }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid credentials" })),
+        )
+            .into_response();
     }
 
     // Success: clear principal buckets ONLY — never clear the IP spray bucket
-    state.rate_limiter.clear_bucket("auth_principal", &email_norm);
+    state
+        .rate_limiter
+        .clear_bucket("auth_principal", &email_norm);
     let _ = state.storage.clear_login_failures(&lock_hmac).await;
 
     // Check if MFA (TOTP or Passkeys) is active for this user
-    let mfa_rec = state.storage.get_user_mfa_record(user.user_id).await.ok().flatten();
+    let mfa_rec = state
+        .storage
+        .get_user_mfa_record(user.user_id)
+        .await
+        .ok()
+        .flatten();
     let totp_enabled = mfa_rec.as_ref().map(|r| r.is_enabled).unwrap_or(false);
     let passkeys = state
         .storage
@@ -835,11 +1029,21 @@ pub async fn auth_login(
         let ip_hmac = state.rate_limiter.hash_key("mfa_ip", &client_ip);
         if state
             .storage
-            .create_mfa_challenge(&chall_sha, user.user_id, user.organization_id, &ip_hmac, now_sec + 300)
+            .create_mfa_challenge(
+                &chall_sha,
+                user.user_id,
+                user.organization_id,
+                &ip_hmac,
+                now_sec + 300,
+            )
             .await
             .is_err()
         {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "MFA challenge error" }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "MFA challenge error" })),
+            )
+                .into_response();
         }
         let mut methods: Vec<&str> = Vec::new();
         if totp_enabled {
@@ -860,6 +1064,7 @@ pub async fn auth_login(
     mint_session_response(
         &state,
         &headers,
+        peer_ip,
         &client_ip,
         user.user_id,
         &user.email,
@@ -877,8 +1082,9 @@ pub async fn auth_logout(
     headers: HeaderMap,
     ext: axum::http::Extensions,
 ) -> Response {
-    if let Err(r) = require_session_mutation(&state, &headers) {
-        return r;
+    let peer_ip = request_peer_ip(&ext);
+    if let Err(r) = require_session_mutation(&state, &headers, peer_ip) {
+        return *r;
     }
     let client_ip = request_client_ip(&ext);
     if let Some(sess) = resolve_request_session(&state, &headers).await {
@@ -891,6 +1097,7 @@ pub async fn auth_logout(
         }
         if let Some(raw) = extract_cookie(&headers, "bf_session") {
             let sha = sha256_hex(raw.as_bytes());
+            state.scanner_guard.untrack_session(&sha);
             let _ = state.storage.delete_session(&sha).await;
         }
         let _ = state
@@ -907,7 +1114,7 @@ pub async fn auth_logout(
             })
             .await;
     }
-    let cookie = build_session_cookie("", 0, &state, &headers);
+    let cookie = build_session_cookie("", 0, &state, &headers, peer_ip);
     let mut resp = Json(json!({ "ok": true })).into_response();
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
@@ -915,12 +1122,13 @@ pub async fn auth_logout(
     resp
 }
 
-pub async fn auth_me(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn auth_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let Some(sess) = resolve_request_session(&state, &headers).await else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Unauthenticated" }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unauthenticated" })),
+        )
+            .into_response();
     };
     let orgs = state
         .storage
@@ -1004,10 +1212,12 @@ pub async fn mfa_verify(
     ext: axum::http::Extensions,
     Json(req): Json<MfaVerifyReq>,
 ) -> Response {
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = request_client_ip(&ext);
-    let ip_dec = state
-        .rate_limiter
-        .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
     if !ip_dec.allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1071,7 +1281,12 @@ pub async fn mfa_verify(
 
     if let Some(code_raw) = req.code.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let aad = format!("mfa:totp:user:{}", chal.user_id);
-        let Ok(b32) = open_secret(&state.config.app_key, aad.as_bytes(), &mfa_rec.totp_secret_enc, false) else {
+        let Ok(b32) = open_secret(
+            &state.config.app_key,
+            aad.as_bytes(),
+            &mfa_rec.totp_secret_enc,
+            false,
+        ) else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "Failed opening encrypted MFA secret" })),
@@ -1085,24 +1300,34 @@ pub async fn mfa_verify(
             )
                 .into_response();
         };
-        if let Some(step) = verify_totp_window(&secret_bytes, code_raw, now_sec, mfa_rec.last_used_step) {
+        if let Some(step) =
+            verify_totp_window(&secret_bytes, code_raw, now_sec, mfa_rec.last_used_step)
+        {
             verified_step = Some(step);
             verified_ok = true;
         }
-    } else if let Some(rc_raw) = req.recovery_code.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    } else if let Some(rc_raw) = req
+        .recovery_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let unused = state
             .storage
             .list_unused_recovery_codes(chal.user_id)
             .await
             .unwrap_or_default();
-        if let Some(matched) = unused.into_iter().find(|rc| verify_recovery_code(rc_raw, &rc.code_hash)) {
+        if let Some(matched) = unused
+            .into_iter()
+            .find(|rc| verify_recovery_code(rc_raw, &rc.code_hash))
+        {
             if state
                 .storage
                 .mark_recovery_code_used(chal.user_id, matched.id, now_sec)
                 .await
                 .unwrap_or(false)
             {
-                verified_step = Some(mfa_rec.last_used_step.unwrap_or(0));
+                verified_step = Some(0);
                 audit_action = "auth.recovery_login";
                 verified_ok = true;
             }
@@ -1125,7 +1350,9 @@ pub async fn mfa_verify(
         if let Some(secs) = locked {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({ "error": "MFA locked due to repeated failures", "retry_after": secs })),
+                Json(
+                    json!({ "error": "MFA locked due to repeated failures", "retry_after": secs }),
+                ),
             )
                 .into_response();
         }
@@ -1136,11 +1363,37 @@ pub async fn mfa_verify(
             .into_response();
     }
 
-    let _ = state
+    if let Err(e) = state
         .storage
         .record_mfa_attempt(chal.user_id, verified_step, now_sec)
-        .await;
-    let _ = state.storage.consume_mfa_challenge(&chall_sha, now_sec).await;
+        .await
+    {
+        if e == "TOTP_STEP_REUSED" {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "TOTP code already used; wait for next code" })),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
+    }
+    let Some(_mc) = state
+        .storage
+        .consume_mfa_challenge(&chall_sha, now_sec)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "MFA challenge invalid, expired, or already used" })),
+        )
+            .into_response();
+    };
 
     let Some((email, name, _)) = state
         .storage
@@ -1176,6 +1429,7 @@ pub async fn mfa_verify(
     mint_session_response(
         &state,
         &headers,
+        peer_ip,
         &client_ip,
         chal.user_id,
         &email,
@@ -1188,23 +1442,47 @@ pub async fn mfa_verify(
     .await
 }
 
-pub async fn mfa_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, false).await {
+pub async fn mfa_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, false).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state.storage.get_mfa_status(sess.user_id).await {
         Ok(st) => Json(st).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
-pub async fn mfa_totp_enroll(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+pub async fn mfa_totp_enroll(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let now_sec = chrono::Utc::now().timestamp();
+    if let Err(r) = require_fresh_reauth(&sess, now_sec) {
+        return *r;
+    }
+    if sess.totp_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "TOTP MFA is already enabled; disable it before re-enrolling" })),
+        )
+            .into_response();
+    }
     let secret_b32 = generate_totp_secret_b32();
     let aad = format!("mfa:totp:user:{}", sess.user_id);
     let Ok(enc) = seal_secret(&state.config.app_key, aad.as_bytes(), &secret_b32) else {
@@ -1219,7 +1497,18 @@ pub async fn mfa_totp_enroll(State(state): State<Arc<AppState>>, headers: Header
         .upsert_pending_totp(sess.user_id, &enc, now_sec)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        if e == "MFA_ALREADY_ENABLED" {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "TOTP MFA is already enabled" })),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
     let otpauth_uri = build_otpauth_uri("Bug-Finder", &sess.email, &secret_b32);
     let qr_svg = render_qr_svg(&otpauth_uri);
@@ -1242,11 +1531,29 @@ pub async fn mfa_totp_confirm(
     ext: axum::http::Extensions,
     Json(req): Json<TotpConfirmReq>,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    let user_dec = state.rate_limiter.check_and_record(
+        "mfa_op_user",
+        &sess.user_id.to_string(),
+        10,
+        Duration::from_secs(60),
+    );
+    if !ip_dec.allowed || !user_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many TOTP confirmation attempts" })),
+        )
+            .into_response();
+    }
     let now_sec = chrono::Utc::now().timestamp();
     let Some(mfa_rec) = state
         .storage
@@ -1261,8 +1568,32 @@ pub async fn mfa_totp_confirm(
         )
             .into_response();
     };
+    if mfa_rec.is_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "TOTP MFA is already enabled" })),
+        )
+            .into_response();
+    }
+    if let Some(until) = mfa_rec.locked_until {
+        if until > now_sec {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "MFA temporarily locked due to failed attempts",
+                    "retry_after": until - now_sec
+                })),
+            )
+                .into_response();
+        }
+    }
     let aad = format!("mfa:totp:user:{}", sess.user_id);
-    let Ok(b32) = open_secret(&state.config.app_key, aad.as_bytes(), &mfa_rec.totp_secret_enc, false) else {
+    let Ok(b32) = open_secret(
+        &state.config.app_key,
+        aad.as_bytes(),
+        &mfa_rec.totp_secret_enc,
+        false,
+    ) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Failed decrypting pending TOTP secret" })),
@@ -1276,13 +1607,34 @@ pub async fn mfa_totp_confirm(
         )
             .into_response();
     };
-    let Some(step) = verify_totp_window(&secret_bytes, &req.code, now_sec, None) else {
+    let Some(step) = verify_totp_window(&secret_bytes, &req.code, now_sec, mfa_rec.last_used_step)
+    else {
+        if let Ok(Some(secs)) = state
+            .storage
+            .record_mfa_attempt(sess.user_id, None, now_sec)
+            .await
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(
+                    json!({ "error": "MFA locked due to repeated failures", "retry_after": secs }),
+                ),
+            )
+                .into_response();
+        }
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "Invalid 6-digit TOTP code" })),
         )
             .into_response();
     };
+    if let Err(e) = state
+        .storage
+        .record_mfa_attempt(sess.user_id, Some(step), now_sec)
+        .await
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+    }
     let pairs = generate_recovery_codes();
     let plaintexts: Vec<String> = pairs.iter().map(|(p, _)| p.clone()).collect();
     let hashes: Vec<String> = pairs.into_iter().map(|(_, h)| h).collect();
@@ -1291,12 +1643,12 @@ pub async fn mfa_totp_confirm(
         .enable_totp_with_recovery_codes(sess.user_id, &hashes, now_sec)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
-    let _ = state
-        .storage
-        .record_mfa_attempt(sess.user_id, Some(step), now_sec)
-        .await;
     let _ = state
         .storage
         .append_audit_log(&NewAuditLog {
@@ -1324,19 +1676,47 @@ pub async fn mfa_totp_disable(
     ext: axum::http::Extensions,
     body: Option<Json<TotpDisableReq>>,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    let user_dec = state.rate_limiter.check_and_record(
+        "mfa_op_user",
+        &sess.user_id.to_string(),
+        10,
+        Duration::from_secs(60),
+    );
+    if !ip_dec.allowed || !user_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many MFA disable attempts" })),
+        )
+            .into_response();
+    }
     let now_sec = chrono::Utc::now().timestamp();
     let mut step_up_ok = sess
         .reauth_at
         .map(|t| now_sec.saturating_sub(t) <= 600)
         .unwrap_or(false);
     if !step_up_ok {
+        let lock_hmac = state
+            .rate_limiter
+            .hash_key("login_lock", &sess.email.to_ascii_lowercase());
+        if let Ok(Some(wait_sec)) = state.storage.check_login_lockout(&lock_hmac, now_sec).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "Account temporarily locked", "retry_after": wait_sec })),
+            )
+                .into_response();
+        }
         if let Some(Json(req)) = body {
-            if let Some(pw) = req.password {
+            if let Some(pw) = req.password.filter(|s| !s.is_empty()) {
                 if let Some((_, _, pw_hash)) = state
                     .storage
                     .find_user_password_hash(sess.user_id)
@@ -1344,7 +1724,20 @@ pub async fn mfa_totp_disable(
                     .ok()
                     .flatten()
                 {
-                    step_up_ok = verify_password(pw, pw_hash).await;
+                    if verify_password(pw, pw_hash).await {
+                        let _ = state.storage.clear_login_failures(&lock_hmac).await;
+                        step_up_ok = true;
+                    } else if let Ok(Some(secs)) = state
+                        .storage
+                        .record_login_failure(&lock_hmac, now_sec)
+                        .await
+                    {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({ "error": "Account locked due to failed attempts", "retry_after": secs })),
+                        )
+                            .into_response();
+                    }
                 }
             }
         }
@@ -1376,7 +1769,11 @@ pub async fn mfa_totp_disable(
         }
     }
     if let Err(e) = state.storage.disable_mfa(sess.user_id, now_sec).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
     let _ = state
         .storage
@@ -1399,22 +1796,15 @@ pub async fn mfa_recovery_regenerate(
     headers: HeaderMap,
     ext: axum::http::Extensions,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
     let now_sec = chrono::Utc::now().timestamp();
-    if !sess
-        .reauth_at
-        .map(|t| now_sec.saturating_sub(t) <= 600)
-        .unwrap_or(false)
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Step-up re-authentication required", "reauth_required": true })),
-        )
-            .into_response();
+    if let Err(r) = require_fresh_reauth(&sess, now_sec) {
+        return *r;
     }
     if !sess.totp_enabled {
         return (
@@ -1431,7 +1821,11 @@ pub async fn mfa_recovery_regenerate(
         .replace_recovery_codes(sess.user_id, &hashes, now_sec)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
     let _ = state
         .storage
@@ -1452,19 +1846,28 @@ pub async fn mfa_recovery_regenerate(
 pub async fn passkey_register_begin(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ext: axum::http::Extensions,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let now_sec = chrono::Utc::now().timestamp();
+    if let Err(r) = require_fresh_reauth(&sess, now_sec) {
+        return *r;
+    }
     let challenge = random_token_b64(32);
     if let Err(e) = state
         .storage
         .save_webauthn_challenge(&challenge, Some(sess.user_id), "register", now_sec + 300)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
     let existing = state
         .storage
@@ -1475,7 +1878,7 @@ pub async fn passkey_register_begin(
         .into_iter()
         .map(|c| json!({ "type": "public-key", "id": c.credential_id_b64 }))
         .collect();
-    let (rp_id, _) = webauthn_rp_and_origins(&state, &headers);
+    let (rp_id, _) = webauthn_rp_and_origins(&state, &headers, peer_ip);
     let user_handle = URL_SAFE_NO_PAD.encode(format!("bf-user-{}", sess.user_id).as_bytes());
     Json(json!({
         "challenge": challenge,
@@ -1515,15 +1918,21 @@ pub async fn passkey_register_finish(
     ext: axum::http::Extensions,
     Json(req): Json<PasskeyRegisterFinishReq>,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
     let now_sec = chrono::Utc::now().timestamp();
+    if let Err(r) = require_fresh_reauth(&sess, now_sec) {
+        return *r;
+    }
     let chall_b64 = match extract_client_data_challenge(&req.client_data_json) {
         Ok(c) => c,
-        Err(msg) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response(),
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+        }
     };
     let Some(chal_rec) = state
         .storage
@@ -1545,7 +1954,7 @@ pub async fn passkey_register_finish(
         )
             .into_response();
     }
-    let (rp_id, origins) = webauthn_rp_and_origins(&state, &headers);
+    let (rp_id, origins) = webauthn_rp_and_origins(&state, &headers, peer_ip);
     let verified = match verify_registration(
         &chall_b64,
         &origins,
@@ -1554,7 +1963,9 @@ pub async fn passkey_register_finish(
         &req.attestation_object,
     ) {
         Ok(v) => v,
-        Err(msg) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response(),
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+        }
     };
     let cred_name = req
         .name
@@ -1595,10 +2006,15 @@ pub async fn passkey_register_finish(
     }
 }
 
-pub async fn list_passkeys(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, false).await {
+pub async fn list_passkeys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, false).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let creds = state
         .storage
@@ -1612,7 +2028,9 @@ pub async fn list_passkeys(State(state): State<Arc<AppState>>, headers: HeaderMa
             name: c.name,
             cose_alg: c.cose_alg,
             sign_count: c.sign_count,
-            last_used_at: c.last_used_at.map(|s| crate::domain::models::iso_from_ms(s * 1000)),
+            last_used_at: c
+                .last_used_at
+                .map(|s| crate::domain::models::iso_from_ms(s * 1000)),
             created_at: crate::domain::models::iso_from_ms(c.created_at),
         })
         .collect();
@@ -1625,9 +2043,10 @@ pub async fn delete_passkey(
     headers: HeaderMap,
     ext: axum::http::Extensions,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
     let now_sec = chrono::Utc::now().timestamp();
@@ -1661,7 +2080,11 @@ pub async fn delete_passkey(
             }
         }
     }
-    match state.storage.delete_webauthn_credential(sess.user_id, cred_id).await {
+    match state
+        .storage
+        .delete_webauthn_credential(sess.user_id, cred_id)
+        .await
+    {
         Ok(true) => {
             let _ = state
                 .storage
@@ -1678,8 +2101,16 @@ pub async fn delete_passkey(
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Passkey not found" }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Passkey not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -1696,10 +2127,12 @@ pub async fn passkey_login_begin(
     ext: axum::http::Extensions,
     body: Option<Json<PasskeyLoginBeginReq>>,
 ) -> Response {
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = request_client_ip(&ext);
-    let ip_dec = state
-        .rate_limiter
-        .check_and_record("auth_ip", &client_ip, 60, Duration::from_secs(60));
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 60, Duration::from_secs(60));
     if !ip_dec.allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1709,47 +2142,26 @@ pub async fn passkey_login_begin(
     }
     let now_sec = chrono::Utc::now().timestamp();
     let req = body.map(|Json(v)| v).unwrap_or_default();
-    let mut target_user_id: Option<i64> = None;
-
-    if let Some(tok) = req.challenge_token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let sha = sha256_hex(tok.as_bytes());
-        if let Ok(Some(chal)) = state.storage.get_mfa_challenge_user(&sha, now_sec).await {
-            target_user_id = Some(chal.user_id);
-        }
-    } else if let Some(email) = req.email.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(Some(u)) = state.storage.find_user_for_login(&email.to_ascii_lowercase()).await {
-            target_user_id = Some(u.user_id);
-        }
-    }
-
-    let allow_creds: Vec<serde_json::Value> = if let Some(uid) = target_user_id {
-        state
-            .storage
-            .list_webauthn_credentials(uid)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| json!({ "type": "public-key", "id": c.credential_id_b64 }))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
+    let _ = (&req.email, &req.challenge_token);
     let challenge = random_token_b64(32);
     if let Err(e) = state
         .storage
-        .save_webauthn_challenge(&challenge, target_user_id, "login", now_sec + 300)
+        .save_webauthn_challenge(&challenge, None, "login", now_sec + 300)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
-    let (rp_id, _) = webauthn_rp_and_origins(&state, &headers);
+    let (rp_id, _) = webauthn_rp_and_origins(&state, &headers, peer_ip);
     Json(json!({
         "challenge": challenge,
         "rpId": rp_id,
         "timeout": 120000,
-        "userVerification": "preferred",
-        "allowCredentials": allow_creds,
+        "userVerification": "required",
+        "allowCredentials": [],
     }))
     .into_response()
 }
@@ -1772,10 +2184,12 @@ pub async fn passkey_login_finish(
     ext: axum::http::Extensions,
     Json(req): Json<PasskeyLoginFinishReq>,
 ) -> Response {
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = request_client_ip(&ext);
-    let ip_dec = state
-        .rate_limiter
-        .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
     if !ip_dec.allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1786,7 +2200,9 @@ pub async fn passkey_login_finish(
     let now_sec = chrono::Utc::now().timestamp();
     let chall_b64 = match extract_client_data_challenge(&req.client_data_json) {
         Ok(c) => c,
-        Err(msg) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response(),
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+        }
     };
     let Some(chal_rec) = state
         .storage
@@ -1823,20 +2239,23 @@ pub async fn passkey_login_finish(
                 .into_response();
         }
     }
-    let (rp_id, origins) = webauthn_rp_and_origins(&state, &headers);
-    let new_sign_count = match verify_assertion(
-        &chall_b64,
-        &origins,
-        &rp_id,
-        cred.cose_alg,
-        &cred.public_key_b64,
-        cred.sign_count,
-        &req.client_data_json,
-        &req.authenticator_data,
-        &req.signature,
-    ) {
+    let (rp_id, origins) = webauthn_rp_and_origins(&state, &headers, peer_ip);
+    let new_sign_count = match verify_assertion(&WebAuthnAssertionInput {
+        expected_challenge_b64: &chall_b64,
+        expected_origins: &origins,
+        expected_rp_id: &rp_id,
+        cose_alg: cred.cose_alg,
+        public_key_b64: &cred.public_key_b64,
+        stored_sign_count: cred.sign_count,
+        client_data_b64: &req.client_data_json,
+        auth_data_b64: &req.authenticator_data,
+        signature_b64: &req.signature,
+        require_uv: true,
+    }) {
         Ok(cnt) => cnt,
-        Err(msg) => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response(),
+        Err(msg) => {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
+        }
     };
 
     let _ = state
@@ -1845,7 +2264,12 @@ pub async fn passkey_login_finish(
         .await;
 
     let mut preferred_org_id: Option<i64> = None;
-    if let Some(mfa_tok) = req.challenge_token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(mfa_tok) = req
+        .challenge_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let sha = sha256_hex(mfa_tok.as_bytes());
         if let Ok(Some(mc)) = state.storage.consume_mfa_challenge(&sha, now_sec).await {
             preferred_org_id = Some(mc.target_org_id);
@@ -1885,6 +2309,7 @@ pub async fn passkey_login_finish(
     mint_session_response(
         &state,
         &headers,
+        peer_ip,
         &client_ip,
         cred.user_id,
         &email,
@@ -1909,15 +2334,44 @@ pub async fn auth_reauth(
     ext: axum::http::Extensions,
     Json(req): Json<ReauthReq>,
 ) -> Response {
-    let (sess, sess_sha) = match require_authenticated_session(&state, &headers, true).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, sess_sha) =
+        match require_authenticated_session(&state, &headers, peer_ip, true).await {
+            Ok(v) => v,
+            Err(r) => return *r,
+        };
     let client_ip = request_client_ip(&ext);
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    let user_dec = state.rate_limiter.check_and_record(
+        "reauth_user",
+        &sess.user_id.to_string(),
+        10,
+        Duration::from_secs(60),
+    );
+    if !ip_dec.allowed || !user_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many re-authentication attempts" })),
+        )
+            .into_response();
+    }
     let now_sec = chrono::Utc::now().timestamp();
     let mut ok = false;
 
     if let Some(pw) = req.password.filter(|s| !s.is_empty()) {
+        let lock_hmac = state
+            .rate_limiter
+            .hash_key("login_lock", &sess.email.to_ascii_lowercase());
+        if let Ok(Some(wait_sec)) = state.storage.check_login_lockout(&lock_hmac, now_sec).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "Account temporarily locked", "retry_after": wait_sec })),
+            )
+                .into_response();
+        }
         if let Some((_, _, pw_hash)) = state
             .storage
             .find_user_password_hash(sess.user_id)
@@ -1926,16 +2380,69 @@ pub async fn auth_reauth(
             .flatten()
         {
             ok = verify_password(pw, pw_hash).await;
+            if ok {
+                let _ = state.storage.clear_login_failures(&lock_hmac).await;
+            } else if let Ok(Some(secs)) = state
+                .storage
+                .record_login_failure(&lock_hmac, now_sec)
+                .await
+            {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "Account locked due to failed attempts", "retry_after": secs })),
+                )
+                    .into_response();
+            }
         }
-    } else if let Some(code) = req.totp_code.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    } else if let Some(code) = req
+        .totp_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if let Ok(Some(mfa_rec)) = state.storage.get_user_mfa_record(sess.user_id).await {
+            if let Some(until) = mfa_rec.locked_until {
+                if until > now_sec {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({
+                            "error": "MFA temporarily locked due to failed attempts",
+                            "retry_after": until - now_sec
+                        })),
+                    )
+                        .into_response();
+                }
+            }
             if mfa_rec.is_enabled {
                 let aad = format!("mfa:totp:user:{}", sess.user_id);
-                if let Ok(b32) = open_secret(&state.config.app_key, aad.as_bytes(), &mfa_rec.totp_secret_enc, false) {
+                if let Ok(b32) = open_secret(
+                    &state.config.app_key,
+                    aad.as_bytes(),
+                    &mfa_rec.totp_secret_enc,
+                    false,
+                ) {
                     if let Ok(sec) = decode_base32(&b32) {
-                        if let Some(step) = verify_totp_window(&sec, code, now_sec, mfa_rec.last_used_step) {
-                            let _ = state.storage.record_mfa_attempt(sess.user_id, Some(step), now_sec).await;
-                            ok = true;
+                        if let Some(step) =
+                            verify_totp_window(&sec, code, now_sec, mfa_rec.last_used_step)
+                        {
+                            if state
+                                .storage
+                                .record_mfa_attempt(sess.user_id, Some(step), now_sec)
+                                .await
+                                .is_ok()
+                            {
+                                ok = true;
+                            }
+                        } else if let Ok(Some(secs)) = state
+                            .storage
+                            .record_mfa_attempt(sess.user_id, None, now_sec)
+                            .await
+                        {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(json!({ "error": "MFA locked due to repeated failures", "retry_after": secs })),
+                            )
+                                .into_response();
                         }
                     }
                 }
@@ -1962,7 +2469,11 @@ pub async fn auth_reauth(
         .mark_session_reauth(&sess_sha, sess.organization_id, now_sec)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
 
     let _ = state
@@ -1994,11 +2505,41 @@ pub async fn change_password(
     ext: axum::http::Extensions,
     Json(req): Json<PasswordChangeReq>,
 ) -> Response {
-    let (sess, old_sha) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, old_sha) = match require_authenticated_session(&state, &headers, peer_ip, true).await
+    {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    let user_dec = state.rate_limiter.check_and_record(
+        "pw_change_user",
+        &sess.user_id.to_string(),
+        10,
+        Duration::from_secs(60),
+    );
+    if !ip_dec.allowed || !user_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many password change attempts" })),
+        )
+            .into_response();
+    }
+    let now_sec = chrono::Utc::now().timestamp();
+    let lock_hmac = state
+        .rate_limiter
+        .hash_key("login_lock", &sess.email.to_ascii_lowercase());
+    if let Ok(Some(wait_sec)) = state.storage.check_login_lockout(&lock_hmac, now_sec).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Account temporarily locked", "retry_after": wait_sec })),
+        )
+            .into_response();
+    }
     let Some((email, name, current_hash)) = state
         .storage
         .find_user_password_hash(sess.user_id)
@@ -2013,12 +2554,24 @@ pub async fn change_password(
             .into_response();
     };
     if !verify_password(req.current_password, current_hash).await {
+        if let Ok(Some(secs)) = state
+            .storage
+            .record_login_failure(&lock_hmac, now_sec)
+            .await
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "Account locked due to failed attempts", "retry_after": secs })),
+            )
+                .into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "Current password is incorrect" })),
         )
             .into_response();
     }
+    let _ = state.storage.clear_login_failures(&lock_hmac).await;
     if let Err(msg) = validate_password_strength(&req.new_password, &email, &name) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
     }
@@ -2030,8 +2583,7 @@ pub async fn change_password(
             .into_response();
     };
 
-    let now_sec = chrono::Utc::now().timestamp();
-    let ttl_sec = state.config.session_ttl_sec as i64;
+    let ttl_sec = state.config.session_ttl_sec;
     let new_sess_raw = random_token_b64(32);
     let new_sess_sha = sha256_hex(new_sess_raw.as_bytes());
     let new_csrf = random_token_b64(24);
@@ -2040,22 +2592,30 @@ pub async fn change_password(
 
     if let Err(e) = state
         .storage
-        .change_user_password(
-            sess.user_id,
-            sess.organization_id,
-            &new_hash,
-            &old_sha,
-            &new_sess_sha,
-            &new_csrf,
-            &ua,
-            &ip_hmac,
+        .change_user_password(&PasswordChangeInput {
+            user_id: sess.user_id,
+            org_id: sess.organization_id,
+            new_password_hash: &new_hash,
+            old_session_sha: &old_sha,
+            new_session_sha: &new_sess_sha,
+            new_csrf: &new_csrf,
+            user_agent: &ua,
+            ip_hmac: &ip_hmac,
             now_sec,
-            now_sec + ttl_sec,
-        )
+            expires_at: now_sec + ttl_sec,
+        })
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
     }
+    state.scanner_guard.untrack_session(&old_sha);
+    state
+        .scanner_guard
+        .track_session(&new_sess_sha, now_sec + ttl_sec);
 
     let _ = state
         .storage
@@ -2071,7 +2631,7 @@ pub async fn change_password(
         })
         .await;
 
-    let cookie = build_session_cookie(&new_sess_raw, ttl_sec, &state, &headers);
+    let cookie = build_session_cookie(&new_sess_raw, ttl_sec, &state, &headers, peer_ip);
     let mut resp = Json(json!({
         "ok": true,
         "csrf_token": new_csrf,
@@ -2083,11 +2643,17 @@ pub async fn change_password(
     resp
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let (sess, sess_sha) = match require_authenticated_session(&state, &headers, false).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, sess_sha) =
+        match require_authenticated_session(&state, &headers, peer_ip, false).await {
+            Ok(v) => v,
+            Err(r) => return *r,
+        };
     let now_sec = chrono::Utc::now().timestamp();
     match state
         .storage
@@ -2095,7 +2661,11 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
         .await
     {
         Ok(list) => Json(list).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -2105,9 +2675,10 @@ pub async fn revoke_session(
     headers: HeaderMap,
     ext: axum::http::Extensions,
 ) -> Response {
-    let (sess, _) = match require_authenticated_session(&state, &headers, true).await {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let client_ip = request_client_ip(&ext);
     match state
@@ -2131,8 +2702,16 @@ pub async fn revoke_session(
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Session not found" }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Session not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -2141,10 +2720,12 @@ pub async fn revoke_other_sessions(
     headers: HeaderMap,
     ext: axum::http::Extensions,
 ) -> Response {
-    let (sess, sess_sha) = match require_authenticated_session(&state, &headers, true).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, sess_sha) =
+        match require_authenticated_session(&state, &headers, peer_ip, true).await {
+            Ok(v) => v,
+            Err(r) => return *r,
+        };
     let client_ip = request_client_ip(&ext);
     match state
         .storage
@@ -2167,7 +2748,11 @@ pub async fn revoke_other_sessions(
                 .await;
             Json(json!({ "ok": true, "revoked": revoked })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -2211,7 +2796,9 @@ pub async fn get_public_invitation(
 
 #[derive(Deserialize)]
 pub struct AcceptInviteReq {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub password: String,
     pub website: Option<String>,
 }
@@ -2223,13 +2810,26 @@ pub async fn accept_public_invitation(
     ext: axum::http::Extensions,
     Json(req): Json<AcceptInviteReq>,
 ) -> Response {
-    if req.website.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid submission" }))).into_response();
+    if req
+        .website
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid submission" })),
+        )
+            .into_response();
     }
+    let peer_ip = request_peer_ip(&ext);
     let client_ip = request_client_ip(&ext);
-    let ip_dec = state
-        .rate_limiter
-        .check_and_record("auth_invite_ip", &client_ip, 20, Duration::from_secs(60));
+    let ip_dec = state.rate_limiter.check_and_record(
+        "auth_invite_ip",
+        &client_ip,
+        20,
+        Duration::from_secs(60),
+    );
     if !ip_dec.allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -2253,35 +2853,82 @@ pub async fn accept_public_invitation(
         )
             .into_response();
     }
-    let clean_name = strip_ansi_and_bidi(req.name.trim()).chars().take(120).collect::<String>();
-    if clean_name.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Name is required" }))).into_response();
+    let auth_sess = resolve_request_session(&state, &headers).await;
+    if let Some(ref sess) = auth_sess {
+        if !validate_same_origin(&headers, peer_ip, &state.config)
+            || !verify_csrf_for_session(sess, &headers)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "Invalid CSRF or Origin" })),
+            )
+                .into_response();
+        }
     }
-    if let Err(msg) = validate_password_strength(&req.password, &info.email, &clean_name) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
-    }
-    let Ok(pw_hash) = hash_password(req.password).await else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "Password hashing failed" })),
-        )
-            .into_response();
+    let auth_uid = auth_sess.as_ref().map(|s| s.user_id);
+    let existing_signed_in_match = auth_sess
+        .as_ref()
+        .is_some_and(|s| s.email.eq_ignore_ascii_case(&info.email));
+
+    let (clean_name, pw_hash) = if existing_signed_in_match {
+        let fallback_name = auth_sess
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .unwrap_or("Member");
+        let cname = if req.name.trim().is_empty() {
+            fallback_name.to_string()
+        } else {
+            strip_ansi_and_bidi(req.name.trim())
+                .chars()
+                .take(120)
+                .collect::<String>()
+        };
+        (cname, String::new())
+    } else {
+        let cname = strip_ansi_and_bidi(req.name.trim())
+            .chars()
+            .take(120)
+            .collect::<String>();
+        if cname.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Name is required" })),
+            )
+                .into_response();
+        }
+        if let Err(msg) = validate_password_strength(&req.password, &info.email, &cname) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+        let Ok(h) = hash_password(req.password).await else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Password hashing failed" })),
+            )
+                .into_response();
+        };
+        (cname, h)
     };
     match state
         .storage
-        .accept_invitation(&sha, &clean_name, &pw_hash, now_sec)
+        .accept_invitation(&sha, &clean_name, &pw_hash, auth_uid, now_sec)
         .await
     {
-        Ok(Ok((uid, org_id, org_slug, email, role))) => {
+        Ok(AcceptInvitationOutcome::AcceptedNewUser {
+            user_id,
+            org_id,
+            org_slug,
+            email,
+            role,
+        }) => {
             let _ = state
                 .storage
                 .append_audit_log(&NewAuditLog {
                     organization_id: org_id,
-                    actor_user_id: Some(uid),
+                    actor_user_id: Some(user_id),
                     actor_email: email.clone(),
                     action: "member.invite_accepted".into(),
                     target_type: "user".into(),
-                    target_id: uid.to_string(),
+                    target_id: user_id.to_string(),
                     ip_hmac: state.rate_limiter.hash_key("session_ip", &client_ip),
                     metadata: json!({ "role": role.as_str() }),
                 })
@@ -2289,8 +2936,9 @@ pub async fn accept_public_invitation(
             let mut resp = mint_session_response(
                 &state,
                 &headers,
+                peer_ip,
                 &client_ip,
-                uid,
+                user_id,
                 &email,
                 &clean_name,
                 role,
@@ -2302,7 +2950,52 @@ pub async fn accept_public_invitation(
             *resp.status_mut() = StatusCode::CREATED;
             resp
         }
-        Ok(Err(msg)) => (StatusCode::GONE, Json(json!({ "error": msg }))).into_response(),
+        Ok(AcceptInvitationOutcome::AcceptedExistingUser {
+            user_id,
+            org_id,
+            org_slug,
+            email,
+            role,
+        }) => {
+            let _ = state
+                .storage
+                .append_audit_log(&NewAuditLog {
+                    organization_id: org_id,
+                    actor_user_id: Some(user_id),
+                    actor_email: email,
+                    action: "member.invite_accepted".into(),
+                    target_type: "user".into(),
+                    target_id: user_id.to_string(),
+                    ip_hmac: state.rate_limiter.hash_key("session_ip", &client_ip),
+                    metadata: json!({ "role": role.as_str(), "existing_account": true }),
+                })
+                .await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "accepted": true,
+                    "existing_account": true,
+                    "organization": { "id": org_id, "slug": org_slug },
+                    "role": role.as_str(),
+                })),
+            )
+                .into_response()
+        }
+        Ok(AcceptInvitationOutcome::ExistingAccountRequiresSignIn) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "An account with this email already exists. Please sign in first to accept this invitation."
+            })),
+        )
+            .into_response(),
+        Ok(AcceptInvitationOutcome::AlreadyMember) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "User is already a member of this organization" })),
+        )
+            .into_response(),
+        Ok(AcceptInvitationOutcome::InvalidOrExpired(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
 }

@@ -1,6 +1,9 @@
-use crate::domain::models::{LogLevel, NormalizedLog, NormalizedTransaction, now_ms};
+use crate::domain::models::{now_ms, LogLevel, NormalizedLog, NormalizedTransaction};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+pub const MAX_ENVELOPE_ITEMS: usize = 100;
+pub const MAX_SENTRY_LOGS_PER_ITEM: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct EnvelopeHeader {
@@ -91,8 +94,8 @@ fn next_line<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 /// - `client_report` (ignored cleanly)
 pub fn parse_envelope(data: &[u8]) -> Result<ParsedEnvelope, EnvelopeError> {
     let mut pos = 0;
-    let header_line = next_line(data, &mut pos)
-        .ok_or_else(|| EnvelopeError("Empty envelope body".into()))?;
+    let header_line =
+        next_line(data, &mut pos).ok_or_else(|| EnvelopeError("Empty envelope body".into()))?;
     let header_val: Value = serde_json::from_slice(header_line)
         .map_err(|_| EnvelopeError("Invalid envelope header JSON".into()))?;
 
@@ -126,23 +129,32 @@ pub fn parse_envelope(data: &[u8]) -> Result<ParsedEnvelope, EnvelopeError> {
         if item_header_line.is_empty() {
             continue;
         }
+        if items.len() >= MAX_ENVELOPE_ITEMS {
+            return Err(EnvelopeError("Envelope item count exceeds limit".into()));
+        }
         let item_header: Value = serde_json::from_slice(item_header_line)
             .map_err(|_| EnvelopeError("Invalid envelope item header JSON".into()))?;
         let item_type = item_header
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let explicit_len = item_header
-            .get("length")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
+        let explicit_len = match item_header.get("length").and_then(|v| v.as_u64()) {
+            Some(n) => Some(
+                usize::try_from(n)
+                    .map_err(|_| EnvelopeError("Envelope item length overflow".into()))?,
+            ),
+            None => None,
+        };
 
         let payload_bytes: &[u8] = if let Some(len) = explicit_len {
-            if pos + len > data.len() {
+            let Some(end) = pos.checked_add(len) else {
+                return Err(EnvelopeError("Envelope item length overflow".into()));
+            };
+            if end > data.len() {
                 return Err(EnvelopeError("Truncated envelope item payload".into()));
             }
-            let slice = &data[pos..pos + len];
-            pos += len;
+            let slice = &data[pos..end];
+            pos = end;
             if pos < data.len() && data[pos] == b'\r' {
                 pos += 1;
             }
@@ -235,7 +247,7 @@ pub fn parse_sentry_log_container(
 ) -> Result<Vec<NormalizedLog>, EnvelopeError> {
     let val: Value = serde_json::from_slice(payload)
         .map_err(|_| EnvelopeError("Invalid Sentry log JSON".into()))?;
-    let raw_items = if let Some(arr) = val.get("items").and_then(|v| v.as_array()) {
+    let mut raw_items = if let Some(arr) = val.get("items").and_then(|v| v.as_array()) {
         arr.clone()
     } else if let Some(arr) = val.as_array() {
         arr.clone()
@@ -244,9 +256,12 @@ pub fn parse_sentry_log_container(
     } else {
         Vec::new()
     };
+    if raw_items.len() > MAX_SENTRY_LOGS_PER_ITEM {
+        return Err(EnvelopeError("Sentry log batch exceeds limit".into()));
+    }
 
     let mut out = Vec::with_capacity(raw_items.len());
-    for item in raw_items {
+    for item in raw_items.drain(..) {
         let Some(obj) = item.as_object() else {
             continue;
         };
@@ -310,10 +325,8 @@ pub fn parse_sentry_log_container(
                         }
                     }
                     "sentry.trace.parent_span_id" => {
-                        if span_id.is_none() {
-                            if let Some(s) = unwrapped.as_str() {
-                                span_id = Some(s.to_string());
-                            }
+                        if let (None, Some(s)) = (&span_id, unwrapped.as_str()) {
+                            span_id = Some(s.to_string());
                         }
                     }
                     _ => {}
@@ -530,10 +543,7 @@ pub fn parse_dsn_url(dsn: &str) -> Option<(String, i64)> {
 
 /// Normalize browser CSP violation report into standard Sentry-like event payload.
 pub fn normalize_csp_report(raw: Value) -> Value {
-    let report = raw
-        .get("csp-report")
-        .cloned()
-        .unwrap_or(raw);
+    let report = raw.get("csp-report").cloned().unwrap_or(raw);
     let directive = report
         .get("effective-directive")
         .or_else(|| report.get("violated-directive"))
@@ -611,5 +621,35 @@ mod tests {
             parse_dsn_url("https://abc123@bugs.example.com/42"),
             Some(("abc123".into(), 42))
         );
+    }
+
+    #[test]
+    fn rejects_integer_overflow_length_and_item_count_overflow() {
+        let huge = format!("{{\"sent_at\":\"2026-01-01T00:00:00Z\"}}\n{{\"type\":\"attachment\",\"length\":{}}}\nhello\n", u64::MAX);
+        let err = parse_envelope(huge.as_bytes()).unwrap_err();
+        assert!(
+            err.0.contains("overflow") || err.0.contains("Truncated"),
+            "got: {err}"
+        );
+
+        let mut many = String::from("{\"sent_at\":\"2026-01-01T00:00:00Z\"}\n");
+        for _ in 0..=MAX_ENVELOPE_ITEMS {
+            many.push_str("{\"type\":\"client_report\"}\n{}\n");
+        }
+        assert!(parse_envelope(many.as_bytes()).is_err());
+
+        let too_many_logs: Vec<serde_json::Value> = (0..=MAX_SENTRY_LOGS_PER_ITEM)
+            .map(|i| json!({"timestamp": 1700000000.0, "level": "info", "body": format!("m{i}")}))
+            .collect();
+        let log_body = serde_json::to_vec(&json!({"version": 2, "items": too_many_logs})).unwrap();
+        let hdr = EnvelopeHeader {
+            event_id: None,
+            sent_at: None,
+            dsn: None,
+            sdk_name: None,
+            sdk_version: None,
+            trace: None,
+        };
+        assert!(parse_sentry_log_container(&log_body, &hdr).is_err());
     }
 }

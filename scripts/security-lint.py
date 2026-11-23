@@ -60,27 +60,34 @@ def check_files() -> list[str]:
     if re.search(r"\bBYPASSRLS\b", pg_sql):
         errors.append("Postgres security violation: literal BYPASSRLS token found")
 
-    # Verify every table with organization_id has ENABLE + FORCE ROW LEVEL SECURITY
+    # Verify every table with organization_id/target_org_id and auth/MFA tables have ENABLE + FORCE RLS
     cap_tables = (
         "dsn_key_lookup",
         "api_token_lookup",
         "session_lookup",
         "tunnel_lookup",
         "invitation_lookup",
+        "mfa_challenges",
+        "user_mfa",
+        "user_mfa_recovery_codes",
+        "webauthn_credentials",
+        "webauthn_challenges",
     )
     create_blocks = re.findall(
         r"CREATE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\);", pg_sql, flags=re.DOTALL
     )
     for tbl_name, body in create_blocks:
-        if "organization_id" in body:
+        if "organization_id" in body or "target_org_id" in body:
             explicit_enable = f"ALTER TABLE {tbl_name} ENABLE ROW LEVEL SECURITY" in pg_sql
             explicit_force = f"ALTER TABLE {tbl_name} FORCE ROW LEVEL SECURITY" in pg_sql
             in_array = f"'{tbl_name}'" in pg_sql and "FOREACH tbl IN ARRAY tenant_tables" in pg_sql
             if not (in_array or (explicit_enable and explicit_force)):
-                errors.append(f"Table {tbl_name} has organization_id without ENABLE + FORCE RLS")
+                errors.append(f"Table {tbl_name} has org scoping without ENABLE + FORCE RLS")
     for cap in cap_tables:
         if f"ALTER TABLE {cap} ENABLE ROW LEVEL SECURITY" not in pg_sql or f"ALTER TABLE {cap} FORCE ROW LEVEL SECURITY" not in pg_sql:
-            errors.append(f"Capability lookup table {cap} missing explicit ENABLE + FORCE RLS")
+            errors.append(f"Security/capability table {cap} missing explicit ENABLE + FORCE RLS")
+    if "REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs FROM bugfinder_app" not in pg_sql:
+        errors.append("Postgres security violation: audit_logs must revoke UPDATE, DELETE, TRUNCATE from bugfinder_app")
 
     # Verify AEAD encryption at rest invariant (seal_secret used in MFA & persistence)
     for req_file in ("src/http/auth_routes.rs", "src/storage/sqlite.rs", "src/storage/postgres.rs"):

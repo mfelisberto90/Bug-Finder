@@ -160,7 +160,10 @@ pub fn extract_issue_metadata(ev: &Value) -> ComputedIssueMetadata {
                 issue_type = IssueType::Error;
             }
             let first = &exc_vals[0];
-            let exc_type = first.get("type").and_then(|v| v.as_str()).unwrap_or("Error");
+            let exc_type = first
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Error");
             let exc_val = first.get("value").and_then(|v| v.as_str()).unwrap_or("");
             title = if exc_val.is_empty() {
                 exc_type.to_string()
@@ -280,13 +283,10 @@ pub fn extract_issue_metadata(ev: &Value) -> ComputedIssueMetadata {
         .and_then(|r| r.get("url"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let search_text = format!(
-        "{title} {culprit} {req_url} {}",
-        frame_names.join(" ")
-    )
-    .chars()
-    .take(1024)
-    .collect();
+    let search_text = format!("{title} {culprit} {req_url} {}", frame_names.join(" "))
+        .chars()
+        .take(1024)
+        .collect();
 
     ComputedIssueMetadata {
         event_id,
@@ -417,7 +417,11 @@ pub fn evaluate_inbound_filters(
     }
 
     if !filters.allowed_domains.is_empty() {
-        let source = origin_or_referer.or(if req_url.is_empty() { None } else { Some(req_url) });
+        let source = origin_or_referer.or(if req_url.is_empty() {
+            None
+        } else {
+            Some(req_url)
+        });
         if let Some(src) = source {
             if !is_origin_allowed(src, &filters.allowed_domains) {
                 return FilterDecision::Drop("disallowed_domain");
@@ -527,11 +531,21 @@ mod tests {
             FilterDecision::Drop("disallowed_domain")
         );
         assert_eq!(
-            evaluate_inbound_filters(&ok_ev, Some("https://app.acme.example"), Some("Googlebot/2.1"), &filters),
+            evaluate_inbound_filters(
+                &ok_ev,
+                Some("https://app.acme.example"),
+                Some("Googlebot/2.1"),
+                &filters
+            ),
             FilterDecision::Drop("crawler")
         );
         assert_eq!(
-            evaluate_inbound_filters(&ok_ev, Some("https://app.acme.example"), Some("Mozilla/5.0"), &filters),
+            evaluate_inbound_filters(
+                &ok_ev,
+                Some("https://app.acme.example"),
+                Some("Mozilla/5.0"),
+                &filters
+            ),
             FilterDecision::Accept
         );
     }

@@ -126,7 +126,10 @@ impl UserRole {
     }
 
     pub fn can_mutate_issues(&self) -> bool {
-        matches!(self, Self::Owner | Self::Manager | Self::Admin | Self::Member)
+        matches!(
+            self,
+            Self::Owner | Self::Manager | Self::Admin | Self::Member
+        )
     }
 
     pub fn can_read(&self) -> bool {
@@ -175,7 +178,11 @@ impl TenantCtx {
             organization_slug,
             user_id: Some(user_id),
             role,
-            scopes: role.default_scopes().iter().map(|s| (*s).to_string()).collect(),
+            scopes: role
+                .default_scopes()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             is_session_auth: true,
             reauth_at,
             session_id,
@@ -478,7 +485,10 @@ pub fn compress_payload_if_large(raw: &[u8]) -> (Vec<u8>, bool) {
     if raw.len() <= 2048 {
         return (raw.to_vec(), false);
     }
-    let mut encoder = flate2::write::DeflateEncoder::new(Vec::with_capacity(raw.len() / 3), flate2::Compression::fast());
+    let mut encoder = flate2::write::DeflateEncoder::new(
+        Vec::with_capacity(raw.len() / 3),
+        flate2::Compression::fast(),
+    );
     if encoder.write_all(raw).is_ok() {
         if let Ok(compressed) = encoder.finish() {
             if compressed.len() < raw.len() {

@@ -1,7 +1,9 @@
 use crate::alerts::dispatcher::AlertDispatchJob;
 use crate::domain::fingerprint::{extract_issue_metadata, should_reopen_on_regression};
 use crate::domain::models::*;
-use crate::security::auth::{compute_audit_entry_hash, compute_lockout_seconds, sha256_hex};
+use crate::security::auth::{
+    compute_audit_entry_hash, compute_lockout_seconds, sha256_hex, AuditEntryHashInput,
+};
 use crate::security::crypto::{open_secret, seal_secret};
 use crate::storage::*;
 use async_trait::async_trait;
@@ -52,13 +54,12 @@ impl PostgresStorage {
 
         if run_migrations {
             let want_sha = sha256_hex(PG_SCHEMA.as_bytes());
-            let already_applied: Option<String> = sqlx::query_scalar(
-                "SELECT schema_sha256 FROM bugfinder_schema_meta WHERE id = 1",
-            )
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten();
+            let already_applied: Option<String> =
+                sqlx::query_scalar("SELECT schema_sha256 FROM bugfinder_schema_meta WHERE id = 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
 
             if already_applied.as_deref() != Some(want_sha.as_str()) {
                 for stmt in split_pg_statements(PG_SCHEMA) {
@@ -96,7 +97,10 @@ impl PostgresStorage {
         &self.pool
     }
 
-    async fn begin_tenant(&self, organization_id: i64) -> Result<Transaction<'_, Postgres>, String> {
+    async fn begin_tenant(
+        &self,
+        organization_id: i64,
+    ) -> Result<Transaction<'_, Postgres>, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
         sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
             .bind(organization_id.to_string())
@@ -116,7 +120,10 @@ impl PostgresStorage {
         if filters.storm_sample_threshold == 0 {
             return true;
         }
-        let mut guard = self.storm_counters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .storm_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if guard.len() > 8192 {
             guard.clear();
         }
@@ -135,7 +142,7 @@ impl PostgresStorage {
             return true;
         }
         let every = filters.storm_sample_every.max(2);
-        entry.count % every == 0
+        entry.count.is_multiple_of(every)
     }
 }
 
@@ -274,6 +281,7 @@ async fn pg_build_alert_jobs_for_event(
         if matched {
             triggered_ids.push(id);
             jobs.push(AlertDispatchJob {
+                organization_id,
                 rule_id: id,
                 rule_name: name,
                 channel_type,
@@ -313,12 +321,14 @@ async fn pg_insert_event_in_tx(
 ) -> Result<(i64, String, bool, bool), String> {
     if !coalesce_aggregates {
         if auth.first_event_at.is_none() {
-            sqlx::query("UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL")
-                .bind(received_ms)
-                .bind(auth.project_id)
-                .execute(&mut **tx)
-                .await
-                .map_err(map_pg_err)?;
+            sqlx::query(
+                "UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL",
+            )
+            .bind(received_ms)
+            .bind(auth.project_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_pg_err)?;
         }
 
         if let Some(rel) = &meta.release {
@@ -337,14 +347,13 @@ async fn pg_insert_event_in_tx(
         }
     }
 
-    let dup: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM issue_events WHERE project_id = $1 AND event_id = $2",
-    )
-    .bind(auth.project_id)
-    .bind(&meta.event_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(map_pg_err)?;
+    let dup: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM issue_events WHERE project_id = $1 AND event_id = $2")
+            .bind(auth.project_id)
+            .bind(&meta.event_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(map_pg_err)?;
     if dup.is_some() {
         return Ok((0, String::new(), false, false));
     }
@@ -366,7 +375,11 @@ async fn pg_insert_event_in_tx(
                 resolved_in_release.as_deref(),
                 meta.release.as_deref(),
             );
-            let new_status = if reopen { "unresolved" } else { status.as_str() };
+            let new_status = if reopen {
+                "unresolved"
+            } else {
+                status.as_str()
+            };
             sqlx::query(
                 "UPDATE issues
                  SET event_count = event_count + 1,
@@ -448,7 +461,8 @@ async fn pg_insert_event_in_tx(
     }
 
     if store_full_blob {
-        let row_uuid = Uuid::parse_str(&new_uuid_v7_from_ms(received_ms)).unwrap_or_else(|_| Uuid::now_v7());
+        let row_uuid =
+            Uuid::parse_str(&new_uuid_v7_from_ms(received_ms)).unwrap_or_else(|_| Uuid::now_v7());
         let (blob, compressed) = compress_payload_if_large(payload_json);
         sqlx::query(
             "INSERT INTO issue_events (
@@ -508,15 +522,7 @@ impl StorageBackend for PostgresStorage {
 
     async fn initial_setup(
         &self,
-        org_name: &str,
-        org_slug: &str,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-        first_project_name: &str,
-        first_project_slug: &str,
-        dsn_public_key: &str,
-        dsn_key_sha256: &str,
+        input: &InitialSetupInput<'_>,
     ) -> Result<(OrganizationDto, ProjectDto), String> {
         let now = now_ms();
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
@@ -536,8 +542,8 @@ impl StorageBackend for PostgresStorage {
         let org_id: i64 = sqlx::query_scalar(
             "INSERT INTO organizations (slug, name, created_at) VALUES ($1, $2, $3) RETURNING id",
         )
-        .bind(org_slug)
-        .bind(org_name)
+        .bind(input.org_slug)
+        .bind(input.org_name)
         .bind(now)
         .fetch_one(&mut *tx)
         .await
@@ -552,9 +558,9 @@ impl StorageBackend for PostgresStorage {
         let user_id: i64 = sqlx::query_scalar(
             "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES ($1, $2, $3, TRUE, $4) RETURNING id",
         )
-        .bind(email.to_ascii_lowercase())
-        .bind(name)
-        .bind(password_hash)
+        .bind(input.email.to_ascii_lowercase())
+        .bind(input.name)
+        .bind(input.password_hash)
         .bind(now)
         .fetch_one(&mut *tx)
         .await
@@ -575,8 +581,8 @@ impl StorageBackend for PostgresStorage {
              VALUES ($1, $2, $3, 'javascript', $4, $5) RETURNING id",
         )
         .bind(org_id)
-        .bind(first_project_slug)
-        .bind(first_project_name)
+        .bind(input.first_project_slug)
+        .bind(input.first_project_name)
         .bind(&filters_val)
         .bind(now)
         .fetch_one(&mut *tx)
@@ -589,8 +595,8 @@ impl StorageBackend for PostgresStorage {
         )
         .bind(org_id)
         .bind(project_id)
-        .bind(dsn_public_key)
-        .bind(dsn_key_sha256)
+        .bind(input.dsn_public_key)
+        .bind(input.dsn_key_sha256)
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -600,11 +606,11 @@ impl StorageBackend for PostgresStorage {
             "INSERT INTO dsn_key_lookup (key_sha256, organization_id, project_id, organization_slug, project_slug, rate_limit_per_min, filters_json, is_active)
              VALUES ($1, $2, $3, $4, $5, 300, $6, TRUE)",
         )
-        .bind(dsn_key_sha256)
+        .bind(input.dsn_key_sha256)
         .bind(org_id)
         .bind(project_id)
-        .bind(org_slug)
-        .bind(first_project_slug)
+        .bind(input.org_slug)
+        .bind(input.first_project_slug)
         .bind(&filters_val)
         .execute(&mut *tx)
         .await
@@ -614,20 +620,20 @@ impl StorageBackend for PostgresStorage {
         Ok((
             OrganizationDto {
                 id: org_id,
-                slug: org_slug.to_string(),
-                name: org_name.to_string(),
+                slug: input.org_slug.to_string(),
+                name: input.org_name.to_string(),
                 role: "owner".into(),
                 created_at: now,
             },
             ProjectDto {
                 id: project_id,
                 organization_id: org_id,
-                slug: first_project_slug.to_string(),
-                name: first_project_name.to_string(),
+                slug: input.first_project_slug.to_string(),
+                name: input.first_project_name.to_string(),
                 platform: "javascript".into(),
                 first_event_at: None,
                 filters: ProjectFilters::default(),
-                dsn_public_key: Some(dsn_public_key.to_string()),
+                dsn_public_key: Some(input.dsn_public_key.to_string()),
                 tunnel_slug: None,
                 created_at: now,
             },
@@ -676,7 +682,11 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn check_login_lockout(&self, key_hmac: &str, now_sec: i64) -> Result<Option<i64>, String> {
+    async fn check_login_lockout(
+        &self,
+        key_hmac: &str,
+        now_sec: i64,
+    ) -> Result<Option<i64>, String> {
         let locked: Option<Option<i64>> =
             sqlx::query_scalar("SELECT locked_until FROM login_attempts WHERE key_hmac = $1")
                 .bind(key_hmac)
@@ -691,31 +701,33 @@ impl StorageBackend for PostgresStorage {
         Ok(None)
     }
 
-    async fn record_login_failure(&self, key_hmac: &str, now_sec: i64) -> Result<Option<i64>, String> {
+    async fn record_login_failure(
+        &self,
+        key_hmac: &str,
+        now_sec: i64,
+    ) -> Result<Option<i64>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
-        let prev: i64 = sqlx::query_scalar(
-            "SELECT failed_count FROM login_attempts WHERE key_hmac = $1",
-        )
-        .bind(key_hmac)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?
-        .unwrap_or(0);
-        let next = prev + 1;
-        let lock_secs = compute_lockout_seconds(next);
-        let locked_until = lock_secs.map(|s| now_sec + s);
-        sqlx::query(
+        let next: i64 = sqlx::query_scalar(
             "INSERT INTO login_attempts (key_hmac, failed_count, locked_until, updated_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (key_hmac) DO UPDATE SET failed_count = $2, locked_until = $3, updated_at = $4",
+             VALUES ($1, 1, NULL, $2)
+             ON CONFLICT (key_hmac) DO UPDATE
+             SET failed_count = login_attempts.failed_count + 1,
+                 updated_at = EXCLUDED.updated_at
+             RETURNING failed_count",
         )
         .bind(key_hmac)
-        .bind(next)
-        .bind(locked_until)
         .bind(now_sec)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        let lock_secs = compute_lockout_seconds(next);
+        let locked_until = lock_secs.map(|s| now_sec + s);
+        sqlx::query("UPDATE login_attempts SET locked_until = $1 WHERE key_hmac = $2")
+            .bind(locked_until)
+            .bind(key_hmac)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
         Ok(lock_secs)
     }
@@ -729,20 +741,10 @@ impl StorageBackend for PostgresStorage {
         Ok(())
     }
 
-    async fn create_session(
-        &self,
-        token_sha256: &str,
-        user_id: i64,
-        org_id: i64,
-        csrf_token: &str,
-        user_agent: &str,
-        ip_hmac: &str,
-        now_sec: i64,
-        expires_at: i64,
-    ) -> Result<i64, String> {
-        let mut tx = self.begin_tenant(org_id).await?;
+    async fn create_session(&self, input: &NewSessionInput<'_>) -> Result<i64, String> {
+        let mut tx = self.begin_tenant(input.org_id).await?;
         sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
-            .bind(user_id.to_string())
+            .bind(input.user_id.to_string())
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
@@ -751,25 +753,25 @@ impl StorageBackend for PostgresStorage {
              JOIN organization_members m ON m.organization_id = o.id
              WHERE o.id = $1 AND m.user_id = $2",
         )
-        .bind(org_id)
-        .bind(user_id)
+        .bind(input.org_id)
+        .bind(input.user_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(map_pg_err)?;
 
-        let ua: String = user_agent.chars().take(160).collect();
+        let ua: String = input.user_agent.chars().take(160).collect();
         let sess_id: i64 = sqlx::query_scalar(
             "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, user_agent, ip_hmac, last_seen_at, reauth_at, expires_at, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9) RETURNING id",
         )
-        .bind(token_sha256)
-        .bind(user_id)
-        .bind(org_id)
-        .bind(csrf_token)
+        .bind(input.token_sha256)
+        .bind(input.user_id)
+        .bind(input.org_id)
+        .bind(input.csrf_token)
         .bind(&ua)
-        .bind(ip_hmac)
-        .bind(now_sec)
-        .bind(expires_at)
+        .bind(input.ip_hmac)
+        .bind(input.now_sec)
+        .bind(input.expires_at)
         .bind(now_ms())
         .fetch_one(&mut *tx)
         .await
@@ -779,15 +781,15 @@ impl StorageBackend for PostgresStorage {
             "INSERT INTO session_lookup (token_sha256, session_id, organization_id, organization_slug, user_id, role, csrf_token, last_seen_at, reauth_at, expires_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9)",
         )
-        .bind(token_sha256)
+        .bind(input.token_sha256)
         .bind(sess_id)
-        .bind(org_id)
+        .bind(input.org_id)
         .bind(org_slug)
-        .bind(user_id)
+        .bind(input.user_id)
         .bind(role)
-        .bind(csrf_token)
-        .bind(now_sec)
-        .bind(expires_at)
+        .bind(input.csrf_token)
+        .bind(input.now_sec)
+        .bind(input.expires_at)
         .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
@@ -823,9 +825,14 @@ impl StorageBackend for PostgresStorage {
         if exp <= now_sec || (last_seen > 0 && last_seen + idle_ttl_sec <= now_sec) {
             return Ok(None);
         }
-        // Stage 2: Set transaction-local tenant context & verify active user + LIVE org membership
+        // Stage 2: Set transaction-local tenant & user context & verify active user + LIVE org membership
         sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
             .bind(org_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(uid.to_string())
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
@@ -869,7 +876,11 @@ impl StorageBackend for PostgresStorage {
         tx.commit().await.map_err(map_pg_err)?;
 
         Ok(Some(AuthenticatedSession {
-            session_id: if real_sess_id > 0 { real_sess_id } else { sess_id },
+            session_id: if real_sess_id > 0 {
+                real_sess_id
+            } else {
+                sess_id
+            },
             user_id: uid,
             email,
             name,
@@ -890,12 +901,13 @@ impl StorageBackend for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-        let org_id: Option<i64> =
-            sqlx::query_scalar("SELECT organization_id FROM session_lookup WHERE token_sha256 = $1")
-                .bind(token_sha256)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(map_pg_err)?;
+        let org_id: Option<i64> = sqlx::query_scalar(
+            "SELECT organization_id FROM session_lookup WHERE token_sha256 = $1",
+        )
+        .bind(token_sha256)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
         if let Some(oid) = org_id {
             sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
                 .bind(oid.to_string())
@@ -996,18 +1008,16 @@ impl StorageBackend for PostgresStorage {
         let mem_role = UserRole::from_db(&mem_role_s).unwrap_or(UserRole::Viewer);
         let eff_role = mem_role.min_role(tok_role);
         Ok(Some(
-            TenantCtx::from_token(
-                org_id,
-                found_slug,
-                uid,
-                eff_role,
-                &raw_scopes,
-            )
-            .with_token_expires_at(exp),
+            TenantCtx::from_token(org_id, found_slug, uid, eff_role, &raw_scopes)
+                .with_token_expires_at(exp),
         ))
     }
 
-    async fn resolve_dsn(&self, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
+    async fn resolve_dsn(
+        &self,
+        project_id: i64,
+        key_sha256: &str,
+    ) -> Result<Option<ProjectAuthInfo>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.ingest_dsn_key_sha256', $1, true)")
             .bind(key_sha256)
@@ -1052,18 +1062,22 @@ impl StorageBackend for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-        let active: Option<bool> = sqlx::query_scalar(
-            "SELECT is_active FROM tunnel_lookup WHERE slug = $1",
-        )
-        .bind(tunnel_slug)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
+        let active: Option<bool> =
+            sqlx::query_scalar("SELECT is_active FROM tunnel_lookup WHERE slug = $1")
+                .bind(tunnel_slug)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
         Ok(active == Some(true))
     }
 
-    async fn resolve_tunnel(&self, tunnel_slug: &str, project_id: i64, key_sha256: &str) -> Result<Option<ProjectAuthInfo>, String> {
+    async fn resolve_tunnel(
+        &self,
+        tunnel_slug: &str,
+        project_id: i64,
+        key_sha256: &str,
+    ) -> Result<Option<ProjectAuthInfo>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.tunnel_slug', $1, true)")
             .bind(tunnel_slug)
@@ -1119,7 +1133,11 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn resolve_tenant_for_user(&self, user_id: i64, org_slug: &str) -> Result<Option<TenantCtx>, String> {
+    async fn resolve_tenant_for_user(
+        &self,
+        user_id: i64,
+        org_slug: &str,
+    ) -> Result<Option<TenantCtx>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
             .bind(user_id.to_string())
@@ -1217,14 +1235,13 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
 
-        let org_settings: Value = sqlx::query_scalar(
-            "SELECT settings_json FROM organizations WHERE id = $1",
-        )
-        .bind(ctx.organization_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?
-        .unwrap_or_else(|| json!({}));
+        let org_settings: Value =
+            sqlx::query_scalar("SELECT settings_json FROM organizations WHERE id = $1")
+                .bind(ctx.organization_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?
+                .unwrap_or_else(|| json!({}));
 
         sqlx::query(
             "INSERT INTO dsn_key_lookup (key_sha256, organization_id, project_id, organization_slug, project_slug, rate_limit_per_min, filters_json, org_settings_json, is_active)
@@ -1298,7 +1315,11 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn list_project_keys(&self, ctx: &TenantCtx, project_slug: &str) -> Result<Vec<ProjectKeyDto>, String> {
+    async fn list_project_keys(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+    ) -> Result<Vec<ProjectKeyDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let rows = sqlx::query(
             "SELECT k.id, k.project_id, k.label, k.public_key, k.rate_limit_per_min, k.is_active, k.created_at
@@ -1333,13 +1354,12 @@ impl StorageBackend for PostgresStorage {
         key_sha256: &str,
     ) -> Result<Option<ProjectKeyDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let proj: Option<(i64, Value, Option<i64>)> = sqlx::query_as(
-            "SELECT id, filters_json, first_event_at FROM projects WHERE slug = $1",
-        )
-        .bind(project_slug)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
+        let proj: Option<(i64, Value, Option<i64>)> =
+            sqlx::query_as("SELECT id, filters_json, first_event_at FROM projects WHERE slug = $1")
+                .bind(project_slug)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
         let Some((pid, fval, first_ev)) = proj else {
             return Ok(None);
         };
@@ -1358,14 +1378,13 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
 
-        let org_settings: Value = sqlx::query_scalar(
-            "SELECT settings_json FROM organizations WHERE id = $1",
-        )
-        .bind(ctx.organization_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?
-        .unwrap_or_else(|| json!({}));
+        let org_settings: Value =
+            sqlx::query_scalar("SELECT settings_json FROM organizations WHERE id = $1")
+                .bind(ctx.organization_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?
+                .unwrap_or_else(|| json!({}));
 
         sqlx::query(
             "INSERT INTO dsn_key_lookup (key_sha256, organization_id, project_id, organization_slug, project_slug, rate_limit_per_min, filters_json, org_settings_json, first_event_at, is_active)
@@ -1394,7 +1413,12 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn delete_project_key(&self, ctx: &TenantCtx, project_slug: &str, key_id: i64) -> Result<bool, String> {
+    async fn delete_project_key(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+        key_id: i64,
+    ) -> Result<bool, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let sha: Option<String> = sqlx::query_scalar(
             "DELETE FROM project_keys k USING projects p
@@ -1417,7 +1441,12 @@ impl StorageBackend for PostgresStorage {
         Ok(sha.is_some())
     }
 
-    async fn enable_project_tunnel(&self, ctx: &TenantCtx, project_slug: &str, tunnel_slug: &str) -> Result<Option<String>, String> {
+    async fn enable_project_tunnel(
+        &self,
+        ctx: &TenantCtx,
+        project_slug: &str,
+        tunnel_slug: &str,
+    ) -> Result<Option<String>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let pid: Option<i64> = sqlx::query_scalar("SELECT id FROM projects WHERE slug = $1")
             .bind(project_slug)
@@ -1460,7 +1489,11 @@ impl StorageBackend for PostgresStorage {
         Ok(Some(tunnel_slug.to_string()))
     }
 
-    async fn issues_etag_watermark(&self, ctx: &TenantCtx, project_id: Option<i64>) -> Result<(i64, i64), String> {
+    async fn issues_etag_watermark(
+        &self,
+        ctx: &TenantCtx,
+        project_id: Option<i64>,
+    ) -> Result<(i64, i64), String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let (cnt, max_ls, sum_ev, res_cnt, ign_cnt): (i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT COUNT(*)::bigint,
@@ -1484,7 +1517,11 @@ impl StorageBackend for PostgresStorage {
         Ok((cnt, sig))
     }
 
-    async fn list_issues(&self, ctx: &TenantCtx, p: &IssueQueryParams) -> Result<(Vec<IssueSummaryDto>, i64, i64), String> {
+    async fn list_issues(
+        &self,
+        ctx: &TenantCtx,
+        p: &IssueQueryParams,
+    ) -> Result<(Vec<IssueSummaryDto>, i64, i64), String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let order = match p.sort.as_str() {
             "freq" => "i.event_count DESC, i.last_seen DESC",
@@ -1493,7 +1530,11 @@ impl StorageBackend for PostgresStorage {
         };
         let limit = p.limit.clamp(1, 200);
         let offset = p.offset.clamp(0, 100_000);
-        let q_text = p.search_query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let q_text = p
+            .search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         let sql = format!(
             "SELECT i.id, i.short_id, i.project_id, pr.slug AS project_slug, i.title, i.culprit, i.level,
@@ -1580,7 +1621,11 @@ impl StorageBackend for PostgresStorage {
         ))
     }
 
-    async fn get_issue(&self, ctx: &TenantCtx, issue_id: i64) -> Result<Option<IssueSummaryDto>, String> {
+    async fn get_issue(
+        &self,
+        ctx: &TenantCtx,
+        issue_id: i64,
+    ) -> Result<Option<IssueSummaryDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let row = sqlx::query(
             "SELECT i.id, i.short_id, i.project_id, pr.slug AS project_slug, i.title, i.culprit, i.level,
@@ -1608,7 +1653,7 @@ impl StorageBackend for PostgresStorage {
         let res = sqlx::query(
             "UPDATE issues
              SET status = $1,
-                 resolved_in_release = CASE WHEN $1 = 'resolved' THEN COALESCE($2, last_release) ELSE NULL END,
+                 resolved_in_release = CASE WHEN $1 = 'resolved' THEN $2 ELSE NULL END,
                  is_regression = CASE WHEN $1 = 'resolved' THEN FALSE ELSE is_regression END
              WHERE id = $3",
         )
@@ -1625,7 +1670,12 @@ impl StorageBackend for PostgresStorage {
         self.get_issue(ctx, issue_id).await
     }
 
-    async fn list_issue_events(&self, ctx: &TenantCtx, issue_id: i64, limit: i64) -> Result<Vec<IssueEventDetailDto>, String> {
+    async fn list_issue_events(
+        &self,
+        ctx: &TenantCtx,
+        issue_id: i64,
+        limit: i64,
+    ) -> Result<Vec<IssueEventDetailDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let rows = sqlx::query(
             "SELECT id, event_id, issue_id, project_id, timestamp_ms, level, environment,
@@ -1664,7 +1714,12 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn get_issue_event(&self, ctx: &TenantCtx, issue_id: i64, event_id_or_latest: &str) -> Result<Option<IssueEventDetailDto>, String> {
+    async fn get_issue_event(
+        &self,
+        ctx: &TenantCtx,
+        issue_id: i64,
+        event_id_or_latest: &str,
+    ) -> Result<Option<IssueEventDetailDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let row = if event_id_or_latest == "latest" {
             sqlx::query(
@@ -1712,12 +1767,13 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn query_logs(&self, ctx: &TenantCtx, p: &LogQueryParams) -> Result<Vec<LogEventDto>, String> {
+    async fn query_logs(
+        &self,
+        ctx: &TenantCtx,
+        p: &LogQueryParams,
+    ) -> Result<Vec<LogEventDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let cursor_uuid = p
-            .cursor_id
-            .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok());
+        let cursor_uuid = p.cursor_id.as_deref().and_then(|s| Uuid::parse_str(s).ok());
         let proj_filter: Option<&[i64]> = if p.project_ids.is_empty() {
             None
         } else {
@@ -1728,7 +1784,11 @@ impl StorageBackend for PostgresStorage {
         } else {
             Some(&p.level_list)
         };
-        let q_text = p.search_query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let q_text = p
+            .search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         let rows = sqlx::query(
             "SELECT id, timestamp_ms, level_num, severity_number, body, service, environment,
@@ -1809,7 +1869,12 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn get_log_stats(&self, ctx: &TenantCtx, since_ms: i64, until_ms: i64) -> Result<Value, String> {
+    async fn get_log_stats(
+        &self,
+        ctx: &TenantCtx,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Value, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let rows: Vec<(i64, i32, i64)> = sqlx::query_as(
             "SELECT (timestamp_ms / 3600000) * 3600000 AS b, level_num, COUNT(*)
@@ -1822,7 +1887,8 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        let mut buckets: std::collections::BTreeMap<i64, [i64; 6]> = std::collections::BTreeMap::new();
+        let mut buckets: std::collections::BTreeMap<i64, [i64; 6]> =
+            std::collections::BTreeMap::new();
         for (b, lvl, cnt) in rows {
             let slot = match LogLevel::from_num(lvl) {
                 LogLevel::Trace => 0,
@@ -1844,7 +1910,13 @@ impl StorageBackend for PostgresStorage {
         Ok(json!({ "intervals": intervals, "series": series }))
     }
 
-    async fn get_stats_v2(&self, ctx: &TenantCtx, category: &str, since_ms: i64, until_ms: i64) -> Result<Value, String> {
+    async fn get_stats_v2(
+        &self,
+        ctx: &TenantCtx,
+        category: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Value, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT bucket_hour, CAST(SUM(quantity) AS BIGINT)
@@ -1878,7 +1950,11 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn list_transactions(&self, ctx: &TenantCtx, since_ms: i64) -> Result<Vec<TransactionSummaryDto>, String> {
+    async fn list_transactions(
+        &self,
+        ctx: &TenantCtx,
+        since_ms: i64,
+    ) -> Result<Vec<TransactionSummaryDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let rows: Vec<(String, String, String, f64, i64)> = sqlx::query_as(
             "SELECT name, op, status, duration_ms, timestamp_ms
@@ -1889,22 +1965,41 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        struct Acc { op: String, durations: Vec<f64>, err: i64, last: i64 }
+        struct Acc {
+            op: String,
+            durations: Vec<f64>,
+            err: i64,
+            last: i64,
+        }
         let mut map: HashMap<String, Acc> = HashMap::new();
         for (name, op, status, dur, ts) in rows {
-            let e = map.entry(name).or_insert(Acc { op, durations: Vec::new(), err: 0, last: ts });
+            let e = map.entry(name).or_insert(Acc {
+                op,
+                durations: Vec::new(),
+                err: 0,
+                last: ts,
+            });
             e.durations.push(dur);
-            if status != "ok" && status != "unset" { e.err += 1; }
-            if ts > e.last { e.last = ts; }
+            if status != "ok" && status != "unset" {
+                e.err += 1;
+            }
+            if ts > e.last {
+                e.last = ts;
+            }
         }
         let mut out: Vec<TransactionSummaryDto> = map
             .into_iter()
             .map(|(name, mut a)| {
-                a.durations.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+                a.durations
+                    .sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
                 let n = a.durations.len();
                 let p50 = a.durations.get(n / 2).copied().unwrap_or(0.0);
                 let p95 = a.durations.get((n * 95) / 100).copied().unwrap_or(p50);
-                let avg = if n == 0 { 0.0 } else { a.durations.iter().sum::<f64>() / n as f64 };
+                let avg = if n == 0 {
+                    0.0
+                } else {
+                    a.durations.iter().sum::<f64>() / n as f64
+                };
                 TransactionSummaryDto {
                     name,
                     op: a.op,
@@ -1917,7 +2012,7 @@ impl StorageBackend for PostgresStorage {
                 }
             })
             .collect();
-        out.sort_by(|a, b| b.count.cmp(&a.count));
+        out.sort_by_key(|t| std::cmp::Reverse(t.count));
         Ok(out)
     }
 
@@ -2051,16 +2146,11 @@ impl StorageBackend for PostgresStorage {
     async fn save_source_map(
         &self,
         ctx: &TenantCtx,
-        project_slug: &str,
-        release_version: &str,
-        debug_id: &str,
-        filename: &str,
-        blob_sha256: &str,
-        size_bytes: i64,
+        input: &SaveSourceMapInput<'_>,
     ) -> Result<SourceMapRecord, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE slug = $1")
-            .bind(project_slug)
+            .bind(input.project_slug)
             .fetch_one(&mut *tx)
             .await
             .map_err(map_pg_err)?;
@@ -2070,11 +2160,11 @@ impl StorageBackend for PostgresStorage {
         )
         .bind(ctx.organization_id)
         .bind(pid)
-        .bind(release_version)
-        .bind(debug_id)
-        .bind(filename)
-        .bind(blob_sha256)
-        .bind(size_bytes)
+        .bind(input.release_version)
+        .bind(input.debug_id)
+        .bind(input.filename)
+        .bind(input.blob_sha256)
+        .bind(input.size_bytes)
         .bind(now_ms())
         .fetch_one(&mut *tx)
         .await
@@ -2082,11 +2172,11 @@ impl StorageBackend for PostgresStorage {
         tx.commit().await.map_err(map_pg_err)?;
         Ok(SourceMapRecord {
             id,
-            release_version: release_version.to_string(),
-            debug_id: debug_id.to_string(),
-            filename: filename.to_string(),
-            blob_sha256: blob_sha256.to_string(),
-            size_bytes,
+            release_version: input.release_version.to_string(),
+            debug_id: input.debug_id.to_string(),
+            filename: input.filename.to_string(),
+            blob_sha256: input.blob_sha256.to_string(),
+            size_bytes: input.size_bytes,
         })
     }
 
@@ -2123,17 +2213,42 @@ impl StorageBackend for PostgresStorage {
         }
         let map_name = format!("{filename}.map");
         let rel_s = release.unwrap_or("");
+        if !rel_s.is_empty() {
+            if let Some(r) = sqlx::query(
+                "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
+                 FROM source_maps
+                 WHERE project_id = $1 AND (filename = $2 OR filename = $3)
+                   AND (release_version = $4 OR release_version = '')
+                 ORDER BY CASE WHEN release_version = $4 THEN 0 ELSE 1 END, id DESC LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(&map_name)
+            .bind(filename)
+            .bind(rel_s)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_pg_err)?
+            {
+                tx.commit().await.map_err(map_pg_err)?;
+                return Ok(Some(SourceMapRecord {
+                    id: r.get("id"),
+                    release_version: r.get("release_version"),
+                    debug_id: r.get("debug_id"),
+                    filename: r.get("filename"),
+                    blob_sha256: r.get("blob_sha256"),
+                    size_bytes: r.get("size_bytes"),
+                }));
+            }
+        }
         let row = sqlx::query(
             "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
              FROM source_maps
              WHERE project_id = $1 AND (filename = $2 OR filename = $3)
-               AND (release_version = $4 OR release_version = '')
-             ORDER BY CASE WHEN release_version = $4 THEN 0 ELSE 1 END, id DESC LIMIT 1",
+             ORDER BY CASE WHEN release_version = '' THEN 0 ELSE 1 END, id DESC LIMIT 1",
         )
         .bind(project_id)
         .bind(&map_name)
         .bind(filename)
-        .bind(rel_s)
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
@@ -2233,7 +2348,13 @@ impl StorageBackend for PostgresStorage {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn record_heartbeat(&self, ctx: &TenantCtx, uuid: &str, is_up: bool, message: &str) -> Result<Option<UptimeMonitorDto>, String> {
+    async fn record_heartbeat(
+        &self,
+        ctx: &TenantCtx,
+        uuid: &str,
+        is_up: bool,
+        message: &str,
+    ) -> Result<Option<UptimeMonitorDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let now = now_ms();
         let status = if is_up { "up" } else { "down" };
@@ -2277,7 +2398,11 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn get_heartbeat(&self, ctx: &TenantCtx, uuid: &str) -> Result<Option<UptimeMonitorDto>, String> {
+    async fn get_heartbeat(
+        &self,
+        ctx: &TenantCtx,
+        uuid: &str,
+    ) -> Result<Option<UptimeMonitorDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let row = sqlx::query(
             "SELECT id, project_id, uuid, name, expected_interval_sec, last_heartbeat_at, status, is_active, created_at
@@ -2339,7 +2464,11 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn create_alert_rule(&self, ctx: &TenantCtx, rule: &NewAlertRule) -> Result<AlertRuleDto, String> {
+    async fn create_alert_rule(
+        &self,
+        ctx: &TenantCtx,
+        rule: &NewAlertRule,
+    ) -> Result<AlertRuleDto, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let owns: Option<i64> = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1")
             .bind(rule.project_id)
@@ -2349,7 +2478,11 @@ impl StorageBackend for PostgresStorage {
         if owns.is_none() {
             return Err("Project not found in organization".into());
         }
-        let enc_secret = seal_secret(&self.app_key, &webhook_aad(ctx.organization_id), &rule.webhook_secret)?;
+        let enc_secret = seal_secret(
+            &self.app_key,
+            &webhook_aad(ctx.organization_id),
+            &rule.webhook_secret,
+        )?;
         let now = now_ms();
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO alert_rules (organization_id, project_id, name, trigger_type, threshold_count, window_sec, cooldown_sec, channel_type, target_url, webhook_secret, email_to, is_active, created_at)
@@ -2400,11 +2533,22 @@ impl StorageBackend for PostgresStorage {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn get_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<AlertRuleDto>, String> {
-        Ok(self.get_alert_rule_for_dispatch(ctx, rule_id).await?.map(|(dto, _)| dto))
+    async fn get_alert_rule(
+        &self,
+        ctx: &TenantCtx,
+        rule_id: i64,
+    ) -> Result<Option<AlertRuleDto>, String> {
+        Ok(self
+            .get_alert_rule_for_dispatch(ctx, rule_id)
+            .await?
+            .map(|(dto, _)| dto))
     }
 
-    async fn get_alert_rule_for_dispatch(&self, ctx: &TenantCtx, rule_id: i64) -> Result<Option<(AlertRuleDto, String)>, String> {
+    async fn get_alert_rule_for_dispatch(
+        &self,
+        ctx: &TenantCtx,
+        rule_id: i64,
+    ) -> Result<Option<(AlertRuleDto, String)>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let row = sqlx::query(
             "SELECT id, project_id, name, trigger_type, threshold_count, window_sec, cooldown_sec,
@@ -2467,15 +2611,26 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
+    async fn get_api_token_role(
+        &self,
+        ctx: &TenantCtx,
+        token_id: i64,
+    ) -> Result<Option<UserRole>, String> {
+        let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        let role_str: Option<String> =
+            sqlx::query_scalar("SELECT role FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(role_str.as_deref().and_then(UserRole::from_db))
+    }
+
     async fn create_api_token(
         &self,
         ctx: &TenantCtx,
-        name: &str,
-        token_sha256: &str,
-        token_prefix: &str,
-        role: UserRole,
-        scopes: &str,
-        expires_at: Option<i64>,
+        input: &NewApiTokenInput<'_>,
     ) -> Result<ApiTokenDto, String> {
         let uid = ctx.user_id.ok_or("Missing actor user_id")?;
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
@@ -2486,12 +2641,12 @@ impl StorageBackend for PostgresStorage {
         )
         .bind(ctx.organization_id)
         .bind(uid)
-        .bind(name)
-        .bind(token_sha256)
-        .bind(token_prefix)
-        .bind(role.as_str())
-        .bind(scopes)
-        .bind(expires_at)
+        .bind(input.name)
+        .bind(input.token_sha256)
+        .bind(input.token_prefix)
+        .bind(input.role.as_str())
+        .bind(input.scopes)
+        .bind(input.expires_at)
         .bind(now)
         .fetch_one(&mut *tx)
         .await
@@ -2501,13 +2656,13 @@ impl StorageBackend for PostgresStorage {
             "INSERT INTO api_token_lookup (token_sha256, organization_id, organization_slug, user_id, role, scopes, expires_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
-        .bind(token_sha256)
+        .bind(input.token_sha256)
         .bind(ctx.organization_id)
         .bind(&ctx.organization_slug)
         .bind(uid)
-        .bind(role.as_str())
-        .bind(scopes)
-        .bind(expires_at)
+        .bind(input.role.as_str())
+        .bind(input.scopes)
+        .bind(input.expires_at)
         .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
@@ -2515,25 +2670,24 @@ impl StorageBackend for PostgresStorage {
         tx.commit().await.map_err(map_pg_err)?;
         Ok(ApiTokenDto {
             id,
-            name: name.to_string(),
-            token_prefix: token_prefix.to_string(),
-            role: role.as_str().to_string(),
-            scopes: scopes.to_string(),
+            name: input.name.to_string(),
+            token_prefix: input.token_prefix.to_string(),
+            role: input.role.as_str().to_string(),
+            scopes: input.scopes.to_string(),
             last_used_at: None,
-            expires_at: expires_at.map(|s| iso_from_ms(s * 1000)),
+            expires_at: input.expires_at.map(|s| iso_from_ms(s * 1000)),
             created_at: iso_from_ms(now),
         })
     }
 
     async fn delete_api_token(&self, ctx: &TenantCtx, token_id: i64) -> Result<bool, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let sha: Option<String> = sqlx::query_scalar(
-            "DELETE FROM api_tokens WHERE id = $1 RETURNING token_sha256",
-        )
-        .bind(token_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
+        let sha: Option<String> =
+            sqlx::query_scalar("DELETE FROM api_tokens WHERE id = $1 RETURNING token_sha256")
+                .bind(token_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
         if let Some(s) = &sha {
             sqlx::query("DELETE FROM api_token_lookup WHERE token_sha256 = $1")
                 .bind(s)
@@ -2577,12 +2731,11 @@ impl StorageBackend for PostgresStorage {
     ) -> Result<MemberDto, String> {
         let email_norm = email.trim().to_ascii_lowercase();
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let existing_uid: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
-                .bind(&email_norm)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(map_pg_err)?;
+        let existing_uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind(&email_norm)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let uid = match existing_uid {
             Some(id) => id,
             None => sqlx::query_scalar(
@@ -2596,9 +2749,9 @@ impl StorageBackend for PostgresStorage {
             .await
             .map_err(map_pg_err)?,
         };
-        sqlx::query(
+        let mem_res = sqlx::query(
             "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, $3)
-             ON CONFLICT (organization_id, user_id) DO UPDATE SET role = $3",
+             ON CONFLICT (organization_id, user_id) DO NOTHING",
         )
         .bind(ctx.organization_id)
         .bind(uid)
@@ -2606,6 +2759,9 @@ impl StorageBackend for PostgresStorage {
         .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        if mem_res.rows_affected() == 0 {
+            return Err("ALREADY_MEMBER".into());
+        }
         tx.commit().await.map_err(map_pg_err)?;
         Ok(MemberDto {
             user_id: uid,
@@ -2616,7 +2772,12 @@ impl StorageBackend for PostgresStorage {
         })
     }
 
-    async fn update_member_role(&self, ctx: &TenantCtx, target_user_id: i64, role: UserRole) -> Result<Result<MemberDto, String>, String> {
+    async fn update_member_role(
+        &self,
+        ctx: &TenantCtx,
+        target_user_id: i64,
+        role: UserRole,
+    ) -> Result<Result<MemberDto, String>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(ctx.organization_id)
@@ -2661,15 +2822,17 @@ impl StorageBackend for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-        let tok_rows: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT id, token_sha256, role FROM api_tokens WHERE user_id = $1",
-        )
-        .bind(target_user_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
+        let tok_rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, token_sha256, role FROM api_tokens WHERE user_id = $1")
+                .bind(target_user_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
         for (tid, tsha, trole) in tok_rows {
-            if UserRole::from_db(&trole).map(|r| r.rank() > role.rank()).unwrap_or(true) {
+            if UserRole::from_db(&trole)
+                .map(|r| r.rank() > role.rank())
+                .unwrap_or(true)
+            {
                 sqlx::query("DELETE FROM api_tokens WHERE id = $1")
                     .bind(tid)
                     .execute(&mut *tx)
@@ -2700,7 +2863,11 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn remove_member(&self, ctx: &TenantCtx, target_user_id: i64) -> Result<Result<bool, String>, String> {
+    async fn remove_member(
+        &self,
+        ctx: &TenantCtx,
+        target_user_id: i64,
+    ) -> Result<Result<bool, String>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(ctx.organization_id)
@@ -2766,6 +2933,25 @@ impl StorageBackend for PostgresStorage {
     ) -> Result<IdempotencyCheck, String> {
         let uid = ctx.user_id.unwrap_or(0);
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        let inserted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO idempotency_keys (organization_id, user_id, action, idem_key, payload_sha256, status_code, response_body, in_flight, created_at)
+             VALUES ($1, $2, $3, $4, $5, 0, '', TRUE, $6)
+             ON CONFLICT (organization_id, user_id, action, idem_key) DO NOTHING
+             RETURNING idem_key",
+        )
+        .bind(ctx.organization_id)
+        .bind(uid)
+        .bind(action)
+        .bind(idem_key)
+        .bind(payload_sha256)
+        .bind(now_ms())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        if inserted.is_some() {
+            tx.commit().await.map_err(map_pg_err)?;
+            return Ok(IdempotencyCheck::Proceed);
+        }
         let existing: Option<(String, i32, String, bool)> = sqlx::query_as(
             "SELECT payload_sha256, status_code, response_body, in_flight
              FROM idempotency_keys WHERE user_id = $1 AND action = $2 AND idem_key = $3 FOR UPDATE",
@@ -2782,30 +2968,16 @@ impl StorageBackend for PostgresStorage {
                     return Ok(IdempotencyCheck::Conflict("Request in-flight".into()));
                 }
                 if old_sha != payload_sha256 {
-                    return Ok(IdempotencyCheck::Conflict("Idempotency-Key payload mismatch".into()));
+                    return Ok(IdempotencyCheck::Conflict(
+                        "Idempotency-Key payload mismatch".into(),
+                    ));
                 }
                 Ok(IdempotencyCheck::Replay {
                     status_code: status as u16,
                     body,
                 })
             }
-            None => {
-                sqlx::query(
-                    "INSERT INTO idempotency_keys (organization_id, user_id, action, idem_key, payload_sha256, status_code, response_body, in_flight, created_at)
-                     VALUES ($1, $2, $3, $4, $5, 0, '', TRUE, $6)",
-                )
-                .bind(ctx.organization_id)
-                .bind(uid)
-                .bind(action)
-                .bind(idem_key)
-                .bind(payload_sha256)
-                .bind(now_ms())
-                .execute(&mut *tx)
-                .await
-                .map_err(map_pg_err)?;
-                tx.commit().await.map_err(map_pg_err)?;
-                Ok(IdempotencyCheck::Proceed)
-            }
+            None => Err("Concurrent idempotency conflict".into()),
         }
     }
 
@@ -2835,7 +3007,10 @@ impl StorageBackend for PostgresStorage {
         Ok(())
     }
 
-    async fn flush_ingest_batch(&self, items: Vec<IngestWriteItem>) -> Result<Vec<AlertDispatchJob>, String> {
+    async fn flush_ingest_batch(
+        &self,
+        items: Vec<IngestWriteItem>,
+    ) -> Result<Vec<AlertDispatchJob>, String> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -2843,10 +3018,18 @@ impl StorageBackend for PostgresStorage {
         for it in items {
             let oid = match &it {
                 IngestWriteItem::Event { auth, .. } => auth.organization_id,
-                IngestWriteItem::Logs { organization_id, .. } => *organization_id,
-                IngestWriteItem::Transaction { organization_id, .. } => *organization_id,
-                IngestWriteItem::Session { organization_id, .. } => *organization_id,
-                IngestWriteItem::CheckIn { organization_id, .. } => *organization_id,
+                IngestWriteItem::Logs {
+                    organization_id, ..
+                } => *organization_id,
+                IngestWriteItem::Transaction {
+                    organization_id, ..
+                } => *organization_id,
+                IngestWriteItem::Session {
+                    organization_id, ..
+                } => *organization_id,
+                IngestWriteItem::CheckIn {
+                    organization_id, ..
+                } => *organization_id,
             };
             by_org.entry(oid).or_default().push(it);
         }
@@ -2862,15 +3045,28 @@ impl StorageBackend for PostgresStorage {
 
             for item in org_items {
                 match item {
-                    IngestWriteItem::Event { auth, meta, payload_json, received_ms } => {
+                    IngestWriteItem::Event {
+                        auth,
+                        meta,
+                        payload_json,
+                        received_ms,
+                    } => {
                         let store_blob = self.should_sample_storm(
                             auth.project_id,
                             &meta.fingerprint,
                             &auth.filters,
                             received_ms,
                         );
-                        let (issue_id, short_id, is_new, is_reg) =
-                            pg_insert_event_in_tx(&mut tx, &auth, &meta, &payload_json, received_ms, store_blob, true).await?;
+                        let (issue_id, short_id, is_new, is_reg) = pg_insert_event_in_tx(
+                            &mut tx,
+                            &auth,
+                            &meta,
+                            &payload_json,
+                            received_ms,
+                            store_blob,
+                            true,
+                        )
+                        .await?;
                         if issue_id > 0 {
                             if auth.first_event_at.is_none() {
                                 first_event_proj
@@ -2885,7 +3081,9 @@ impl StorageBackend for PostgresStorage {
                                     .or_insert(received_ms);
                             }
                             let bh = (received_ms / 3_600_000) * 3_600_000;
-                            *hourly_map.entry((auth.project_id, bh, "error")).or_insert(0) += 1;
+                            *hourly_map
+                                .entry((auth.project_id, bh, "error"))
+                                .or_insert(0) += 1;
 
                             let jobs = pg_build_alert_jobs_for_event(
                                 &mut tx,
@@ -2904,9 +3102,16 @@ impl StorageBackend for PostgresStorage {
                             alerts.extend(jobs);
                         }
                     }
-                    IngestWriteItem::Logs { organization_id, project_id, project_slug, auto_promote_level, logs } => {
+                    IngestWriteItem::Logs {
+                        organization_id,
+                        project_id,
+                        project_slug,
+                        auto_promote_level,
+                        logs,
+                    } => {
                         for l in logs {
-                            let uid = Uuid::parse_str(&new_uuid_v7_from_ms(l.timestamp_ms)).unwrap_or_else(|_| Uuid::now_v7());
+                            let uid = Uuid::parse_str(&new_uuid_v7_from_ms(l.timestamp_ms))
+                                .unwrap_or_else(|_| Uuid::now_v7());
                             sqlx::query(
                                 "INSERT INTO log_events (id, organization_id, project_id, timestamp_ms, level_num, severity_number, body, service, environment, host, trace_id, span_id, attributes_json)
                                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
@@ -2928,7 +3133,11 @@ impl StorageBackend for PostgresStorage {
                             .await
                             .map_err(map_pg_err)?;
 
-                            for (rt, val) in [("service", &l.service), ("environment", &l.environment), ("host", &l.host)] {
+                            for (rt, val) in [
+                                ("service", &l.service),
+                                ("environment", &l.environment),
+                                ("host", &l.host),
+                            ] {
                                 if !val.is_empty() {
                                     log_res_map
                                         .entry((rt, val.clone()))
@@ -2966,10 +3175,21 @@ impl StorageBackend for PostgresStorage {
                                         org_event_throttle_rate: 0,
                                     };
                                     let (issue_id, short_id, is_new, is_reg) =
-                                        pg_insert_event_in_tx(&mut tx, &synth_auth, &meta, &bytes, l.timestamp_ms, true, true).await?;
+                                        pg_insert_event_in_tx(
+                                            &mut tx,
+                                            &synth_auth,
+                                            &meta,
+                                            &bytes,
+                                            l.timestamp_ms,
+                                            true,
+                                            true,
+                                        )
+                                        .await?;
                                     if issue_id > 0 {
                                         let bh_err = (l.timestamp_ms / 3_600_000) * 3_600_000;
-                                        *hourly_map.entry((project_id, bh_err, "error")).or_insert(0) += 1;
+                                        *hourly_map
+                                            .entry((project_id, bh_err, "error"))
+                                            .or_insert(0) += 1;
                                         let jobs = pg_build_alert_jobs_for_event(
                                             &mut tx,
                                             &self.app_key,
@@ -3008,8 +3228,13 @@ impl StorageBackend for PostgresStorage {
                             }
                         }
                     }
-                    IngestWriteItem::Transaction { organization_id, project_id, tx: tr } => {
-                        let uid = Uuid::parse_str(&new_uuid_v7_from_ms(tr.timestamp_ms)).unwrap_or_else(|_| Uuid::now_v7());
+                    IngestWriteItem::Transaction {
+                        organization_id,
+                        project_id,
+                        tx: tr,
+                    } => {
+                        let uid = Uuid::parse_str(&new_uuid_v7_from_ms(tr.timestamp_ms))
+                            .unwrap_or_else(|_| Uuid::now_v7());
                         sqlx::query(
                             "INSERT INTO transaction_events (id, organization_id, project_id, name, op, status, duration_ms, trace_id, span_id, environment, release, spans_json, timestamp_ms)
                              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
@@ -3032,9 +3257,16 @@ impl StorageBackend for PostgresStorage {
                         .map_err(map_pg_err)?;
 
                         let bh = (tr.timestamp_ms / 3_600_000) * 3_600_000;
-                        *hourly_map.entry((project_id, bh, "transaction")).or_insert(0) += 1;
+                        *hourly_map
+                            .entry((project_id, bh, "transaction"))
+                            .or_insert(0) += 1;
                     }
-                    IngestWriteItem::Session { organization_id, project_id, session, received_ms } => {
+                    IngestWriteItem::Session {
+                        organization_id,
+                        project_id,
+                        session,
+                        received_ms,
+                    } => {
                         let bh = (received_ms / 3_600_000) * 3_600_000;
                         releases_map
                             .entry((project_id, session.release.clone()))
@@ -3044,7 +3276,12 @@ impl StorageBackend for PostgresStorage {
                             "crashed" => (0i64, 0, 1, 0),
                             "abnormal" => (0, 0, 0, 1),
                             _ if session.errors > 0 || session.status == "errored" => (0, 1, 0, 0),
-                            _ if session.init || session.status == "exited" || session.status == "ok" => (1, 0, 0, 0),
+                            _ if session.init
+                                || session.status == "exited"
+                                || session.status == "ok" =>
+                            {
+                                (1, 0, 0, 0)
+                            }
                             _ => (0, 0, 0, 0),
                         };
                         sqlx::query(
@@ -3069,12 +3306,22 @@ impl StorageBackend for PostgresStorage {
                         .await
                         .map_err(map_pg_err)?;
                     }
-                    IngestWriteItem::CheckIn { organization_id, project_id, check_in, received_ms } => {
+                    IngestWriteItem::CheckIn {
+                        organization_id,
+                        project_id,
+                        check_in,
+                        received_ms,
+                    } => {
                         let is_up = check_in.status != "error";
                         let status = if is_up { "up" } else { "down" };
-                        let mon_id: Option<i64> = sqlx::query_scalar(
-                            "UPDATE uptime_monitors SET last_heartbeat_at = $1, status = $2
-                             WHERE project_id = $3 AND (uuid = $4 OR name = $4) RETURNING id",
+                        let mon_row: Option<(i64, String, String, String)> = sqlx::query_as(
+                            "UPDATE uptime_monitors m
+                             SET last_heartbeat_at = $1, status = $2
+                             FROM projects p
+                             WHERE m.project_id = $3
+                               AND p.id = m.project_id
+                               AND (m.uuid = $4 OR m.name = $4)
+                             RETURNING m.id, m.uuid, m.name, p.slug",
                         )
                         .bind(received_ms)
                         .bind(status)
@@ -3083,7 +3330,7 @@ impl StorageBackend for PostgresStorage {
                         .fetch_optional(&mut *tx)
                         .await
                         .map_err(map_pg_err)?;
-                        if let Some(mid) = mon_id {
+                        if let Some((mid, muuid, mname, pslug)) = mon_row {
                             sqlx::query(
                                 "INSERT INTO uptime_checks (organization_id, monitor_id, is_up, duration_ms, checked_at)
                                  VALUES ($1,$2,$3,$4,$5)",
@@ -3096,6 +3343,54 @@ impl StorageBackend for PostgresStorage {
                             .execute(&mut *tx)
                             .await
                             .map_err(map_pg_err)?;
+
+                            if !is_up {
+                                let rules = sqlx::query(
+                                    "SELECT id, name, channel_type, target_url, webhook_secret, email_to, cooldown_sec, last_triggered_at
+                                     FROM alert_rules WHERE project_id = $1 AND trigger_type = 'uptime_down' AND is_active = TRUE",
+                                )
+                                .bind(project_id)
+                                .fetch_all(&mut *tx)
+                                .await
+                                .map_err(map_pg_err)?;
+                                let mut fired = Vec::new();
+                                for rr in rules {
+                                    let rid: i64 = rr.get("id");
+                                    let cd: i64 = rr.get("cooldown_sec");
+                                    let lt: Option<i64> = rr.get("last_triggered_at");
+                                    if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                                        fired.push(rid);
+                                        alerts.push(AlertDispatchJob {
+                                            organization_id,
+                                            rule_id: rid,
+                                            rule_name: rr.get("name"),
+                                            channel_type: rr.get("channel_type"),
+                                            target_url: rr.get("target_url"),
+                                            webhook_secret: open_webhook_secret(
+                                                &self.app_key,
+                                                organization_id,
+                                                &rr.get::<String, _>("webhook_secret"),
+                                            ),
+                                            email_to: rr.get("email_to"),
+                                            title: format!("Uptime check-in failed: {mname}"),
+                                            message: format!(
+                                                "Cron/check-in error reported for monitor {muuid}"
+                                            ),
+                                            level: "fatal".into(),
+                                            project_slug: pslug.clone(),
+                                            short_id: None,
+                                        });
+                                    }
+                                }
+                                for rid in fired {
+                                    sqlx::query("UPDATE alert_rules SET last_triggered_at = $1 WHERE id = $2")
+                                        .bind(now_sec)
+                                        .bind(rid)
+                                        .execute(&mut *tx)
+                                        .await
+                                        .map_err(map_pg_err)?;
+                                }
+                            }
                         }
                     }
                 }
@@ -3158,7 +3453,11 @@ impl StorageBackend for PostgresStorage {
         Ok(alerts)
     }
 
-    async fn run_maintenance(&self, retention_days: u32, max_db_mb: u64) -> Result<Vec<AlertDispatchJob>, String> {
+    async fn run_maintenance(
+        &self,
+        retention_days: u32,
+        max_db_mb: u64,
+    ) -> Result<Vec<AlertDispatchJob>, String> {
         let now = now_ms();
         let cutoff_ms = now - (retention_days as i64) * 86_400_000;
         let now_sec = now / 1000;
@@ -3171,13 +3470,17 @@ impl StorageBackend for PostgresStorage {
             .execute(&mut *scan_tx)
             .await
             .map_err(map_pg_err)?;
-        sqlx::query("DELETE FROM session_lookup WHERE expires_at <= EXTRACT(EPOCH FROM NOW())::bigint")
-            .execute(&mut *scan_tx)
-            .await
-            .map_err(map_pg_err)?;
-        let _ = sqlx::query("DELETE FROM invitation_lookup WHERE expires_at <= EXTRACT(EPOCH FROM NOW())::bigint")
-            .execute(&mut *scan_tx)
-            .await;
+        sqlx::query(
+            "DELETE FROM session_lookup WHERE expires_at <= EXTRACT(EPOCH FROM NOW())::bigint",
+        )
+        .execute(&mut *scan_tx)
+        .await
+        .map_err(map_pg_err)?;
+        let _ = sqlx::query(
+            "DELETE FROM invitation_lookup WHERE expires_at <= EXTRACT(EPOCH FROM NOW())::bigint",
+        )
+        .execute(&mut *scan_tx)
+        .await;
         let _ = sqlx::query("DELETE FROM mfa_challenges WHERE expires_at <= $1")
             .bind(now_sec)
             .execute(&mut *scan_tx)
@@ -3200,26 +3503,32 @@ impl StorageBackend for PostgresStorage {
                 .execute(&mut *tx)
                 .await
                 .map_err(map_pg_err)?;
-            sqlx::query("DELETE FROM org_invitations WHERE accepted_at IS NULL AND expires_at <= $1")
-                .bind(now_sec)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_pg_err)?;
-            sqlx::query("DELETE FROM invitation_lookup WHERE accepted_at IS NULL AND expires_at <= $1")
-                .bind(now_sec)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_pg_err)?;
+            sqlx::query(
+                "DELETE FROM org_invitations WHERE accepted_at IS NULL AND expires_at <= $1",
+            )
+            .bind(now_sec)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            sqlx::query(
+                "DELETE FROM invitation_lookup WHERE accepted_at IS NULL AND expires_at <= $1",
+            )
+            .bind(now_sec)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
             sqlx::query("DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at <= $1")
                 .bind(now_sec)
                 .execute(&mut *tx)
                 .await
                 .map_err(map_pg_err)?;
-            sqlx::query("DELETE FROM api_token_lookup WHERE expires_at IS NOT NULL AND expires_at <= $1")
-                .bind(now_sec)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_pg_err)?;
+            sqlx::query(
+                "DELETE FROM api_token_lookup WHERE expires_at IS NOT NULL AND expires_at <= $1",
+            )
+            .bind(now_sec)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
             sqlx::query("DELETE FROM idempotency_keys WHERE created_at < $1")
                 .bind(now - 86_400_000)
                 .execute(&mut *tx)
@@ -3313,11 +3622,16 @@ impl StorageBackend for PostgresStorage {
                     if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
                         fired.push(rid);
                         alerts.push(AlertDispatchJob {
+                            organization_id: org_id,
                             rule_id: rid,
                             rule_name: rr.get("name"),
                             channel_type: rr.get("channel_type"),
                             target_url: rr.get("target_url"),
-                            webhook_secret: open_webhook_secret(&self.app_key, org_id, &rr.get::<String, _>("webhook_secret")),
+                            webhook_secret: open_webhook_secret(
+                                &self.app_key,
+                                org_id,
+                                &rr.get::<String, _>("webhook_secret"),
+                            ),
                             email_to: rr.get("email_to"),
                             title: format!("Uptime monitor down: {mname}"),
                             message: format!("Heartbeat missed for monitor {muuid}"),
@@ -3344,11 +3658,13 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn db_size_bytes(&self) -> u64 {
-        sqlx::query_scalar::<_, i64>("SELECT COALESCE(pg_database_size(current_database()), 0)::bigint")
-            .fetch_one(&self.pool)
-            .await
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(0)
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(pg_database_size(current_database()), 0)::bigint",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(|v| v.max(0) as u64)
+        .unwrap_or(0)
     }
 
     async fn check_health(&self) -> Result<StorageHealthInfo, String> {
@@ -3357,35 +3673,38 @@ impl StorageBackend for PostgresStorage {
             .await
             .map_err(map_pg_err)?;
 
-        let rolbypassrls: bool = sqlx::query_scalar(
-            "SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_pg_err)?
-        .unwrap_or(true);
+        let role_row =
+            sqlx::query("SELECT rolbypassrls, rolsuper FROM pg_roles WHERE rolname = current_user")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_pg_err)?;
 
-        let rls_row = sqlx::query(
-            "SELECT relrowsecurity, relforcerowsecurity
-             FROM pg_class
-             WHERE relname = 'issues' AND relnamespace = current_schema()::regnamespace",
+        let (rolbypassrls, rolsuper) = match role_row {
+            Some(row) => (
+                row.try_get::<bool, _>("rolbypassrls").unwrap_or(true),
+                row.try_get::<bool, _>("rolsuper").unwrap_or(true),
+            ),
+            None => (true, true),
+        };
+
+        let unprotected_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM pg_class c
+             WHERE c.relnamespace = current_schema()::regnamespace
+               AND c.relkind = 'r'
+               AND c.relname NOT IN ('users', 'login_attempts', 'bugfinder_schema_meta')
+               AND NOT (c.relrowsecurity AND c.relforcerowsecurity)",
         )
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(map_pg_err)?;
 
-        let (rel_rls, rel_force_rls) = match rls_row {
-            Some(row) => (
-                row.try_get::<bool, _>("relrowsecurity").unwrap_or(false),
-                row.try_get::<bool, _>("relforcerowsecurity").unwrap_or(false),
-            ),
-            None => (false, false),
-        };
-
-        let rls_verified = !rolbypassrls && rel_rls && rel_force_rls;
+        let rls_verified = !rolbypassrls && !rolsuper && unprotected_tables == 0;
         let detail = format!(
-            "PostgreSQL reachable (nobypassrls={}, issues_rls={}, issues_force_rls={})",
-            !rolbypassrls, rel_rls, rel_force_rls
+            "PostgreSQL reachable (nobypassrls={}, nosuper={}, all_rls_forced={})",
+            !rolbypassrls,
+            !rolsuper,
+            unprotected_tables == 0
         );
         Ok(StorageHealthInfo {
             engine: "postgres".to_string(),
@@ -3470,13 +3789,21 @@ impl StorageBackend for PostgresStorage {
                 let trig: String = r.get("trigger_type");
                 fired.push(rid);
                 alerts.push(AlertDispatchJob {
+                    organization_id: ev.organization_id,
                     rule_id: rid,
                     rule_name: r.get("name"),
                     channel_type: r.get("channel_type"),
                     target_url: r.get("target_url"),
-                    webhook_secret: open_webhook_secret(&self.app_key, ev.organization_id, &r.get::<String, _>("webhook_secret")),
+                    webhook_secret: open_webhook_secret(
+                        &self.app_key,
+                        ev.organization_id,
+                        &r.get::<String, _>("webhook_secret"),
+                    ),
                     email_to: r.get("email_to"),
-                    title: format!("[{}:{}] {} (score {})", ev.category, ev.severity, ev.signal_type, ev.risk_score),
+                    title: format!(
+                        "[{}:{}] {} (score {})",
+                        ev.category, ev.severity, ev.signal_type, ev.risk_score
+                    ),
                     message: format!(
                         "Trigger={trig} | Source={} | Action={} | Path={}",
                         ev.source_kind, ev.action_taken, ev.path
@@ -3696,19 +4023,24 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn get_mfa_status(&self, user_id: i64) -> Result<MfaStatusDto, String> {
-        let totp_enabled: bool = sqlx::query_scalar(
-            "SELECT is_enabled FROM user_mfa WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_pg_err)?
-        .unwrap_or(false);
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let totp_enabled: bool =
+            sqlx::query_scalar("SELECT is_enabled FROM user_mfa WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?
+                .unwrap_or(false);
         let recovery_codes_remaining: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM user_mfa_recovery_codes WHERE user_id = $1 AND used_at IS NULL",
         )
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_pg_err)?;
         let rows = sqlx::query(
@@ -3716,9 +4048,10 @@ impl StorageBackend for PostgresStorage {
              FROM webauthn_credentials WHERE user_id = $1 ORDER BY id DESC",
         )
         .bind(user_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         let passkeys = rows
             .into_iter()
             .map(|r| {
@@ -3741,14 +4074,21 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn get_user_mfa_record(&self, user_id: i64) -> Result<Option<UserMfaRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let row = sqlx::query(
             "SELECT user_id, totp_secret_enc, is_enabled, last_used_step, failed_attempts, locked_until
              FROM user_mfa WHERE user_id = $1",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(row.map(|r| UserMfaRecord {
             user_id: r.get("user_id"),
             totp_secret_enc: r.get("totp_secret_enc"),
@@ -3759,23 +4099,50 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn upsert_pending_totp(&self, user_id: i64, totp_secret_enc: &str, now_sec: i64) -> Result<(), String> {
-        sqlx::query(
+    async fn upsert_pending_totp(
+        &self,
+        user_id: i64,
+        totp_secret_enc: &str,
+        now_sec: i64,
+    ) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let res = sqlx::query(
             "INSERT INTO user_mfa (user_id, totp_secret_enc, is_enabled, failed_attempts, updated_at)
              VALUES ($1, $2, FALSE, 0, $3)
-             ON CONFLICT (user_id) DO UPDATE SET totp_secret_enc = $2, is_enabled = FALSE, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = $3",
+             ON CONFLICT (user_id) DO UPDATE
+             SET totp_secret_enc = $2, is_enabled = FALSE, last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = $3
+             WHERE user_mfa.is_enabled = FALSE",
         )
         .bind(user_id)
         .bind(totp_secret_enc)
         .bind(now_sec)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        if res.rows_affected() == 0 {
+            return Err("MFA_ALREADY_ENABLED".into());
+        }
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
-    async fn enable_totp_with_recovery_codes(&self, user_id: i64, code_hashes: &[String], now_sec: i64) -> Result<(), String> {
+    async fn enable_totp_with_recovery_codes(
+        &self,
+        user_id: i64,
+        code_hashes: &[String],
+        now_sec: i64,
+    ) -> Result<(), String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         sqlx::query(
             "UPDATE user_mfa SET is_enabled = TRUE, enabled_at = $1, failed_attempts = 0, locked_until = NULL, updated_at = $1
              WHERE user_id = $2",
@@ -3806,6 +4173,11 @@ impl StorageBackend for PostgresStorage {
 
     async fn disable_mfa(&self, user_id: i64, now_sec: i64) -> Result<(), String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         sqlx::query(
             "UPDATE user_mfa SET is_enabled = FALSE, totp_secret_enc = '', last_used_step = NULL, failed_attempts = 0, locked_until = NULL, updated_at = $1 WHERE user_id = $2",
         )
@@ -3823,8 +4195,18 @@ impl StorageBackend for PostgresStorage {
         Ok(())
     }
 
-    async fn replace_recovery_codes(&self, user_id: i64, code_hashes: &[String], _now_sec: i64) -> Result<(), String> {
+    async fn replace_recovery_codes(
+        &self,
+        user_id: i64,
+        code_hashes: &[String],
+        _now_sec: i64,
+    ) -> Result<(), String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         sqlx::query("DELETE FROM user_mfa_recovery_codes WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *tx)
@@ -3844,18 +4226,44 @@ impl StorageBackend for PostgresStorage {
         Ok(())
     }
 
-    async fn record_mfa_attempt(&self, user_id: i64, success_step: Option<i64>, now_sec: i64) -> Result<Option<i64>, String> {
+    async fn record_mfa_attempt(
+        &self,
+        user_id: i64,
+        success_step: Option<i64>,
+        now_sec: i64,
+    ) -> Result<Option<i64>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
-        if let Some(step) = success_step {
-            sqlx::query(
-                "UPDATE user_mfa SET last_used_step = $1, failed_attempts = 0, locked_until = NULL, updated_at = $2 WHERE user_id = $3",
-            )
-            .bind(step)
-            .bind(now_sec)
-            .bind(user_id)
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+        if let Some(step) = success_step {
+            let res = if step > 0 {
+                sqlx::query(
+                    "UPDATE user_mfa
+                     SET last_used_step = $1, failed_attempts = 0, locked_until = NULL, updated_at = $2
+                     WHERE user_id = $3 AND (last_used_step IS NULL OR last_used_step < $1)",
+                )
+                .bind(step)
+                .bind(now_sec)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?
+            } else {
+                sqlx::query(
+                    "UPDATE user_mfa SET failed_attempts = 0, locked_until = NULL, updated_at = $1 WHERE user_id = $2",
+                )
+                .bind(now_sec)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?
+            };
+            if step > 0 && res.rows_affected() == 0 {
+                return Err("TOTP_STEP_REUSED".into());
+            }
             tx.commit().await.map_err(map_pg_err)?;
             return Ok(None);
         }
@@ -3886,34 +4294,79 @@ impl StorageBackend for PostgresStorage {
         Ok(lock_secs)
     }
 
-    async fn list_unused_recovery_codes(&self, user_id: i64) -> Result<Vec<RecoveryCodeRecord>, String> {
+    async fn list_unused_recovery_codes(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<RecoveryCodeRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT id, code_hash FROM user_mfa_recovery_codes WHERE user_id = $1 AND used_at IS NULL",
         )
         .bind(user_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(rows
             .into_iter()
             .map(|(id, code_hash)| RecoveryCodeRecord { id, code_hash })
             .collect())
     }
 
-    async fn mark_recovery_code_used(&self, user_id: i64, code_id: i64, now_sec: i64) -> Result<bool, String> {
+    async fn mark_recovery_code_used(
+        &self,
+        user_id: i64,
+        code_id: i64,
+        now_sec: i64,
+    ) -> Result<bool, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let res = sqlx::query(
             "UPDATE user_mfa_recovery_codes SET used_at = $1 WHERE id = $2 AND user_id = $3 AND used_at IS NULL",
         )
         .bind(now_sec)
         .bind(code_id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(res.rows_affected() > 0)
     }
 
-    async fn create_mfa_challenge(&self, token_sha256: &str, user_id: i64, target_org_id: i64, ip_hmac: &str, expires_at: i64) -> Result<(), String> {
+    async fn create_mfa_challenge(
+        &self,
+        token_sha256: &str,
+        user_id: i64,
+        target_org_id: i64,
+        ip_hmac: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.mfa_challenge_sha256', $1, true)")
+            .bind(token_sha256)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+            .bind(target_org_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         sqlx::query(
             "INSERT INTO mfa_challenges (token_sha256, user_id, target_org_id, ip_hmac, expires_at, created_at)
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -3924,54 +4377,100 @@ impl StorageBackend for PostgresStorage {
         .bind(ip_hmac)
         .bind(expires_at)
         .bind(now_ms())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
-    async fn consume_mfa_challenge(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String> {
+    async fn consume_mfa_challenge(
+        &self,
+        token_sha256: &str,
+        now_sec: i64,
+    ) -> Result<Option<MfaChallengeRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.mfa_challenge_sha256', $1, true)")
+            .bind(token_sha256)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let row: Option<(i64, i64, String, i64)> = sqlx::query_as(
             "DELETE FROM mfa_challenges WHERE token_sha256 = $1
              RETURNING user_id, target_org_id, ip_hmac, expires_at",
         )
         .bind(token_sha256)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
-        Ok(row.and_then(|(user_id, target_org_id, ip_hmac, expires_at)| {
-            if expires_at > now_sec {
-                Some(MfaChallengeRecord {
-                    user_id,
-                    target_org_id,
-                    ip_hmac,
-                    expires_at,
-                })
-            } else {
-                None
-            }
-        }))
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(
+            row.and_then(|(user_id, target_org_id, ip_hmac, expires_at)| {
+                if expires_at > now_sec {
+                    Some(MfaChallengeRecord {
+                        user_id,
+                        target_org_id,
+                        ip_hmac,
+                        expires_at,
+                    })
+                } else {
+                    None
+                }
+            }),
+        )
     }
 
-    async fn get_mfa_challenge_user(&self, token_sha256: &str, now_sec: i64) -> Result<Option<MfaChallengeRecord>, String> {
+    async fn get_mfa_challenge_user(
+        &self,
+        token_sha256: &str,
+        now_sec: i64,
+    ) -> Result<Option<MfaChallengeRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.mfa_challenge_sha256', $1, true)")
+            .bind(token_sha256)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let row: Option<(i64, i64, String, i64)> = sqlx::query_as(
             "SELECT user_id, target_org_id, ip_hmac, expires_at
              FROM mfa_challenges WHERE token_sha256 = $1 AND expires_at > $2",
         )
         .bind(token_sha256)
         .bind(now_sec)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
-        Ok(row.map(|(user_id, target_org_id, ip_hmac, expires_at)| MfaChallengeRecord {
-            user_id,
-            target_org_id,
-            ip_hmac,
-            expires_at,
-        }))
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(row.map(
+            |(user_id, target_org_id, ip_hmac, expires_at)| MfaChallengeRecord {
+                user_id,
+                target_org_id,
+                ip_hmac,
+                expires_at,
+            },
+        ))
     }
 
-    async fn save_webauthn_challenge(&self, challenge_b64: &str, user_id: Option<i64>, flow_kind: &str, expires_at: i64) -> Result<(), String> {
+    async fn save_webauthn_challenge(
+        &self,
+        challenge_b64: &str,
+        user_id: Option<i64>,
+        flow_kind: &str,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.webauthn_challenge_b64', $1, true)")
+            .bind(challenge_b64)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        if let Some(uid) = user_id {
+            sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+                .bind(uid.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+        }
         sqlx::query(
             "INSERT INTO webauthn_challenges (challenge_b64, user_id, flow_kind, expires_at, created_at)
              VALUES ($1, $2, $3, $4, $5)",
@@ -3981,38 +4480,67 @@ impl StorageBackend for PostgresStorage {
         .bind(flow_kind)
         .bind(expires_at)
         .bind(now_ms())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
-    async fn consume_webauthn_challenge(&self, challenge_b64: &str, flow_kind: &str, now_sec: i64) -> Result<Option<WebAuthnChallengeRecord>, String> {
+    async fn consume_webauthn_challenge(
+        &self,
+        challenge_b64: &str,
+        flow_kind: &str,
+        now_sec: i64,
+    ) -> Result<Option<WebAuthnChallengeRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.webauthn_challenge_b64', $1, true)")
+            .bind(challenge_b64)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let row: Option<(String, Option<i64>, String, i64)> = sqlx::query_as(
             "DELETE FROM webauthn_challenges WHERE challenge_b64 = $1 AND flow_kind = $2
              RETURNING challenge_b64, user_id, flow_kind, expires_at",
         )
         .bind(challenge_b64)
         .bind(flow_kind)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
-        Ok(row.and_then(|(challenge_b64, user_id, flow_kind, expires_at)| {
-            if expires_at > now_sec {
-                Some(WebAuthnChallengeRecord {
-                    challenge_b64,
-                    user_id,
-                    flow_kind,
-                    expires_at,
-                })
-            } else {
-                None
-            }
-        }))
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(
+            row.and_then(|(challenge_b64, user_id, flow_kind, expires_at)| {
+                if expires_at > now_sec {
+                    Some(WebAuthnChallengeRecord {
+                        challenge_b64,
+                        user_id,
+                        flow_kind,
+                        expires_at,
+                    })
+                } else {
+                    None
+                }
+            }),
+        )
     }
 
-    async fn create_webauthn_credential(&self, user_id: i64, name: &str, credential_id_b64: &str, cose_alg: i32, public_key_b64: &str, sign_count: u32) -> Result<PasskeyDto, String> {
+    async fn create_webauthn_credential(
+        &self,
+        user_id: i64,
+        name: &str,
+        credential_id_b64: &str,
+        cose_alg: i32,
+        public_key_b64: &str,
+        sign_count: u32,
+    ) -> Result<PasskeyDto, String> {
         let now = now_ms();
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO webauthn_credentials (user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
@@ -4024,9 +4552,10 @@ impl StorageBackend for PostgresStorage {
         .bind(public_key_b64)
         .bind(sign_count as i64)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(PasskeyDto {
             id,
             name: name.to_string(),
@@ -4037,15 +4566,25 @@ impl StorageBackend for PostgresStorage {
         })
     }
 
-    async fn list_webauthn_credentials(&self, user_id: i64) -> Result<Vec<WebAuthnCredRecord>, String> {
+    async fn list_webauthn_credentials(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<WebAuthnCredRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let rows = sqlx::query(
             "SELECT id, user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, last_used_at, created_at
              FROM webauthn_credentials WHERE user_id = $1 ORDER BY id DESC",
         )
         .bind(user_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(rows
             .into_iter()
             .map(|r| WebAuthnCredRecord {
@@ -4062,15 +4601,25 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn find_webauthn_credential(&self, credential_id_b64: &str) -> Result<Option<WebAuthnCredRecord>, String> {
+    async fn find_webauthn_credential(
+        &self,
+        credential_id_b64: &str,
+    ) -> Result<Option<WebAuthnCredRecord>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.webauthn_cred_id', $1, true)")
+            .bind(credential_id_b64)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let r = sqlx::query(
             "SELECT id, user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, last_used_at, created_at
              FROM webauthn_credentials WHERE credential_id_b64 = $1",
         )
         .bind(credential_id_b64)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(r.map(|r| WebAuthnCredRecord {
             id: r.get("id"),
             user_id: r.get("user_id"),
@@ -4084,28 +4633,55 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
-    async fn update_webauthn_sign_count(&self, cred_id: i64, sign_count: u32, now_sec: i64) -> Result<(), String> {
-        sqlx::query("UPDATE webauthn_credentials SET sign_count = $1, last_used_at = $2 WHERE id = $3")
-            .bind(sign_count as i64)
-            .bind(now_sec)
-            .bind(cred_id)
-            .execute(&self.pool)
+    async fn update_webauthn_sign_count(
+        &self,
+        cred_id: i64,
+        sign_count: u32,
+        now_sec: i64,
+    ) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.webauthn_cred_pk', $1, true)")
+            .bind(cred_id.to_string())
+            .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+        sqlx::query(
+            "UPDATE webauthn_credentials SET sign_count = $1, last_used_at = $2 WHERE id = $3",
+        )
+        .bind(sign_count as i64)
+        .bind(now_sec)
+        .bind(cred_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
     async fn delete_webauthn_credential(&self, user_id: i64, cred_id: i64) -> Result<bool, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let res = sqlx::query("DELETE FROM webauthn_credentials WHERE id = $1 AND user_id = $2")
             .bind(cred_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(res.rows_affected() > 0)
     }
 
-    async fn list_user_sessions(&self, user_id: i64, org_id: i64, current_token_sha256: &str, now_sec: i64) -> Result<Vec<ActiveSessionDto>, String> {
+    async fn list_user_sessions(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        current_token_sha256: &str,
+        now_sec: i64,
+    ) -> Result<Vec<ActiveSessionDto>, String> {
         let mut tx = self.begin_tenant(org_id).await?;
         let rows = sqlx::query(
             "SELECT id, token_sha256, user_agent, ip_hmac, last_seen_at, created_at
@@ -4136,7 +4712,12 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn revoke_session_by_id(&self, user_id: i64, org_id: i64, session_id: i64) -> Result<bool, String> {
+    async fn revoke_session_by_id(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        session_id: i64,
+    ) -> Result<bool, String> {
         let mut tx = self.begin_tenant(org_id).await?;
         let sha: Option<String> = sqlx::query_scalar(
             "DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING token_sha256",
@@ -4157,7 +4738,12 @@ impl StorageBackend for PostgresStorage {
         Ok(sha.is_some())
     }
 
-    async fn revoke_other_sessions(&self, user_id: i64, org_id: i64, keep_token_sha256: &str) -> Result<usize, String> {
+    async fn revoke_other_sessions(
+        &self,
+        user_id: i64,
+        org_id: i64,
+        keep_token_sha256: &str,
+    ) -> Result<usize, String> {
         let mut tx = self.begin_tenant(org_id).await?;
         let res = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token_sha256 != $2")
             .bind(user_id)
@@ -4175,25 +4761,37 @@ impl StorageBackend for PostgresStorage {
         Ok(res.rows_affected() as usize)
     }
 
-    async fn mark_session_reauth(&self, token_sha256: &str, org_id: i64, now_sec: i64) -> Result<(), String> {
+    async fn mark_session_reauth(
+        &self,
+        token_sha256: &str,
+        org_id: i64,
+        now_sec: i64,
+    ) -> Result<(), String> {
         let mut tx = self.begin_tenant(org_id).await?;
-        sqlx::query("UPDATE sessions SET reauth_at = $1, last_seen_at = $1 WHERE token_sha256 = $2")
-            .bind(now_sec)
-            .bind(token_sha256)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_pg_err)?;
-        sqlx::query("UPDATE session_lookup SET reauth_at = $1, last_seen_at = $1 WHERE token_sha256 = $2")
-            .bind(now_sec)
-            .bind(token_sha256)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_pg_err)?;
+        sqlx::query(
+            "UPDATE sessions SET reauth_at = $1, last_seen_at = $1 WHERE token_sha256 = $2",
+        )
+        .bind(now_sec)
+        .bind(token_sha256)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        sqlx::query(
+            "UPDATE session_lookup SET reauth_at = $1, last_seen_at = $1 WHERE token_sha256 = $2",
+        )
+        .bind(now_sec)
+        .bind(token_sha256)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
-    async fn find_user_password_hash(&self, user_id: i64) -> Result<Option<(String, String, String)>, String> {
+    async fn find_user_password_hash(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<(String, String, String)>, String> {
         let row: Option<(String, String, String)> = sqlx::query_as(
             "SELECT email, name, password_hash FROM users WHERE id = $1 AND is_active = TRUE",
         )
@@ -4204,22 +4802,12 @@ impl StorageBackend for PostgresStorage {
         Ok(row)
     }
 
-    async fn change_user_password(
-        &self,
-        user_id: i64,
-        org_id: i64,
-        new_password_hash: &str,
-        _old_session_sha: &str,
-        new_session_sha: &str,
-        new_csrf: &str,
-        user_agent: &str,
-        ip_hmac: &str,
-        now_sec: i64,
-        expires_at: i64,
-    ) -> Result<(), String> {
+    async fn change_user_password(&self, input: &PasswordChangeInput<'_>) -> Result<(), String> {
+        let user_id = input.user_id;
+        let org_id = input.org_id;
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-            .bind(new_password_hash)
+            .bind(input.new_password_hash)
             .bind(user_id)
             .execute(&mut *tx)
             .await
@@ -4272,19 +4860,19 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
 
-        let ua: String = user_agent.chars().take(160).collect();
+        let ua: String = input.user_agent.chars().take(160).collect();
         let sess_id: i64 = sqlx::query_scalar(
             "INSERT INTO sessions (token_sha256, user_id, organization_id, csrf_token, user_agent, ip_hmac, last_seen_at, reauth_at, expires_at, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9) RETURNING id",
         )
-        .bind(new_session_sha)
+        .bind(input.new_session_sha)
         .bind(user_id)
         .bind(org_id)
-        .bind(new_csrf)
+        .bind(input.new_csrf)
         .bind(&ua)
-        .bind(ip_hmac)
-        .bind(now_sec)
-        .bind(expires_at)
+        .bind(input.ip_hmac)
+        .bind(input.now_sec)
+        .bind(input.expires_at)
         .bind(now_ms())
         .fetch_one(&mut *tx)
         .await
@@ -4294,23 +4882,31 @@ impl StorageBackend for PostgresStorage {
             "INSERT INTO session_lookup (token_sha256, session_id, organization_id, organization_slug, user_id, role, csrf_token, last_seen_at, reauth_at, expires_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9)",
         )
-        .bind(new_session_sha)
+        .bind(input.new_session_sha)
         .bind(sess_id)
         .bind(org_id)
         .bind(org_slug)
         .bind(user_id)
         .bind(role)
-        .bind(new_csrf)
-        .bind(now_sec)
-        .bind(expires_at)
+        .bind(input.new_csrf)
+        .bind(input.now_sec)
+        .bind(input.expires_at)
         .execute(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        let _ = input.old_session_sha;
         tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
-    async fn create_invitation(&self, ctx: &TenantCtx, email: &str, role: UserRole, token_sha256: &str, expires_at: i64) -> Result<InvitationDto, String> {
+    async fn create_invitation(
+        &self,
+        ctx: &TenantCtx,
+        email: &str,
+        role: UserRole,
+        token_sha256: &str,
+        expires_at: i64,
+    ) -> Result<InvitationDto, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let email_norm = email.trim().to_ascii_lowercase();
         let now = now_ms();
@@ -4402,13 +4998,12 @@ impl StorageBackend for PostgresStorage {
 
     async fn revoke_invitation(&self, ctx: &TenantCtx, inv_id: i64) -> Result<bool, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let sha: Option<String> = sqlx::query_scalar(
-            "DELETE FROM org_invitations WHERE id = $1 RETURNING token_sha256",
-        )
-        .bind(inv_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
+        let sha: Option<String> =
+            sqlx::query_scalar("DELETE FROM org_invitations WHERE id = $1 RETURNING token_sha256")
+                .bind(inv_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
         if let Some(ref s) = sha {
             sqlx::query("DELETE FROM invitation_lookup WHERE token_sha256 = $1")
                 .bind(s)
@@ -4420,7 +5015,10 @@ impl StorageBackend for PostgresStorage {
         Ok(sha.is_some())
     }
 
-    async fn lookup_invitation(&self, token_sha256: &str) -> Result<Option<InvitationLookupInfo>, String> {
+    async fn lookup_invitation(
+        &self,
+        token_sha256: &str,
+    ) -> Result<Option<InvitationLookupInfo>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.invite_token_sha256', $1, true)")
             .bind(token_sha256)
@@ -4436,15 +5034,17 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(row.map(|(oid, oslug, oname, email, role, exp, acc)| InvitationLookupInfo {
-            organization_id: oid,
-            organization_slug: oslug,
-            organization_name: oname,
-            email,
-            role,
-            expires_at: exp,
-            accepted_at: acc,
-        }))
+        Ok(row.map(
+            |(oid, oslug, oname, email, role, exp, acc)| InvitationLookupInfo {
+                organization_id: oid,
+                organization_slug: oslug,
+                organization_name: oname,
+                email,
+                role,
+                expires_at: exp,
+                accepted_at: acc,
+            },
+        ))
     }
 
     async fn accept_invitation(
@@ -4452,8 +5052,9 @@ impl StorageBackend for PostgresStorage {
         token_sha256: &str,
         name: &str,
         password_hash: &str,
+        authenticated_user_id: Option<i64>,
         now_sec: i64,
-    ) -> Result<Result<(i64, i64, String, String, UserRole), String>, String> {
+    ) -> Result<AcceptInvitationOutcome, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.invite_token_sha256', $1, true)")
             .bind(token_sha256)
@@ -4469,16 +5070,85 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         let Some((org_id, org_slug, email, role_s, exp, acc)) = inv else {
-            return Ok(Err("Invitation not found".into()));
+            return Ok(AcceptInvitationOutcome::InvalidOrExpired(
+                "Invitation not found".into(),
+            ));
         };
         if acc.is_some() {
-            return Ok(Err("Invitation has already been used".into()));
+            return Ok(AcceptInvitationOutcome::InvalidOrExpired(
+                "Invitation has already been used".into(),
+            ));
         }
         if exp <= now_sec {
-            return Ok(Err("Invitation has expired".into()));
+            return Ok(AcceptInvitationOutcome::InvalidOrExpired(
+                "Invitation has expired".into(),
+            ));
         }
 
-        // Stage 2: Set transaction-local tenant context & atomically claim invitation
+        let existing_uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind(&email)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let role = UserRole::from_db(&role_s).unwrap_or(UserRole::Member);
+
+        if let Some(uid) = existing_uid {
+            if authenticated_user_id != Some(uid) {
+                return Ok(AcceptInvitationOutcome::ExistingAccountRequiresSignIn);
+            }
+            sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+                .bind(org_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+                .bind(uid.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            let added = sqlx::query(
+                "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, $3)
+                 ON CONFLICT (organization_id, user_id) DO NOTHING",
+            )
+            .bind(org_id)
+            .bind(uid)
+            .bind(role.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            if added.rows_affected() == 0 {
+                return Ok(AcceptInvitationOutcome::AlreadyMember);
+            }
+            let claimed: Option<i64> = sqlx::query_scalar(
+                "UPDATE org_invitations SET accepted_at = $1 WHERE token_sha256 = $2 AND accepted_at IS NULL RETURNING id",
+            )
+            .bind(now_sec)
+            .bind(token_sha256)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            if claimed.is_none() {
+                return Ok(AcceptInvitationOutcome::InvalidOrExpired(
+                    "Invitation already claimed".into(),
+                ));
+            }
+            sqlx::query("UPDATE invitation_lookup SET accepted_at = $1 WHERE token_sha256 = $2")
+                .bind(now_sec)
+                .bind(token_sha256)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            tx.commit().await.map_err(map_pg_err)?;
+            return Ok(AcceptInvitationOutcome::AcceptedExistingUser {
+                user_id: uid,
+                org_id,
+                org_slug,
+                email,
+                role,
+            });
+        }
+
+        // Stage 2: Set transaction-local tenant context & atomically claim invitation for new user
         sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
             .bind(org_id.to_string())
             .execute(&mut *tx)
@@ -4493,7 +5163,9 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         if claimed.is_none() {
-            return Ok(Err("Invitation already claimed".into()));
+            return Ok(AcceptInvitationOutcome::InvalidOrExpired(
+                "Invitation already claimed".into(),
+            ));
         }
         sqlx::query("UPDATE invitation_lookup SET accepted_at = $1 WHERE token_sha256 = $2")
             .bind(now_sec)
@@ -4502,28 +5174,19 @@ impl StorageBackend for PostgresStorage {
             .await
             .map_err(map_pg_err)?;
 
-        let existing_uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
-            .bind(&email)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_pg_err)?;
-        let uid = match existing_uid {
-            Some(id) => id,
-            None => sqlx::query_scalar(
-                "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES ($1, $2, $3, TRUE, $4) RETURNING id",
-            )
-            .bind(&email)
-            .bind(name)
-            .bind(password_hash)
-            .bind(now_ms())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(map_pg_err)?,
-        };
-        let role = UserRole::from_db(&role_s).unwrap_or(UserRole::Member);
+        let uid: i64 = sqlx::query_scalar(
+            "INSERT INTO users (email, name, password_hash, is_active, created_at) VALUES ($1, $2, $3, TRUE, $4) RETURNING id",
+        )
+        .bind(&email)
+        .bind(name)
+        .bind(password_hash)
+        .bind(now_ms())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
         sqlx::query(
             "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, $3)
-             ON CONFLICT (organization_id, user_id) DO UPDATE SET role = $3",
+             ON CONFLICT (organization_id, user_id) DO NOTHING",
         )
         .bind(org_id)
         .bind(uid)
@@ -4532,7 +5195,13 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(Ok((uid, org_id, org_slug, email, role)))
+        Ok(AcceptInvitationOutcome::AcceptedNewUser {
+            user_id: uid,
+            org_id,
+            org_slug,
+            email,
+            role,
+        })
     }
 
     async fn append_audit_log(&self, entry: &NewAuditLog) -> Result<(), String> {
@@ -4542,26 +5211,25 @@ impl StorageBackend for PostgresStorage {
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-        let prev_hash: String = sqlx::query_scalar(
-            "SELECT entry_hash FROM audit_logs ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_pg_err)?
-        .filter(|s: &String| !s.is_empty())
-        .unwrap_or_else(|| "GENESIS".to_string());
+        let prev_hash: String =
+            sqlx::query_scalar("SELECT entry_hash FROM audit_logs ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?
+                .filter(|s: &String| !s.is_empty())
+                .unwrap_or_else(|| "GENESIS".to_string());
 
         let created_at = now_ms();
-        let entry_hash = compute_audit_entry_hash(
-            &prev_hash,
-            entry.organization_id,
-            entry.actor_user_id,
-            &entry.action,
-            &entry.target_type,
-            &entry.target_id,
-            &entry.metadata,
+        let entry_hash = compute_audit_entry_hash(&AuditEntryHashInput {
+            prev_hash: &prev_hash,
+            org_id: entry.organization_id,
+            actor_user_id: entry.actor_user_id,
+            action: &entry.action,
+            target_type: &entry.target_type,
+            target_id: &entry.target_id,
+            metadata: &entry.metadata,
             created_at,
-        );
+        });
         sqlx::query(
             "INSERT INTO audit_logs (organization_id, actor_user_id, actor_email, action, target_type, target_id, ip_hmac, metadata_json, prev_hash, entry_hash, created_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -4584,9 +5252,17 @@ impl StorageBackend for PostgresStorage {
         Ok(())
     }
 
-    async fn list_audit_logs(&self, ctx: &TenantCtx, action_filter: Option<&str>, limit: i64, offset: i64) -> Result<Vec<AuditLogDto>, String> {
+    async fn list_audit_logs(
+        &self,
+        ctx: &TenantCtx,
+        action_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let act = action_filter.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let act = action_filter
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let rows = sqlx::query(
             "SELECT id, actor_user_id, actor_email, action, target_type, target_id, ip_hmac, metadata_json, entry_hash, created_at
              FROM audit_logs
@@ -4619,55 +5295,66 @@ impl StorageBackend for PostgresStorage {
 
     async fn verify_audit_chain(&self, ctx: &TenantCtx) -> Result<AuditVerifyDto, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let rows = sqlx::query(
-            "SELECT id, actor_user_id, action, target_type, target_id, metadata_json, prev_hash, entry_hash, created_at
-             FROM audit_logs ORDER BY id ASC",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
-        tx.commit().await.map_err(map_pg_err)?;
         let mut expected_prev = "GENESIS".to_string();
         let mut count = 0usize;
-        for r in rows {
-            let id: i64 = r.get("id");
-            let actor_uid: Option<i64> = r.get("actor_user_id");
-            let action: String = r.get("action");
-            let target_type: String = r.get("target_type");
-            let target_id: String = r.get("target_id");
-            let meta_val: Value = r.get("metadata_json");
-            let prev_hash: String = r.get("prev_hash");
-            let entry_hash: String = r.get("entry_hash");
-            let created_at: i64 = r.get("created_at");
-            count += 1;
-            if prev_hash != expected_prev {
-                return Ok(AuditVerifyDto {
-                    valid: false,
-                    checked_entries: count,
-                    broken_at_id: Some(id),
-                    detail: format!("Previous hash link mismatch at audit_logs.id={id}"),
+        let mut last_id = 0i64;
+        loop {
+            let rows = sqlx::query(
+                "SELECT id, actor_user_id, action, target_type, target_id, metadata_json, prev_hash, entry_hash, created_at
+                 FROM audit_logs WHERE id > $1 ORDER BY id ASC LIMIT 500",
+            )
+            .bind(last_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            let batch_len = rows.len();
+            for r in rows {
+                let id: i64 = r.get("id");
+                last_id = id;
+                let actor_uid: Option<i64> = r.get("actor_user_id");
+                let action: String = r.get("action");
+                let target_type: String = r.get("target_type");
+                let target_id: String = r.get("target_id");
+                let meta_val: Value = r.get("metadata_json");
+                let prev_hash: String = r.get("prev_hash");
+                let entry_hash: String = r.get("entry_hash");
+                let created_at: i64 = r.get("created_at");
+                count += 1;
+                if prev_hash != expected_prev {
+                    tx.commit().await.map_err(map_pg_err)?;
+                    return Ok(AuditVerifyDto {
+                        valid: false,
+                        checked_entries: count,
+                        broken_at_id: Some(id),
+                        detail: format!("Previous hash link mismatch at audit_logs.id={id}"),
+                    });
+                }
+                let recomputed = compute_audit_entry_hash(&AuditEntryHashInput {
+                    prev_hash: &prev_hash,
+                    org_id: ctx.organization_id,
+                    actor_user_id: actor_uid,
+                    action: &action,
+                    target_type: &target_type,
+                    target_id: &target_id,
+                    metadata: &meta_val,
+                    created_at,
                 });
+                if recomputed != entry_hash {
+                    tx.commit().await.map_err(map_pg_err)?;
+                    return Ok(AuditVerifyDto {
+                        valid: false,
+                        checked_entries: count,
+                        broken_at_id: Some(id),
+                        detail: format!("SHA-256 tamper detected at audit_logs.id={id}"),
+                    });
+                }
+                expected_prev = entry_hash;
             }
-            let recomputed = compute_audit_entry_hash(
-                &prev_hash,
-                ctx.organization_id,
-                actor_uid,
-                &action,
-                &target_type,
-                &target_id,
-                &meta_val,
-                created_at,
-            );
-            if recomputed != entry_hash {
-                return Ok(AuditVerifyDto {
-                    valid: false,
-                    checked_entries: count,
-                    broken_at_id: Some(id),
-                    detail: format!("SHA-256 tamper detected at audit_logs.id={id}"),
-                });
+            if batch_len < 500 {
+                break;
             }
-            expected_prev = entry_hash;
         }
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(AuditVerifyDto {
             valid: true,
             checked_entries: count,
@@ -4680,18 +5367,26 @@ impl StorageBackend for PostgresStorage {
         })
     }
 
-    async fn get_org_security_settings(&self, ctx: &TenantCtx) -> Result<OrgSecuritySettings, String> {
+    async fn get_org_security_settings(
+        &self,
+        ctx: &TenantCtx,
+    ) -> Result<OrgSecuritySettings, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let val: Value = sqlx::query_scalar("SELECT settings_json FROM organizations WHERE id = $1")
-            .bind(ctx.organization_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(map_pg_err)?;
+        let val: Value =
+            sqlx::query_scalar("SELECT settings_json FROM organizations WHERE id = $1")
+                .bind(ctx.organization_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
         Ok(serde_json::from_value(val).unwrap_or_default())
     }
 
-    async fn update_org_security_settings(&self, ctx: &TenantCtx, settings: &OrgSecuritySettings) -> Result<OrgSecuritySettings, String> {
+    async fn update_org_security_settings(
+        &self,
+        ctx: &TenantCtx,
+        settings: &OrgSecuritySettings,
+    ) -> Result<OrgSecuritySettings, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
         let mut clean = settings.clone();
         clean.event_throttle_rate = clean.event_throttle_rate.min(100);

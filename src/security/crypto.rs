@@ -50,7 +50,10 @@ pub fn seal_secret(app_key: &[u8; 32], aad: &[u8], plaintext: &str) -> Result<St
     let mut combined = Vec::with_capacity(NONCE_LEN + in_out.len());
     combined.extend_from_slice(&nonce_bytes);
     combined.extend_from_slice(&in_out);
-    Ok(format!("{AEAD_PREFIX}{}", URL_SAFE_NO_PAD.encode(&combined)))
+    Ok(format!(
+        "{AEAD_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(&combined)
+    ))
 }
 
 /// Open a sealed AEAD secret with record-bound AAD.

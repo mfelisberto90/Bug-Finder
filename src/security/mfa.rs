@@ -186,16 +186,106 @@ struct QrVersionSpec {
 }
 
 const QR_SPECS_L: &[QrVersionSpec] = &[
-    QrVersionSpec { version: 1, data_codewords: 19, ec_per_block: 7, g1_blocks: 1, g1_data: 19, g2_blocks: 0, g2_data: 0, align: &[] },
-    QrVersionSpec { version: 2, data_codewords: 34, ec_per_block: 10, g1_blocks: 1, g1_data: 34, g2_blocks: 0, g2_data: 0, align: &[6, 18] },
-    QrVersionSpec { version: 3, data_codewords: 55, ec_per_block: 15, g1_blocks: 1, g1_data: 55, g2_blocks: 0, g2_data: 0, align: &[6, 22] },
-    QrVersionSpec { version: 4, data_codewords: 80, ec_per_block: 20, g1_blocks: 1, g1_data: 80, g2_blocks: 0, g2_data: 0, align: &[6, 26] },
-    QrVersionSpec { version: 5, data_codewords: 108, ec_per_block: 26, g1_blocks: 1, g1_data: 108, g2_blocks: 0, g2_data: 0, align: &[6, 30] },
-    QrVersionSpec { version: 6, data_codewords: 136, ec_per_block: 18, g1_blocks: 2, g1_data: 68, g2_blocks: 0, g2_data: 0, align: &[6, 34] },
-    QrVersionSpec { version: 7, data_codewords: 156, ec_per_block: 20, g1_blocks: 2, g1_data: 78, g2_blocks: 0, g2_data: 0, align: &[6, 22, 38] },
-    QrVersionSpec { version: 8, data_codewords: 194, ec_per_block: 24, g1_blocks: 2, g1_data: 97, g2_blocks: 0, g2_data: 0, align: &[6, 24, 42] },
-    QrVersionSpec { version: 9, data_codewords: 232, ec_per_block: 30, g1_blocks: 2, g1_data: 116, g2_blocks: 0, g2_data: 0, align: &[6, 26, 46] },
-    QrVersionSpec { version: 10, data_codewords: 274, ec_per_block: 18, g1_blocks: 2, g1_data: 68, g2_blocks: 2, g2_data: 69, align: &[6, 28, 50] },
+    QrVersionSpec {
+        version: 1,
+        data_codewords: 19,
+        ec_per_block: 7,
+        g1_blocks: 1,
+        g1_data: 19,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[],
+    },
+    QrVersionSpec {
+        version: 2,
+        data_codewords: 34,
+        ec_per_block: 10,
+        g1_blocks: 1,
+        g1_data: 34,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 18],
+    },
+    QrVersionSpec {
+        version: 3,
+        data_codewords: 55,
+        ec_per_block: 15,
+        g1_blocks: 1,
+        g1_data: 55,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 22],
+    },
+    QrVersionSpec {
+        version: 4,
+        data_codewords: 80,
+        ec_per_block: 20,
+        g1_blocks: 1,
+        g1_data: 80,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 26],
+    },
+    QrVersionSpec {
+        version: 5,
+        data_codewords: 108,
+        ec_per_block: 26,
+        g1_blocks: 1,
+        g1_data: 108,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 30],
+    },
+    QrVersionSpec {
+        version: 6,
+        data_codewords: 136,
+        ec_per_block: 18,
+        g1_blocks: 2,
+        g1_data: 68,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 34],
+    },
+    QrVersionSpec {
+        version: 7,
+        data_codewords: 156,
+        ec_per_block: 20,
+        g1_blocks: 2,
+        g1_data: 78,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 22, 38],
+    },
+    QrVersionSpec {
+        version: 8,
+        data_codewords: 194,
+        ec_per_block: 24,
+        g1_blocks: 2,
+        g1_data: 97,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 24, 42],
+    },
+    QrVersionSpec {
+        version: 9,
+        data_codewords: 232,
+        ec_per_block: 30,
+        g1_blocks: 2,
+        g1_data: 116,
+        g2_blocks: 0,
+        g2_data: 0,
+        align: &[6, 26, 46],
+    },
+    QrVersionSpec {
+        version: 10,
+        data_codewords: 274,
+        ec_per_block: 18,
+        g1_blocks: 2,
+        g1_data: 68,
+        g2_blocks: 2,
+        g2_data: 69,
+        align: &[6, 28, 50],
+    },
 ];
 
 fn gf_mul(mut a: u8, mut b: u8) -> u8 {
@@ -256,20 +346,23 @@ fn encode_qr_matrix(bytes: &[u8]) -> Option<Vec<Vec<bool>>> {
         }
     };
     push_bits(&mut bits, 0b0100, 4); // Byte mode
-    push_bits(&mut bits, bytes.len(), if spec.version <= 9 { 8 } else { 16 });
+    push_bits(
+        &mut bits,
+        bytes.len(),
+        if spec.version <= 9 { 8 } else { 16 },
+    );
     for &b in bytes {
         push_bits(&mut bits, b as usize, 8);
     }
     let cap_bits = spec.data_codewords * 8;
     let term = (cap_bits - bits.len()).min(4);
-    for _ in 0..term {
-        bits.push(false);
-    }
-    while bits.len() % 8 != 0 {
+    bits.resize(bits.len() + term, false);
+    while !bits.len().is_multiple_of(8) {
         bits.push(false);
     }
     let mut data_cw = Vec::with_capacity(spec.data_codewords);
-    for chunk in bits.chunks_exact(8) {
+    let (chunks, _) = bits.as_chunks::<8>();
+    for chunk in chunks {
         let mut b = 0u8;
         for &bit in chunk {
             b = (b << 1) | (bit as u8);
@@ -285,7 +378,10 @@ fn encode_qr_matrix(bytes: &[u8]) -> Option<Vec<Vec<bool>>> {
     let mut data_blocks: Vec<&[u8]> = Vec::new();
     let mut ec_blocks: Vec<Vec<u8>> = Vec::new();
     let mut offset = 0;
-    for (count, len) in [(spec.g1_blocks, spec.g1_data), (spec.g2_blocks, spec.g2_data)] {
+    for (count, len) in [
+        (spec.g1_blocks, spec.g1_data),
+        (spec.g2_blocks, spec.g2_data),
+    ] {
         for _ in 0..count {
             let blk = &data_cw[offset..offset + len];
             data_blocks.push(blk);
@@ -315,7 +411,13 @@ fn encode_qr_matrix(bytes: &[u8]) -> Option<Vec<Vec<bool>>> {
     let mut modules = vec![vec![false; size]; size];
     let mut reserved = vec![vec![false; size]; size];
 
-    fn set_mod(modules: &mut [Vec<bool>], reserved: &mut [Vec<bool>], r: usize, c: usize, val: bool) {
+    fn set_mod(
+        modules: &mut [Vec<bool>],
+        reserved: &mut [Vec<bool>],
+        r: usize,
+        c: usize,
+        val: bool,
+    ) {
         modules[r][c] = val;
         reserved[r][c] = true;
     }
@@ -375,17 +477,21 @@ fn encode_qr_matrix(bytes: &[u8]) -> Option<Vec<Vec<bool>>> {
 
     // Dark module & reserve format info areas
     set_mod(&mut modules, &mut reserved, size - 8, 8, true);
-    for i in 0..=8 {
+    for (i, cell) in reserved[8].iter_mut().enumerate().take(9) {
         if i != 6 {
-            reserved[8][i] = true;
-            reserved[i][8] = true;
+            *cell = true;
         }
     }
-    for i in (size - 8)..size {
-        reserved[8][i] = true;
+    for (i, row) in reserved.iter_mut().enumerate().take(9) {
+        if i != 6 {
+            row[8] = true;
+        }
     }
-    for i in (size - 7)..size {
-        reserved[i][8] = true;
+    for cell in reserved[8].iter_mut().take(size).skip(size - 8) {
+        *cell = true;
+    }
+    for row in reserved.iter_mut().take(size).skip(size - 7) {
+        row[8] = true;
     }
 
     // Version info for versions >= 7
@@ -505,14 +611,14 @@ fn apply_format_info(grid: &mut [Vec<bool>], size: usize, mask: usize) {
 fn qr_penalty(grid: &[Vec<bool>], size: usize) -> usize {
     let mut score = 0usize;
     let mut dark_count = 0usize;
-    for r in 0..size {
+    for row in grid.iter().take(size) {
         let mut run = 1usize;
-        for c in 0..size {
-            if grid[r][c] {
+        for (c, &cell) in row.iter().enumerate().take(size) {
+            if cell {
                 dark_count += 1;
             }
             if c > 0 {
-                if grid[r][c] == grid[r][c - 1] {
+                if cell == row[c - 1] {
                     run += 1;
                 } else {
                     if run >= 5 {
@@ -528,8 +634,8 @@ fn qr_penalty(grid: &[Vec<bool>], size: usize) -> usize {
     }
     for c in 0..size {
         let mut run = 1usize;
-        for r in 1..size {
-            if grid[r][c] == grid[r - 1][c] {
+        for win in grid[..size].windows(2) {
+            if win[1][c] == win[0][c] {
                 run += 1;
             } else {
                 if run >= 5 {
@@ -609,10 +715,17 @@ mod tests {
         assert_eq!(codes.len(), 10);
         assert_eq!(codes[0].0.len(), 11);
         assert!(verify_recovery_code(&codes[0].0, &codes[0].1));
-        assert!(verify_recovery_code(&codes[0].0.to_ascii_lowercase().replace('-', " "), &codes[0].1));
+        assert!(verify_recovery_code(
+            &codes[0].0.to_ascii_lowercase().replace('-', " "),
+            &codes[0].1
+        ));
         assert!(!verify_recovery_code("AAAAA-BBBBB", &codes[0].1));
 
-        let uri = build_otpauth_uri("Bug-Finder", "owner@alpha.test", &generate_totp_secret_b32());
+        let uri = build_otpauth_uri(
+            "Bug-Finder",
+            "owner@alpha.test",
+            &generate_totp_secret_b32(),
+        );
         let svg = render_qr_svg(&uri);
         assert!(svg.starts_with("<svg class=\"qr-svg\""));
         assert!(!svg.contains("style="));

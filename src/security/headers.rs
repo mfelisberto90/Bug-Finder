@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::security::auth::random_token_b64;
+use crate::security::auth::{random_token_b64, sha256_hex};
 use crate::security::ratelimit::BoundedMap;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct CspNonce(pub String);
@@ -17,8 +17,18 @@ pub struct CspNonce(pub String);
 #[derive(Debug, Clone)]
 pub struct ClientIp(pub IpAddr);
 
+#[derive(Debug, Clone)]
+pub struct PeerIp(pub IpAddr);
+
 const SCANNER_USER_AGENTS: &[&str] = &[
-    "sqlmap", "nuclei", "nikto", "ffuf", "gobuster", "masscan", "zgrab", "dirbuster",
+    "sqlmap",
+    "nuclei",
+    "nikto",
+    "ffuf",
+    "gobuster",
+    "masscan",
+    "zgrab",
+    "dirbuster",
 ];
 
 const CANARY_PATHS: &[&str] = &[
@@ -32,43 +42,104 @@ const CANARY_PATHS: &[&str] = &[
 
 pub struct ScannerGuard {
     bans: Mutex<BoundedMap<String, Instant>>,
+    active_sessions: Mutex<BoundedMap<String, i64>>,
+}
+
+impl Default for ScannerGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 impl ScannerGuard {
     pub fn new() -> Self {
         Self {
             bans: Mutex::new(BoundedMap::new(4096)),
+            active_sessions: Mutex::new(BoundedMap::new(16384)),
         }
+    }
+
+    pub fn track_session(&self, session_sha256: &str, expires_at: i64) {
+        if session_sha256.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .active_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(session_sha256.to_string(), expires_at);
+    }
+
+    pub fn untrack_session(&self, session_sha256: &str) {
+        if session_sha256.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .active_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.remove(&session_sha256.to_string());
+    }
+
+    pub fn is_active_session(&self, session_sha256: &str) -> bool {
+        if session_sha256.is_empty() {
+            return false;
+        }
+        let now = now_unix_secs();
+        let mut guard = self
+            .active_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = session_sha256.to_string();
+        if let Some(exp) = guard.get_mut(&key) {
+            if *exp > now {
+                return true;
+            }
+            guard.remove(&key);
+        }
+        false
     }
 
     pub fn is_banned(&self, ip_hmac: &str) -> bool {
         let mut guard = self.bans.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(until) = guard.get_mut(&ip_hmac.to_string()) {
+        let key = ip_hmac.to_string();
+        if let Some(until) = guard.get_mut(&key) {
             if Instant::now() < *until {
                 return true;
             }
-            guard.remove(&ip_hmac.to_string());
+            guard.remove(&key);
         }
         false
     }
 
     pub fn ban_15m(&self, ip_hmac: &str) {
         let mut guard = self.bans.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(ip_hmac.to_string(), Instant::now() + Duration::from_secs(900));
+        guard.insert(
+            ip_hmac.to_string(),
+            Instant::now() + Duration::from_secs(900),
+        );
     }
 }
 
-pub fn resolve_client_ip(
-    headers: &HeaderMap,
-    peer_ip: IpAddr,
-    config: &AppConfig,
-) -> IpAddr {
+pub fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfig) -> IpAddr {
     if !config.is_trusted_proxy(peer_ip) {
         return peer_ip;
     }
-    if let Some(cf) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = cf.trim().parse::<IpAddr>() {
-            return ip;
+    if config.trust_cf_header {
+        if let Some(cf) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Ok(ip) = cf.trim().parse::<IpAddr>() {
+                return ip;
+            }
         }
     }
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
@@ -93,11 +164,7 @@ pub fn normalize_host_header(host_header: &str) -> String {
             .map(|s| format!("{}]", s.to_ascii_lowercase()))
             .unwrap_or_default()
     } else {
-        trimmed
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
+        trimmed.split(':').next().unwrap_or("").to_ascii_lowercase()
     }
 }
 
@@ -123,51 +190,112 @@ pub fn is_allowed_host(host_header: &str, config: &AppConfig) -> bool {
     config.allowed_hosts.iter().any(|h| h == &host)
 }
 
-pub fn is_https_request(headers: &HeaderMap, config: &AppConfig) -> bool {
+pub fn is_https_request(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfig) -> bool {
     if config.force_secure_cookies {
         return true;
     }
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|p| p.eq_ignore_ascii_case("https"))
-        .unwrap_or(false)
+    if config.is_trusted_proxy(peer_ip) {
+        if let Some(proto) = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|p| p.split(',').next())
+        {
+            if proto.trim().eq_ignore_ascii_case("https") {
+                return true;
+            }
+            if proto.trim().eq_ignore_ascii_case("http") {
+                return false;
+            }
+        }
+    }
+    config
+        .public_url
+        .as_deref()
+        .is_some_and(|u| u.trim_start().to_ascii_lowercase().starts_with("https://"))
+}
+
+fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() || trimmed.contains(['/', '?', '#', '@', ' ', '\t']) {
+        return None;
+    }
+    if trimmed.starts_with('[') {
+        let close = trimmed.find(']')?;
+        let host = trimmed[..=close].to_ascii_lowercase();
+        let rest = &trimmed[close + 1..];
+        if rest.is_empty() {
+            Some((host, None))
+        } else if let Some(port_str) = rest.strip_prefix(':') {
+            let port = port_str.parse::<u16>().ok()?;
+            Some((host, Some(port)))
+        } else {
+            None
+        }
+    } else if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        let port = port_str.parse::<u16>().ok()?;
+        Some((host.to_ascii_lowercase(), Some(port)))
+    } else {
+        Some((trimmed.to_ascii_lowercase(), None))
+    }
+}
+
+fn parse_origin_tuple(url_or_origin: &str) -> Option<(&'static str, String, u16)> {
+    let trimmed = url_or_origin.trim().trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    let (scheme, default_port, rest) = lower
+        .strip_prefix("https://")
+        .map(|r| ("https", 443u16, r))
+        .or_else(|| lower.strip_prefix("http://").map(|r| ("http", 80u16, r)))?;
+    let (host, port_opt) = split_host_and_port(rest)?;
+    Some((scheme, host, port_opt.unwrap_or(default_port)))
 }
 
 /// Validates browser Origin / Sec-Fetch-Site on state-mutating cookie-authenticated requests.
-pub fn validate_same_origin(headers: &HeaderMap, config: &AppConfig) -> bool {
+pub fn validate_same_origin(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfig) -> bool {
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        let orig = origin.trim().trim_end_matches('/');
-        if orig.is_empty() {
+        let Some((orig_scheme, orig_host, orig_port)) = parse_origin_tuple(origin) else {
             return false;
-        }
-        let orig_lower = orig.to_ascii_lowercase();
-        let orig_host_port = orig_lower
-            .strip_prefix("https://")
-            .or_else(|| orig_lower.strip_prefix("http://"))
-            .unwrap_or("")
-            .split('/')
-            .next()
-            .unwrap_or("");
-        if orig_host_port.is_empty() {
-            return false;
-        }
+        };
         if let Some(ref pub_url) = config.public_url {
-            if pub_url.trim_end_matches('/').eq_ignore_ascii_case(orig) {
-                return true;
+            let pub_origin = pub_url
+                .trim()
+                .split('/')
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("/");
+            if let Some((ps, ph, pp)) = parse_origin_tuple(&pub_origin) {
+                if orig_scheme == ps && orig_host == ph && orig_port == pp {
+                    return true;
+                }
             }
         }
-        if let Some(req_host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-            if orig_host_port.eq_ignore_ascii_case(req_host.trim()) {
-                return true;
-            }
-            let req_norm = normalize_host_header(req_host);
-            let orig_norm = normalize_host_header(orig_host_port);
-            if !req_norm.is_empty() && req_norm == orig_norm {
-                return true;
+        let req_is_https = is_https_request(headers, peer_ip, config);
+        let req_scheme = if req_is_https { "https" } else { "http" };
+        let req_default_port = if req_is_https { 443u16 } else { 80u16 };
+        let req_host_hdr = if config.is_trusted_proxy(peer_ip) {
+            headers
+                .get("x-forwarded-host")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
+        } else {
+            headers.get(header::HOST).and_then(|v| v.to_str().ok())
+        };
+        if let Some(raw_host) = req_host_hdr {
+            if let Some((req_host, req_port_opt)) = split_host_and_port(raw_host) {
+                let req_port = req_port_opt.unwrap_or(req_default_port);
+                if orig_scheme == req_scheme && orig_host == req_host && orig_port == req_port {
+                    return true;
+                }
             }
         }
-        if config.is_dev && is_allowed_desktop_host(orig_host_port) {
+        if config.is_dev
+            && orig_scheme == "http"
+            && matches!(orig_host.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+        {
             return true;
         }
         return false;
@@ -191,7 +319,7 @@ pub fn is_cross_origin_public_path(path: &str) -> bool {
     }
     if let Some(rest) = path.strip_prefix("/api/") {
         if let Some((pid_str, sub)) = rest.split_once('/') {
-            if pid_str.parse::<i64>().ok().map_or(false, |id| id > 0) {
+            if pid_str.parse::<i64>().ok().is_some_and(|id| id > 0) {
                 let norm = sub.trim_end_matches('/');
                 return matches!(
                     norm,
@@ -212,25 +340,42 @@ pub fn inject_csp_nonce_into_html(html: &str, nonce: &str) -> String {
     while let Some(pos) = rest.find('<') {
         out.push_str(&rest[..pos]);
         let after = &rest[pos..];
-        let lower_prefix: String = after.chars().take(48).collect::<String>().to_ascii_lowercase();
+        let lower_prefix: String = after
+            .chars()
+            .take(48)
+            .collect::<String>()
+            .to_ascii_lowercase();
 
-        if lower_prefix.starts_with("<script ")
-            || lower_prefix.starts_with("<script>")
-        {
-            let tag_prefix_len = if lower_prefix.starts_with("<script>") { 7 } else { 7 };
-            out.push_str(&after[..tag_prefix_len]);
-            if !lower_prefix.contains("nonce=") {
-                out.push_str(&nonce_attr);
+        if lower_prefix.starts_with("<script ") || lower_prefix.starts_with("<script>") {
+            if let Some(gt) = after.find('>') {
+                let tag = &after[..gt];
+                if !tag.to_ascii_lowercase().contains("nonce=") {
+                    out.push_str("<script");
+                    out.push_str(&nonce_attr);
+                    out.push_str(&tag[7..]);
+                } else {
+                    out.push_str(tag);
+                }
+                rest = &after[gt..];
+            } else {
+                out.push('<');
+                rest = &after[1..];
             }
-            rest = &after[tag_prefix_len..];
-        } else if lower_prefix.starts_with("<style ")
-            || lower_prefix.starts_with("<style>")
-        {
-            out.push_str(&after[..6]);
-            if !lower_prefix.contains("nonce=") {
-                out.push_str(&nonce_attr);
+        } else if lower_prefix.starts_with("<style ") || lower_prefix.starts_with("<style>") {
+            if let Some(gt) = after.find('>') {
+                let tag = &after[..gt];
+                if !tag.to_ascii_lowercase().contains("nonce=") {
+                    out.push_str("<style");
+                    out.push_str(&nonce_attr);
+                    out.push_str(&tag[6..]);
+                } else {
+                    out.push_str(tag);
+                }
+                rest = &after[gt..];
+            } else {
+                out.push('<');
+                rest = &after[1..];
             }
-            rest = &after[6..];
         } else if lower_prefix.starts_with("<link ") {
             if let Some(gt) = after.find('>') {
                 let tag = &after[..gt];
@@ -256,101 +401,18 @@ pub fn inject_csp_nonce_into_html(html: &str, nonce: &str) -> String {
     out
 }
 
-pub async fn security_headers_middleware(
-    State(state): State<Arc<crate::AppState>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let path = req.uri().path().to_string();
-    let headers = req.headers().clone();
-
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !is_allowed_host(host, &state.config) {
-        return (StatusCode::FORBIDDEN, "Forbidden host").into_response();
-    }
-
-    let peer_ip = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    let client_ip = resolve_client_ip(&headers, peer_ip, &state.config);
-
-    let has_session_cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|raw| {
-            raw.split(';').find_map(|part| {
-                let (k, v) = part.trim().split_once('=')?;
-                if k.trim() == "bf_session" {
-                    Some(v.trim())
-                } else {
-                    None
-                }
-            })
-        })
-        .map(|val| {
-            val.len() >= 32
-                && val
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        })
-        .unwrap_or(false);
-    let has_ingest_auth = headers.contains_key("x-sentry-auth")
-        || headers.contains_key(header::AUTHORIZATION)
-        || req.uri().query().map(|q| q.contains("sentry_key=") || q.contains("glitchtip_key=")).unwrap_or(false);
-
-    // CGNAT-safe scanner & honeypot guard: always exempt active authenticated sessions and signed/DSN ingest
-    if !has_session_cookie && !has_ingest_auth {
-        let ip_hmac = state.rate_limiter.hash_key("honeypot", &client_ip.to_string());
-        if state.scanner_guard.is_banned(&ip_hmac) {
-            return (StatusCode::TOO_MANY_REQUESTS, "Temporarily blocked").into_response();
-        }
-        let ua = headers
-            .get(header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let is_canary = CANARY_PATHS.iter().any(|c| path.eq_ignore_ascii_case(c));
-        let is_scanner = SCANNER_USER_AGENTS.iter().any(|s| ua.contains(s));
-        if is_canary || is_scanner {
-            state.scanner_guard.ban_15m(&ip_hmac);
-            return (StatusCode::NOT_FOUND, "Not found").into_response();
-        }
-    }
-
-    let nonce = random_token_b64(18);
-    let mut req = req;
-    req.extensions_mut().insert(CspNonce(nonce.clone()));
-    req.extensions_mut().insert(ClientIp(client_ip));
-
-    let is_https = is_https_request(&headers, &state.config);
-    let mut resp = next.run(req).await;
-    if resp.status().is_server_error() {
-        state.self_monitor.record(
-            "http_5xx",
-            "error",
-            "http",
-            &format!("HTTP {} on {}", resp.status().as_u16(), path),
-            None,
-        );
-        state
-            .metrics
-            .self_errors_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
+fn apply_security_headers(resp: &mut Response, path: &str, nonce: &str, is_https: bool) {
     let h = resp.headers_mut();
-
     let csp = format!(
         "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'nonce-{nonce}'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     );
     if let Ok(v) = HeaderValue::from_str(&csp) {
         h.insert("content-security-policy", v);
     }
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     h.insert(
         "referrer-policy",
@@ -362,7 +424,7 @@ pub async fn security_headers_middleware(
     );
     h.insert(
         "cross-origin-resource-policy",
-        HeaderValue::from_static(if is_cross_origin_public_path(&path) {
+        HeaderValue::from_static(if is_cross_origin_public_path(path) {
             "cross-origin"
         } else {
             "same-origin"
@@ -382,7 +444,7 @@ pub async fn security_headers_middleware(
         );
     }
 
-    if path.starts_with("/api/") {
+    if (path.starts_with("/api/") || path == "/metrics") && !h.contains_key(header::CACHE_CONTROL) {
         h.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, private"),
@@ -398,7 +460,134 @@ pub async fn security_headers_middleware(
     if path == "/robots.txt" || path == "/api/health" {
         h.remove(header::SET_COOKIE);
     }
+}
 
+pub async fn security_headers_middleware(
+    State(state): State<Arc<crate::AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
+
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let client_ip = resolve_client_ip(&headers, peer_ip, &state.config);
+    let nonce = random_token_b64(18);
+    let is_https = is_https_request(&headers, peer_ip, &state.config);
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_loopback_health =
+        path == "/api/health" && peer_ip.is_loopback() && is_allowed_desktop_host(host);
+    if !is_loopback_health && !is_allowed_host(host, &state.config) {
+        let mut resp = (StatusCode::FORBIDDEN, "Forbidden host").into_response();
+        apply_security_headers(&mut resp, &path, &nonce, is_https);
+        return resp;
+    }
+
+    let raw_session_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|part| {
+                let (k, v) = part.trim().split_once('=')?;
+                if k.trim() == "bf_session" {
+                    Some(v.trim())
+                } else {
+                    None
+                }
+            })
+        })
+        .filter(|val| {
+            val.len() >= 32
+                && val
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    let session_sha = raw_session_cookie.map(|s| sha256_hex(s.as_bytes()));
+    let mut has_active_session = session_sha
+        .as_deref()
+        .is_some_and(|s| state.scanner_guard.is_active_session(s));
+
+    let has_ingest_auth = is_cross_origin_public_path(&path)
+        && (headers.contains_key("x-sentry-auth")
+            || headers.contains_key(header::AUTHORIZATION)
+            || req
+                .uri()
+                .query()
+                .is_some_and(|q| q.contains("sentry_key=") || q.contains("glitchtip_key=")));
+
+    // CGNAT-safe scanner & honeypot guard: only verified active sessions and public-ingest DSN auth skip checks
+    if !has_active_session && !has_ingest_auth {
+        let ip_hmac = state
+            .rate_limiter
+            .hash_key("honeypot", &client_ip.to_string());
+        let already_banned = state.scanner_guard.is_banned(&ip_hmac);
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_canary = CANARY_PATHS.iter().any(|c| path.eq_ignore_ascii_case(c));
+        let is_scanner = SCANNER_USER_AGENTS.iter().any(|s| ua.contains(s));
+
+        if (already_banned || is_canary || is_scanner) && session_sha.is_some() {
+            if let Some(ref sha) = session_sha {
+                if let Ok(Some(_sess)) = state
+                    .storage
+                    .resolve_session(sha, now_unix_secs(), state.config.session_idle_sec)
+                    .await
+                {
+                    state
+                        .scanner_guard
+                        .track_session(sha, now_unix_secs() + 900);
+                    has_active_session = true;
+                }
+            }
+        }
+
+        if !has_active_session {
+            if already_banned {
+                let mut resp =
+                    (StatusCode::TOO_MANY_REQUESTS, "Temporarily blocked").into_response();
+                apply_security_headers(&mut resp, &path, &nonce, is_https);
+                return resp;
+            }
+            if is_canary || is_scanner {
+                state.scanner_guard.ban_15m(&ip_hmac);
+                let mut resp = (StatusCode::NOT_FOUND, "Not found").into_response();
+                apply_security_headers(&mut resp, &path, &nonce, is_https);
+                return resp;
+            }
+        }
+    }
+
+    let mut req = req;
+    req.extensions_mut().insert(CspNonce(nonce.clone()));
+    req.extensions_mut().insert(ClientIp(client_ip));
+    req.extensions_mut().insert(PeerIp(peer_ip));
+
+    let mut resp = next.run(req).await;
+    if resp.status().is_server_error() {
+        state.self_monitor.record(
+            "http_5xx",
+            "error",
+            "http",
+            &format!("Internal HTTP {} error", resp.status().as_u16()),
+            None,
+        );
+        state
+            .metrics
+            .self_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    apply_security_headers(&mut resp, &path, &nonce, is_https);
     resp
 }
 
@@ -438,9 +627,77 @@ mod tests {
         assert!(!is_cross_origin_public_path("/"));
         assert!(!is_cross_origin_public_path("/assets/app.js"));
         assert!(!is_cross_origin_public_path("/api/auth/me"));
-        assert!(!is_cross_origin_public_path("/api/0/organizations/acme/issues/"));
+        assert!(!is_cross_origin_public_path(
+            "/api/0/organizations/acme/issues/"
+        ));
         assert!(!is_cross_origin_public_path("/api/0/sdk-meta/"));
         assert!(!is_cross_origin_public_path("/api/0/envelope/"));
         assert!(!is_cross_origin_public_path("/metrics"));
+    }
+
+    #[test]
+    fn validate_same_origin_checks_scheme_and_port() {
+        let tmp = std::env::temp_dir().join(format!("bf_hdr_test1_{}", random_token_b64(6)));
+        let mut cfg = AppConfig::from_env_and_overrides(None, Some(tmp.clone()), None, false)
+            .expect("config init");
+        cfg.is_dev = false;
+        cfg.public_url = Some("https://bf.example.com".to_string());
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::HOST, HeaderValue::from_static("bf.example.com"));
+        hdrs.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        hdrs.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://bf.example.com"),
+        );
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        assert!(validate_same_origin(&hdrs, loopback, &cfg));
+
+        // Different port or http:// downgrade must be rejected
+        hdrs.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://bf.example.com"),
+        );
+        assert!(!validate_same_origin(&hdrs, loopback, &cfg));
+
+        hdrs.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://bf.example.com:8443"),
+        );
+        assert!(!validate_same_origin(&hdrs, loopback, &cfg));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_https_request_ignores_untrusted_proxy_headers() {
+        let tmp = std::env::temp_dir().join(format!("bf_hdr_test2_{}", random_token_b64(6)));
+        let mut cfg = AppConfig::from_env_and_overrides(None, Some(tmp.clone()), None, false)
+            .expect("config init");
+        cfg.force_secure_cookies = false;
+        cfg.public_url = None;
+        cfg.trusted_proxies.clear();
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let attacker = IpAddr::from([203, 0, 113, 9]);
+        assert!(!is_https_request(&hdrs, attacker, &cfg));
+
+        cfg.trusted_proxies.extend(
+            crate::config::CidrBlock::expand_keyword_or_cidr("203.0.113.9/32")
+                .expect("valid test cidr"),
+        );
+        assert!(is_https_request(&hdrs, attacker, &cfg));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scanner_guard_tracks_and_untracks_sessions() {
+        let guard = ScannerGuard::new();
+        let sha = sha256_hex(b"session_secret_value_0123456789abcdef");
+        assert!(!guard.is_active_session(&sha));
+        guard.track_session(&sha, now_unix_secs() + 60);
+        assert!(guard.is_active_session(&sha));
+        guard.untrack_session(&sha);
+        assert!(!guard.is_active_session(&sha));
     }
 }
