@@ -485,9 +485,9 @@ impl OidcClient {
         if auth_ep.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err("OIDC authorization_endpoint contains invalid characters".into());
         }
-        if !auth_ep.starts_with("https://")
-            && !(self.allow_http_dev && auth_ep.starts_with("http://"))
-        {
+        let scheme_ok = auth_ep.starts_with("https://")
+            || (self.allow_http_dev && auth_ep.starts_with("http://"));
+        if !scheme_ok {
             return Err("OIDC authorization_endpoint must use https://".into());
         }
         let challenge = pkce_s256_challenge(code_verifier);
