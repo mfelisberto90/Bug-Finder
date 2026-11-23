@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -185,7 +186,10 @@ fn upsert_env_file(
 
     for &(key, val) in entries {
         let prefix = format!("{key}=");
-        if let Some(pos) = lines.iter().position(|l| l.trim_start().starts_with(&prefix)) {
+        if let Some(pos) = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(&prefix))
+        {
             if force && lines[pos] != format!("{key}={val}") {
                 lines[pos] = format!("{key}={val}");
                 changed = true;
@@ -210,16 +214,20 @@ fn upsert_env_file(
 
     let mut opts = OpenOptions::new();
     opts.create(true).write(true).truncate(true);
-    if secret_mode {
-        opts.mode(0o600);
-    } else {
-        opts.mode(0o644);
+    #[cfg(unix)]
+    {
+        if secret_mode {
+            opts.mode(0o600);
+        } else {
+            opts.mode(0o644);
+        }
     }
     let mut f = opts
         .open(path)
         .map_err(|e| format!("Write {}: {e}", path.display()))?;
     f.write_all(content.as_bytes())
         .map_err(|e| format!("Write {}: {e}", path.display()))?;
+    #[cfg(unix)]
     if secret_mode {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
@@ -251,8 +259,8 @@ fn inject_html_script_tag(
     dsn: &str,
     dry_run: bool,
 ) -> Result<bool, String> {
-    let raw = fs::read_to_string(html_path)
-        .map_err(|e| format!("Read {}: {e}", html_path.display()))?;
+    let raw =
+        fs::read_to_string(html_path).map_err(|e| format!("Read {}: {e}", html_path.display()))?;
     if raw.contains("<!-- bugfinder:auto -->") || raw.contains("bugfinder-mini.js") {
         return Ok(false);
     }
@@ -270,8 +278,7 @@ fn inject_html_script_tag(
         format!("{raw}\n{script_tag}")
     };
     if !dry_run {
-        fs::write(html_path, updated)
-            .map_err(|e| format!("Write {}: {e}", html_path.display()))?;
+        fs::write(html_path, updated).map_err(|e| format!("Write {}: {e}", html_path.display()))?;
     }
     Ok(true)
 }
@@ -289,7 +296,11 @@ pub fn run_init_cli(
     let use_sentry_sdk = match sdk_mode.trim().to_ascii_lowercase().as_str() {
         "" | "zero-dep" | "mini" => false,
         "sentry" | "glitchtip" => true,
-        other => return Err(format!("Unknown --sdk '{other}': expected zero-dep or sentry")),
+        other => {
+            return Err(format!(
+                "Unknown --sdk '{other}': expected zero-dep or sentry"
+            ))
+        }
     };
 
     let stack = match DetectedStack::from_cli_str(stack_arg)? {
@@ -308,18 +319,13 @@ pub fn run_init_cli(
     }
 
     let mut env_entries: Vec<(&str, &str)> = vec![("BUGFINDER_DSN", dsn)];
-    let mut ex_entries: Vec<(&str, &str)> = vec![(
-        "BUGFINDER_DSN",
-        "http://<PUBLIC_KEY>@127.0.0.1:8080/1",
-    )];
+    let mut ex_entries: Vec<(&str, &str)> =
+        vec![("BUGFINDER_DSN", "http://<PUBLIC_KEY>@127.0.0.1:8080/1")];
 
     match stack {
         DetectedStack::Vite => {
             env_entries.push(("VITE_BUGFINDER_DSN", dsn));
-            ex_entries.push((
-                "VITE_BUGFINDER_DSN",
-                "http://<PUBLIC_KEY>@127.0.0.1:8080/1",
-            ));
+            ex_entries.push(("VITE_BUGFINDER_DSN", "http://<PUBLIC_KEY>@127.0.0.1:8080/1"));
         }
         DetectedStack::NextJs => {
             env_entries.push(("NEXT_PUBLIC_BUGFINDER_DSN", dsn));
@@ -344,14 +350,28 @@ pub fn run_init_cli(
     }
 
     let env_changed = upsert_env_file(&dir.join(".env"), &env_entries, dry_run, force, true)?;
-    let ex_changed = upsert_env_file(&dir.join(".env.example"), &ex_entries, dry_run, false, false)?;
+    let ex_changed = upsert_env_file(
+        &dir.join(".env.example"),
+        &ex_entries,
+        dry_run,
+        false,
+        false,
+    )?;
     println!(
         "  - .env (0600): {}",
-        if env_changed { "updated" } else { "already configured" }
+        if env_changed {
+            "updated"
+        } else {
+            "already configured"
+        }
     );
     println!(
         "  - .env.example: {}",
-        if ex_changed { "updated" } else { "already configured" }
+        if ex_changed {
+            "updated"
+        } else {
+            "already configured"
+        }
     );
     if dir.join(".git").exists() && !env_is_gitignored(dir) {
         eprintln!(
@@ -414,7 +434,11 @@ pub fn run_init_cli(
             println!(
                 "  - {}: {} ({hint})",
                 fname,
-                if wrote { "created" } else { "kept existing (use --force to overwrite)" }
+                if wrote {
+                    "created"
+                } else {
+                    "kept existing (use --force to overwrite)"
+                }
             );
         }
         DetectedStack::Python
@@ -438,13 +462,17 @@ pub fn run_init_cli(
             println!(
                 "  - {}: {} ({hint})",
                 fname,
-                if wrote { "created" } else { "kept existing (use --force to overwrite)" }
+                if wrote {
+                    "created"
+                } else {
+                    "kept existing (use --force to overwrite)"
+                }
             );
         }
         DetectedStack::Laravel | DetectedStack::Php => {
             if use_sentry_sdk {
                 println!(
-                    "  Laravel/Sentry `.env` ready. Point your SDK or GlitchTipClient to `GLITCHTIP_DSN` (project #{project_id})."
+                    "  Laravel/Sentry `.env` ready. Point your Sentry Laravel SDK (`SENTRY_LARAVEL_DSN` / `GLITCHTIP_DSN`) to project #{project_id}."
                 );
             } else {
                 let wrote = write_connector_file(
@@ -565,7 +593,7 @@ export function captureException(err, extra = {}) {
 
 if (TARGET && typeof process !== "undefined" && !globalThis.__bfHooked) {
   globalThis.__bfHooked = true;
-  process.on("uncaughtException", (err) => captureException(err, { handler: "uncaughtException" }));
+  process.on("uncaughtExceptionMonitor", (err) => captureException(err, { handler: "uncaughtExceptionMonitor" }));
   process.on("unhandledRejection", (reason) => captureException(reason, { handler: "unhandledRejection" }));
 }
 "#
@@ -731,6 +759,20 @@ fn zero_dep_php_snippet() -> &'static str {
             $prev($e);
         }
     });
+
+    $prevErr = set_error_handler(static function (int $severity, string $message, string $file = '', int $line = 0) use ($send, &$prevErr): bool {
+        if (error_reporting() & $severity) {
+            $send(new \ErrorException($message, 0, $severity, $file, $line));
+        }
+        return $prevErr ? (bool) ($prevErr)($severity, $message, $file, $line) : false;
+    });
+
+    register_shutdown_function(static function () use ($send): void {
+        $last = error_get_last();
+        if (is_array($last) && in_array($last['type'] ?? 0, [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+            $send(new \ErrorException((string) ($last['message'] ?? 'Fatal shutdown error'), 0, (int) $last['type'], (string) ($last['file'] ?? ''), (int) ($last['line'] ?? 0)));
+        }
+    });
 })();
 "#
 }
@@ -795,15 +837,42 @@ fn zero_dep_rust_snippet() -> &'static str {
     "// Tip: run your binary via `bugfinder wrap --dsn $BUGFINDER_DSN -- ./target/release/your-app`\n// for zero-code panic & stderr capture without extra dependencies, or configure the `sentry` crate with env `BUGFINDER_DSN`.\n"
 }
 
+fn contains_isolated_zero_error(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = lower[start..].find("0 error") {
+        let abs = start + rel;
+        if abs == 0 || !bytes[abs - 1].is_ascii_digit() {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 pub fn looks_like_real_error_line(raw: &str) -> bool {
     let lower = raw.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
     }
 
+    let has_explicit_crash = lower.contains("traceback (most recent call last)")
+        || lower.contains("panicked at ")
+        || lower.contains("fatal error:")
+        || lower.contains("php fatal error:")
+        || lower.contains("php parse error:")
+        || lower.contains("uncaught ")
+        || lower.contains("exception in thread ")
+        || lower.contains("caused by:")
+        || lower.starts_with("panic:")
+        || lower.contains(" panic: ")
+        || lower.contains("\tpanic:")
+        || lower.contains("runtime error:");
+    if has_explicit_crash {
+        return true;
+    }
+
     const BENIGN_EXCLUSIONS: &[&str] = &[
-        "0 error",
-        "0 errors",
         "no error",
         "without error",
         "error_count=0",
@@ -824,20 +893,16 @@ pub fn looks_like_real_error_line(raw: &str) -> bool {
         "errorboundary",
         "error_middleware",
     ];
-    if BENIGN_EXCLUSIONS.iter().any(|ex| lower.contains(ex)) {
+    if contains_isolated_zero_error(&lower) || BENIGN_EXCLUSIONS.iter().any(|ex| lower.contains(ex))
+    {
         return false;
     }
 
-    let has_explicit_crash = lower.contains("traceback")
-        || lower.contains("panicked at")
-        || lower.contains("uncaught")
-        || lower.contains("fatal error");
-    if !has_explicit_crash
-        && (lower.contains("\" 200 ")
-            || lower.contains("\" 201 ")
-            || lower.contains("\" 204 ")
-            || lower.contains("\" 304 ")
-            || lower.ends_with(" 200 ok"))
+    if lower.contains("\" 200 ")
+        || lower.contains("\" 201 ")
+        || lower.contains("\" 204 ")
+        || lower.contains("\" 304 ")
+        || lower.ends_with(" 200 ok")
     {
         return false;
     }
@@ -847,7 +912,11 @@ pub fn looks_like_real_error_line(raw: &str) -> bool {
         "panicked at ",
         "fatal error:",
         "php fatal error:",
+        "php parse error:",
         "uncaught ",
+        "exception in thread ",
+        "caused by:",
+        "runtime error:",
         "unhandledpromiserejection",
         "unhandled rejection",
         "segmentation fault",
@@ -877,10 +946,57 @@ pub fn looks_like_real_error_line(raw: &str) -> bool {
         "attributeerror:",
         "runtimeerror:",
         "zerodivisionerror:",
+        "importerror:",
+        "modulenotfounderror:",
+        "indentationerror:",
+        "nameerror:",
+        "oserror:",
+        "filenotfounderror:",
+        "timeouterror:",
+        "connectionerror:",
+        "permissionerror:",
+        "assertionerror:",
         "nullpointerexception",
         "sqlstate[",
     ];
     ERROR_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+fn is_python_exception_closing_line(line: &str) -> bool {
+    if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+        return false;
+    }
+    let head = line.split(':').next().unwrap_or("").trim();
+    if head.is_empty()
+        || head.eq_ignore_ascii_case("traceback")
+        || !head
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    {
+        return false;
+    }
+    let last_seg = head.rsplit('.').next().unwrap_or(head);
+    let starts_pascal = last_seg
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_uppercase());
+    starts_pascal
+        && (line.contains(':')
+            || head.ends_with("Error")
+            || head.ends_with("Exception")
+            || head.ends_with("Interrupt")
+            || head.ends_with("Exit"))
+}
+
+fn is_php_frame_line(trimmed: &str) -> bool {
+    trimmed.strip_prefix('#').is_some_and(|rest| {
+        let digits: String = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .map(char::from)
+            .collect();
+        !digits.is_empty() && rest[digits.len()..].starts_with(' ')
+    })
 }
 
 fn is_stack_continuation(line: &str) -> bool {
@@ -894,8 +1010,11 @@ fn is_stack_continuation(line: &str) -> bool {
         || t.starts_with("at ")
         || t.starts_with("Caused by:")
         || t.starts_with("stack backtrace:")
+        || t.starts_with("note: run with ")
         || t.starts_with("goroutine ")
-        || looks_like_real_error_line(t)
+        || t.starts_with("Stack trace:")
+        || t.starts_with("thrown in ")
+        || is_php_frame_line(t.trim_start())
 }
 
 enum TelemetryMsg {
@@ -932,14 +1051,15 @@ fn post_envelope_blocking(agent: &ureq::Agent, endpoint: &str, body: &str) {
         .send_string(body);
 }
 
-fn flush_log_batch(
-    agent: &ureq::Agent,
-    endpoint: &str,
-    dsn: &str,
-    service: &str,
-    env_name: &str,
-    buf: &mut Vec<(f64, &'static str, String)>,
-) {
+struct StreamTarget<'a> {
+    agent: &'a ureq::Agent,
+    endpoint: &'a str,
+    dsn: &'a str,
+    service: &'a str,
+    env_name: &'a str,
+}
+
+fn flush_log_batch(target: &StreamTarget<'_>, buf: &mut Vec<(f64, &'static str, String)>) {
     if buf.is_empty() {
         return;
     }
@@ -952,27 +1072,23 @@ fn flush_log_batch(
                 "severity_number": if lvl == "error" { 17 } else { 9 },
                 "body": body,
                 "attributes": {
-                    "service.name": { "value": service, "type": "string" },
-                    "sentry.environment": { "value": env_name, "type": "string" }
+                    "service.name": { "value": target.service, "type": "string" },
+                    "sentry.environment": { "value": target.env_name, "type": "string" }
                 }
             })
         })
         .collect();
     let envelope = format!(
         "{}\n{}\n{}\n",
-        json!({ "sent_at": chrono::Utc::now().to_rfc3339(), "dsn": dsn, "sdk": { "name": "bugfinder.wrap", "version": env!("CARGO_PKG_VERSION") } }),
+        json!({ "sent_at": chrono::Utc::now().to_rfc3339(), "dsn": target.dsn, "sdk": { "name": "bugfinder.wrap", "version": env!("CARGO_PKG_VERSION") } }),
         json!({ "type": "log", "item_count": items.len(), "content_type": "application/vnd.sentry.items.log+json" }),
         json!({ "version": 2, "items": items })
     );
-    post_envelope_blocking(agent, endpoint, &envelope);
+    post_envelope_blocking(target.agent, target.endpoint, &envelope);
 }
 
 fn flush_error_event(
-    agent: &ureq::Agent,
-    endpoint: &str,
-    dsn: &str,
-    service: &str,
-    env_name: &str,
+    target: &StreamTarget<'_>,
     title: &str,
     level: &'static str,
     stack_lines: &[String],
@@ -993,12 +1109,12 @@ fn flush_error_event(
         "timestamp": chrono::Utc::now().timestamp() as f64,
         "platform": "other",
         "level": level,
-        "environment": env_name,
-        "culprit": service,
+        "environment": target.env_name,
+        "culprit": target.service,
         "breadcrumbs": { "values": crumbs },
         "exception": {
             "values": [{
-                "type": service,
+                "type": target.service,
                 "value": title,
                 "stacktrace": { "frames": frames }
             }]
@@ -1006,11 +1122,11 @@ fn flush_error_event(
     });
     let envelope = format!(
         "{}\n{}\n{}\n",
-        json!({ "event_id": eid, "sent_at": chrono::Utc::now().to_rfc3339(), "dsn": dsn, "sdk": { "name": "bugfinder.wrap", "version": env!("CARGO_PKG_VERSION") } }),
+        json!({ "event_id": eid, "sent_at": chrono::Utc::now().to_rfc3339(), "dsn": target.dsn, "sdk": { "name": "bugfinder.wrap", "version": env!("CARGO_PKG_VERSION") } }),
         json!({ "type": "event", "content_type": "application/json" }),
         payload
     );
-    post_envelope_blocking(agent, endpoint, &envelope);
+    post_envelope_blocking(target.agent, target.endpoint, &envelope);
 }
 
 fn sender_worker(
@@ -1024,15 +1140,26 @@ fn sender_worker(
         .timeout_connect(Duration::from_secs(2))
         .timeout(Duration::from_secs(3))
         .build();
+    let target = StreamTarget {
+        agent: &agent,
+        endpoint: &endpoint,
+        dsn: &dsn,
+        service: &service,
+        env_name: &env_name,
+    };
     let mut log_buf: Vec<(f64, &'static str, String)> = Vec::with_capacity(25);
     let mut last_flush = Instant::now();
 
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(TelemetryMsg::Log { ts_sec, level, body }) => {
+            Ok(TelemetryMsg::Log {
+                ts_sec,
+                level,
+                body,
+            }) => {
                 log_buf.push((ts_sec, level, body));
                 if log_buf.len() >= 25 || last_flush.elapsed() >= Duration::from_secs(1) {
-                    flush_log_batch(&agent, &endpoint, &dsn, &service, &env_name, &mut log_buf);
+                    flush_log_batch(&target, &mut log_buf);
                     last_flush = Instant::now();
                 }
             }
@@ -1042,32 +1169,22 @@ fn sender_worker(
                 stack_lines,
                 breadcrumbs,
             }) => {
-                flush_log_batch(&agent, &endpoint, &dsn, &service, &env_name, &mut log_buf);
+                flush_log_batch(&target, &mut log_buf);
                 last_flush = Instant::now();
-                flush_error_event(
-                    &agent,
-                    &endpoint,
-                    &dsn,
-                    &service,
-                    &env_name,
-                    &title,
-                    level,
-                    &stack_lines,
-                    &breadcrumbs,
-                );
+                flush_error_event(&target, &title, level, &stack_lines, &breadcrumbs);
             }
             Ok(TelemetryMsg::FlushAndExit) => {
-                flush_log_batch(&agent, &endpoint, &dsn, &service, &env_name, &mut log_buf);
+                flush_log_batch(&target, &mut log_buf);
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !log_buf.is_empty() && last_flush.elapsed() >= Duration::from_secs(1) {
-                    flush_log_batch(&agent, &endpoint, &dsn, &service, &env_name, &mut log_buf);
+                    flush_log_batch(&target, &mut log_buf);
                     last_flush = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                flush_log_batch(&agent, &endpoint, &dsn, &service, &env_name, &mut log_buf);
+                flush_log_batch(&target, &mut log_buf);
                 break;
             }
         }
@@ -1095,18 +1212,38 @@ impl StreamAggregator {
 
     fn flush_pending_error(&mut self) {
         if let Some((headline, stack)) = self.pending_err.take() {
-            let final_title = stack
-                .iter()
-                .rev()
-                .find(|l| {
-                    let low = l.to_ascii_lowercase();
-                    !l.starts_with("  ")
-                        && !l.starts_with('\t')
-                        && !low.starts_with("traceback ")
-                        && looks_like_real_error_line(l)
-                })
-                .cloned()
-                .unwrap_or(headline);
+            let final_title = if headline
+                .to_ascii_lowercase()
+                .contains("traceback (most recent call last)")
+            {
+                stack
+                    .iter()
+                    .rev()
+                    .find(|l| is_python_exception_closing_line(l))
+                    .cloned()
+                    .unwrap_or(headline)
+            } else if headline.to_ascii_lowercase().contains("panicked at ")
+                && headline.trim_end().ends_with(':')
+                && stack.len() >= 2
+                && !stack[1].starts_with("stack backtrace:")
+                && !stack[1].starts_with("note: run with ")
+            {
+                format!("{} {}", headline.trim_end(), stack[1].trim())
+            } else {
+                stack
+                    .iter()
+                    .rev()
+                    .find(|l| {
+                        let low = l.to_ascii_lowercase();
+                        !l.starts_with("  ")
+                            && !l.starts_with('\t')
+                            && !low.starts_with("traceback ")
+                            && (looks_like_real_error_line(l)
+                                || is_python_exception_closing_line(l))
+                    })
+                    .cloned()
+                    .unwrap_or(headline)
+            };
             let now = Instant::now();
             if self.last_sent.len() > 64 {
                 self.last_sent.clear();
@@ -1139,16 +1276,36 @@ impl StreamAggregator {
         }
         self.ring.push_back(scrubbed.clone());
 
-        if let Some((_, ref mut stack)) = self.pending_err {
-            if stack.len() < 25 && is_stack_continuation(&scrubbed) {
-                stack.push(scrubbed.clone());
-                let ts_sec = (chrono::Utc::now().timestamp_millis() as f64) / 1000.0;
-                let _ = self.tx.try_send(TelemetryMsg::Log {
-                    ts_sec,
-                    level: "error",
-                    body: scrubbed,
-                });
-                return;
+        if let Some((ref headline, ref mut stack)) = self.pending_err {
+            if stack.len() < 25 {
+                let low_head = headline.to_ascii_lowercase();
+                let is_py_closing = low_head.contains("traceback (most recent call last)")
+                    && is_python_exception_closing_line(&scrubbed);
+                let is_rust_panic_msg = low_head.contains("panicked at ")
+                    && stack.len() == 1
+                    && !scrubbed.starts_with('[')
+                    && !scrubbed.starts_with('{');
+                if is_py_closing {
+                    stack.push(scrubbed.clone());
+                    let ts_sec = (chrono::Utc::now().timestamp_millis() as f64) / 1000.0;
+                    let _ = self.tx.try_send(TelemetryMsg::Log {
+                        ts_sec,
+                        level: "error",
+                        body: scrubbed,
+                    });
+                    self.flush_pending_error();
+                    return;
+                }
+                if is_stack_continuation(&scrubbed) || is_rust_panic_msg {
+                    stack.push(scrubbed.clone());
+                    let ts_sec = (chrono::Utc::now().timestamp_millis() as f64) / 1000.0;
+                    let _ = self.tx.try_send(TelemetryMsg::Log {
+                        ts_sec,
+                        level: "error",
+                        body: scrubbed,
+                    });
+                    return;
+                }
             }
             self.flush_pending_error();
         }
@@ -1269,15 +1426,13 @@ pub fn run_wrap_cli(
         "{origin}/api/{pid}/envelope/?sentry_key={}",
         percent_encode_val(&key)
     );
-    let svc = service
-        .map(ToString::to_string)
-        .unwrap_or_else(|| {
-            Path::new(&cmd[0])
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("wrapped-app")
-                .to_string()
-        });
+    let svc = service.map(ToString::to_string).unwrap_or_else(|| {
+        Path::new(&cmd[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("wrapped-app")
+            .to_string()
+    });
 
     let mut command = Command::new(&cmd[0]);
     if cmd.len() > 1 {
@@ -1312,7 +1467,7 @@ pub fn run_wrap_cli(
         child
             .stdout
             .take()
-            .map(|out_pipe| spawn_stream_pump(out_pipe, std::io::stdout(), tx.clone(), false))
+            .map(|out_pipe| spawn_stream_pump(out_pipe, std::io::stdout(), tx.clone(), true))
     } else {
         None
     };
@@ -1322,12 +1477,17 @@ pub fn run_wrap_cli(
         .map_err(|e| format!("Failed waiting for child process: {e}"))?;
     let exit_code = status.code().unwrap_or(1);
 
-    let (emitted_err, ring) = stderr_handle
+    let (err_emitted, mut ring) = stderr_handle
         .and_then(|h| h.join().ok())
         .flatten()
         .unwrap_or((false, Vec::new()));
-    if let Some(h) = stdout_handle {
-        let _ = h.join();
+    let (out_emitted, out_ring) = stdout_handle
+        .and_then(|h| h.join().ok())
+        .flatten()
+        .unwrap_or((false, Vec::new()));
+    let emitted_err = err_emitted || out_emitted;
+    if ring.is_empty() {
+        ring = out_ring;
     }
 
     if exit_code != 0 && !emitted_err {
@@ -1355,9 +1515,7 @@ pub fn run_wrap_cli(
                     .timeout_connect(Duration::from_secs(2))
                     .timeout(Duration::from_secs(3))
                     .build();
-                let mut req = hb_agent
-                    .post(hb)
-                    .set("Content-Type", "application/json");
+                let mut req = hb_agent.post(hb).set("Content-Type", "application/json");
                 if let Ok(tok) = std::env::var("BUGFINDER_TOKEN") {
                     let t = tok.trim();
                     if !t.is_empty() {
@@ -1424,7 +1582,11 @@ mod tests {
         assert_eq!(detect_project_stack(d_lara.path()), DetectedStack::Laravel);
 
         let d_fast = TempDir::new().unwrap();
-        fs::write(d_fast.path().join("requirements.txt"), "uvicorn\nfastapi==0.115\n").unwrap();
+        fs::write(
+            d_fast.path().join("requirements.txt"),
+            "uvicorn\nfastapi==0.115\n",
+        )
+        .unwrap();
         assert_eq!(detect_project_stack(d_fast.path()), DetectedStack::FastApi);
 
         let d_go = TempDir::new().unwrap();
@@ -1432,7 +1594,11 @@ mod tests {
         assert_eq!(detect_project_stack(d_go.path()), DetectedStack::Go);
 
         let d_html = TempDir::new().unwrap();
-        fs::write(d_html.path().join("index.html"), "<html><head></head></html>").unwrap();
+        fs::write(
+            d_html.path().join("index.html"),
+            "<html><head></head></html>",
+        )
+        .unwrap();
         assert_eq!(detect_project_stack(d_html.path()), DetectedStack::WebHtml);
     }
 
@@ -1453,12 +1619,18 @@ mod tests {
 
         // Real run injects tag cleanly and writes 0600 .env without secret in .env.example
         run_init_cli(d.path(), dsn, "web", "zero-dep", false, false, true).unwrap();
-        let meta = fs::metadata(d.path().join(".env")).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            let meta = fs::metadata(d.path().join(".env")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
         let env_txt = fs::read_to_string(d.path().join(".env")).unwrap();
         assert!(env_txt.contains("BUGFINDER_DSN=http://pub_key_abc123@127.0.0.1:8080/1"));
         let ex_txt = fs::read_to_string(d.path().join(".env.example")).unwrap();
-        assert!(!ex_txt.contains("pub_key_abc123"), ".env.example must not leak real DSN");
+        assert!(
+            !ex_txt.contains("pub_key_abc123"),
+            ".env.example must not leak real DSN"
+        );
 
         let html_1 = fs::read_to_string(d.path().join("index.html")).unwrap();
         assert_eq!(html_1.matches("<!-- bugfinder:auto -->").count(), 1);
@@ -1475,17 +1647,47 @@ mod tests {
     #[test]
     fn error_line_detector_avoids_false_positives_and_scrubs_secrets() {
         // Real errors
-        assert!(looks_like_real_error_line("Traceback (most recent call last):"));
-        assert!(looks_like_real_error_line("RuntimeError: connection dropped"));
-        assert!(looks_like_real_error_line("thread 'main' panicked at src/lib.rs:10:5"));
-        assert!(looks_like_real_error_line("PHP Fatal error: Call to undefined foo()"));
+        assert!(looks_like_real_error_line(
+            "Traceback (most recent call last):"
+        ));
+        assert!(looks_like_real_error_line(
+            "RuntimeError: connection dropped"
+        ));
+        assert!(looks_like_real_error_line(
+            "thread 'main' panicked at src/lib.rs:10:5"
+        ));
+        assert!(looks_like_real_error_line(
+            "PHP Fatal error: Call to undefined foo()"
+        ));
         assert!(looks_like_real_error_line("[ERROR] failed loading config"));
-        assert!(looks_like_real_error_line(r#"{"level":"error","msg":"db down"}"#));
+        assert!(looks_like_real_error_line(
+            r#"{"level":"error","msg":"db down"}"#
+        ));
         assert!(looks_like_real_error_line("[DB ERROR TRACE]: PoolTimedOut"));
-        assert!(looks_like_real_error_line("[INTERNAL ERROR TRACE]: redis unreachable"));
-        assert!(looks_like_real_error_line("FATAL [SEC-CFG-01]: refusing fail-open startup"));
-        assert!(looks_like_real_error_line("[GEMINI-SDR-ERR] Model gemini-3.8-flash request error"));
-        assert!(looks_like_real_error_line("[WEBCHAT-CRM-TX-ERR] tenant_id=1 err=deadlock"));
+        assert!(looks_like_real_error_line(
+            "[INTERNAL ERROR TRACE]: redis unreachable"
+        ));
+        assert!(looks_like_real_error_line(
+            "FATAL [SEC-CFG-01]: refusing fail-open startup"
+        ));
+        assert!(looks_like_real_error_line(
+            "[AI-WORKER-ERR] Upstream model request failed timeout=5000ms"
+        ));
+        assert!(looks_like_real_error_line(
+            "[TX-POOL-ERR] tenant_id=1 err=deadlock"
+        ));
+        assert!(looks_like_real_error_line(
+            "panic: runtime error: invalid memory address or nil pointer dereference"
+        ));
+        assert!(looks_like_real_error_line(
+            "Exception in thread \"main\" java.lang.NullPointerException"
+        ));
+        assert!(looks_like_real_error_line(
+            "thread 'worker' panicked at src/error_handler.rs:42:5:"
+        ));
+        assert!(looks_like_real_error_line(
+            "[ERROR] HTTP 500 error talking to upstream"
+        ));
 
         // Exhaustive benign false-positive candidates MUST return false
         for benign in [
@@ -1500,8 +1702,8 @@ mod tests {
             "ErrorBoundary mounted cleanly",
             r#"127.0.0.1 - - "GET /api/0/errors 200 12ms""#,
             "worker started listening on port 8080",
-            "acme-server listening on http://127.0.0.1:3366",
-            "[WEBCHAT-INIT-CHIPS-WARN] tenant_id=1 err=none",
+            "acme-server listening on http://127.0.0.1:8080",
+            "[CACHE-WARM-WARN] tenant_id=1 err=none",
             "[master-audit] ok",
         ] {
             assert!(
@@ -1537,5 +1739,65 @@ mod tests {
             "workspace root without src/ must not get an orphan src/bugfinder_hook.rs"
         );
         assert!(d.path().join(".env").is_file());
+    }
+
+    #[test]
+    fn stream_aggregator_stitches_multilang_stacks_without_merging_distinct_errors() {
+        let (tx, rx) = mpsc::sync_channel::<TelemetryMsg>(64);
+        let mut agg = StreamAggregator::new(tx);
+
+        // 1. Python Traceback + indented frames + bare custom Exception closing line
+        for line in [
+            "Traceback (most recent call last):",
+            "  File \"app.py\", line 12, in handle",
+            "    run_step()",
+            "CustomPipelineError: database timeout after 5s",
+        ] {
+            agg.push_line(line.to_string());
+        }
+
+        // 2. Rust 2-line panic (second line unindented) followed by PHP Fatal + #0 frames
+        for line in [
+            "thread 'worker' panicked at src/main.rs:88:9:",
+            "called `Option::unwrap()` on a `None` value",
+            "PHP Fatal error: Uncaught RuntimeException: bad state in /srv/app.php:14",
+            "Stack trace:",
+            "#0 /srv/app.php(14): boot()",
+            "#1 {main}",
+            "  thrown in /srv/app.php on line 14",
+            "[ERROR] independent error A",
+            "[ERROR] independent error B",
+        ] {
+            agg.push_line(line.to_string());
+        }
+        agg.flush_pending_error();
+        drop(agg);
+
+        let events: Vec<(String, Vec<String>)> = rx
+            .into_iter()
+            .filter_map(|m| match m {
+                TelemetryMsg::ErrorEvent {
+                    title, stack_lines, ..
+                } => Some((title, stack_lines)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            events.len(),
+            5,
+            "Expected 5 distinct errors (py, rust, php, errA, errB), got {events:?}"
+        );
+        assert_eq!(
+            events[0].0,
+            "CustomPipelineError: database timeout after 5s"
+        );
+        assert_eq!(events[0].1.len(), 4);
+        assert!(events[1]
+            .0
+            .contains("panicked at src/main.rs:88:9: called `Option::unwrap()`"));
+        assert!(events[2].1.iter().any(|l| l.starts_with("#0 /srv/app.php")));
+        assert_eq!(events[3].0, "[ERROR] independent error A");
+        assert_eq!(events[4].0, "[ERROR] independent error B");
     }
 }

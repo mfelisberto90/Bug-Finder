@@ -190,6 +190,37 @@ a.nav-link:active,
   transform: scale(0.97);
 }
 
+button:focus-visible,
+a.nav-link:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[role="tab"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+@media (hover: hover) {
+  button:hover:not(:disabled),
+  a.nav-link:hover,
+  [role="tab"]:hover {
+    border-color: var(--brand);
+  }
+  .nav-link:hover {
+    background: var(--brand-soft);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 button[data-primary-cta="true"] {
   background: var(--brand);
   color: var(--brand-ink);
@@ -246,6 +277,7 @@ textarea {
   position: sticky;
   top: 0;
   height: 100dvh;
+  overflow-y: auto;
 }
 
 .brand-row {
@@ -741,8 +773,19 @@ dialog.bf-dialog::backdrop {
   }
   button,
   select,
-  input {
+  input,
+  textarea {
     min-height: 48px;
+    font-size: 16px;
+  }
+  .mobile-top-controls {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .mobile-org-select {
+    flex: 1 1 140px;
+    min-width: 120px;
+    width: auto;
   }
   .subtabs button,
   .data-table button {
