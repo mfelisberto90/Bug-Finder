@@ -30,11 +30,30 @@ pub async fn run_mcp_stdio(
     let mut reader = BufReader::new(stdin.lock());
     let mut out = stdout.lock();
 
+    const MAX_MCP_LINE_BYTES: usize = 1024 * 1024;
     let mut line = String::new();
-    while reader.read_line(&mut line).map_err(|e| e.to_string())? > 0 {
+    loop {
+        line.clear();
+        use std::io::Read as _;
+        let n = (&mut reader)
+            .take((MAX_MCP_LINE_BYTES + 1) as u64)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        if line.len() > MAX_MCP_LINE_BYTES {
+            let err_resp = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32600, "message": "Request line exceeded 1 MiB limit" }
+            });
+            writeln!(out, "{err_resp}").ok();
+            out.flush().ok();
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            line.clear();
             continue;
         }
         let req: Value = match serde_json::from_str(trimmed) {
@@ -141,20 +160,33 @@ pub async fn handle_mcp_request(
                 .get("name")
                 .and_then(|v| v.as_str())
                 .ok_or((-32602, "Missing tool name".to_string()))?;
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
 
             let data = match name {
                 "list_issues" => {
                     let iq = IssueQueryParams {
-                        status: args.get("status").and_then(|v| v.as_str()).map(ToString::to_string),
+                        status: args
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
                         level: None,
                         environment: None,
                         release: None,
                         project_id: None,
-                        search_query: args.get("query").and_then(|v| v.as_str()).map(ToString::to_string),
+                        search_query: args
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
                         sort: "date".into(),
                         since_ms: None,
-                        limit: args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20).clamp(1, 50),
+                        limit: args
+                            .get("limit")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(20)
+                            .clamp(1, 50),
                         offset: 0,
                     };
                     let (issues, total, _) = storage
@@ -189,17 +221,33 @@ pub async fn handle_mcp_request(
                         project_ids: Vec::new(),
                         min_level_num: None,
                         level_list,
-                        service: args.get("service").and_then(|v| v.as_str()).map(ToString::to_string),
+                        service: args
+                            .get("service")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
                         environment: None,
                         host: None,
-                        trace_id: args.get("trace_id").and_then(|v| v.as_str()).map(ToString::to_string),
-                        search_query: args.get("query").and_then(|v| v.as_str()).map(ToString::to_string),
+                        trace_id: args
+                            .get("trace_id")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
+                        search_query: args
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
                         start_ms: None,
                         end_ms: None,
                         cursor_id: None,
-                        limit: args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50).clamp(1, 100),
+                        limit: args
+                            .get("limit")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(50)
+                            .clamp(1, 100),
                     };
-                    let logs = storage.query_logs(ctx, &lq).await.map_err(|e| (-32000, e))?;
+                    let logs = storage
+                        .query_logs(ctx, &lq)
+                        .await
+                        .map_err(|e| (-32000, e))?;
                     json!({ "logs": logs })
                 }
                 "get_trace_context" => {
@@ -285,10 +333,20 @@ pub fn run_tail_cli(
                             if let Some(data) = line.strip_prefix("data:") {
                                 if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
                                     let strip = crate::domain::scrubber::strip_ansi_and_bidi;
-                                    let lvl = strip(v.get("level").and_then(|x| x.as_str()).unwrap_or("info"));
-                                    let svc = strip(v.get("service").and_then(|x| x.as_str()).unwrap_or("-"));
-                                    let msg = strip(v.get("title_or_body").and_then(|x| x.as_str()).unwrap_or(""));
-                                    let tid = strip(v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("-"));
+                                    let lvl = strip(
+                                        v.get("level").and_then(|x| x.as_str()).unwrap_or("info"),
+                                    );
+                                    let svc = strip(
+                                        v.get("service").and_then(|x| x.as_str()).unwrap_or("-"),
+                                    );
+                                    let msg = strip(
+                                        v.get("title_or_body")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or(""),
+                                    );
+                                    let tid = strip(
+                                        v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("-"),
+                                    );
                                     println!("[{lvl}] [{svc}] [trace={tid}] {msg}");
                                 }
                             }
@@ -313,11 +371,9 @@ pub fn run_tail_cli(
 }
 
 pub fn run_synthetic_test(dsn: &str, is_log: bool) -> Result<(), String> {
-    let (pub_key, project_id) =
-        parse_dsn_url(dsn).ok_or_else(|| "Invalid DSN format: expected http(s)://key@host/project_id".to_string())?;
-    let without_scheme = dsn
-        .split_once("://")
-        .ok_or("Missing URL scheme")?;
+    let (pub_key, project_id) = parse_dsn_url(dsn)
+        .ok_or_else(|| "Invalid DSN format: expected http(s)://key@host/project_id".to_string())?;
+    let without_scheme = dsn.split_once("://").ok_or("Missing URL scheme")?;
     let scheme = without_scheme.0;
     let host = without_scheme
         .1
@@ -368,14 +424,24 @@ pub fn run_synthetic_test(dsn: &str, is_log: bool) -> Result<(), String> {
         )
     };
 
-    let auth_hdr = format!("Sentry sentry_version=7, sentry_client=bugfinder-cli/1.0.0, sentry_key={pub_key}");
-    let resp = ureq::post(&endpoint)
+    let auth_hdr =
+        format!("Sentry sentry_version=7, sentry_client=bugfinder-cli/1.0.0, sentry_key={pub_key}");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build();
+    let resp = agent
+        .post(&endpoint)
         .set("Content-Type", "application/x-sentry-envelope")
         .set("X-Sentry-Auth", &auth_hdr)
         .send_string(&body)
         .map_err(|e| format!("Failed sending envelope: {e}"))?;
 
-    println!("HTTP {} -> {}", resp.status(), resp.into_string().unwrap_or_default());
+    println!(
+        "HTTP {} -> {}",
+        resp.status(),
+        resp.into_string().unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -389,6 +455,9 @@ mod tests {
             percent_encode_query_component("payment failed & 100%"),
             "payment%20failed%20%26%20100%25"
         );
-        assert_eq!(percent_encode_query_component("acme-org_1.2"), "acme-org_1.2");
+        assert_eq!(
+            percent_encode_query_component("acme-org_1.2"),
+            "acme-org_1.2"
+        );
     }
 }

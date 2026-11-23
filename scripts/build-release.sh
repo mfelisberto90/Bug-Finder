@@ -6,9 +6,7 @@ cd "$ROOT_DIR"
 
 echo "[1/3] Building embedded UI bundle..."
 pushd "$ROOT_DIR/ui" >/dev/null
-if [[ ! -d node_modules ]]; then
-  npm install --no-audit --no-fund
-fi
+npm ci --no-audit --no-fund
 npm run build
 popd >/dev/null
 
@@ -29,9 +27,9 @@ EXTRA_FLAGS=(
   "-C" "force-unwind-tables=no"
   "-C" "link-arg=-Wl,-z,pack-relative-relocs"
   "-C" "link-arg=-Wl,--as-needed"
-  "--remap-path-prefix=${ROOT_DIR}=/src"
   "--remap-path-prefix=${CARGO_HOME_DIR}=/cargo"
   "--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup"
+  "--remap-path-prefix=${ROOT_DIR}=/src"
   "--remap-path-prefix=${HOME}=/build"
 )
 export RUSTFLAGS="${RUSTFLAGS:-} ${EXTRA_FLAGS[*]}"

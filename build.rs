@@ -100,7 +100,11 @@ fn main() {
 </body>
 </html>"#;
         let etag = fnv1a_hex(fallback_html);
-        writeln!(file, "pub fn get_asset(path: &str) -> Option<EmbeddedAsset> {{").unwrap();
+        writeln!(
+            file,
+            "pub fn get_asset(path: &str) -> Option<EmbeddedAsset> {{"
+        )
+        .unwrap();
         writeln!(file, "    match path {{").unwrap();
         writeln!(
             file,
@@ -112,7 +116,11 @@ fn main() {
         writeln!(file, "    }}").unwrap();
         writeln!(file, "}}").unwrap();
     } else {
-        writeln!(file, "pub fn get_asset(path: &str) -> Option<EmbeddedAsset> {{").unwrap();
+        writeln!(
+            file,
+            "pub fn get_asset(path: &str) -> Option<EmbeddedAsset> {{"
+        )
+        .unwrap();
         writeln!(file, "    match path {{").unwrap();
         for (idx, (rel, abs)) in files.iter().enumerate() {
             let bytes = fs::read(abs).expect("read ui dist asset");
@@ -132,7 +140,10 @@ fn main() {
             } else {
                 abs.clone()
             };
-            let abs_str = embed_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+            let abs_str = embed_path
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
             writeln!(
                 file,
                 "        {:?} => Some(EmbeddedAsset {{ bytes: include_bytes!(\"{}\"), gzipped: {}, content_type: {:?}, etag: {:?} }}),",
@@ -145,7 +156,10 @@ fn main() {
         writeln!(file, "}}").unwrap();
     }
 
-    let mini_sdk_path = manifest_dir.join("sdks").join("browser").join("bugfinder-mini.js");
+    let mini_sdk_path = manifest_dir
+        .join("sdks")
+        .join("browser")
+        .join("bugfinder-mini.js");
     let mini_raw = if mini_sdk_path.is_file() {
         fs::read(&mini_sdk_path).expect("read bugfinder-mini.js")
     } else {
@@ -154,11 +168,22 @@ fn main() {
     let mini_etag = fnv1a_hex(&mini_raw);
     let mini_gz_file = out_dir.join("mini_sdk.js.gz");
     fs::write(&mini_gz_file, gzip_best(&mini_raw)).expect("write mini_sdk.js.gz");
-    let mini_gz_str = mini_gz_file.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-    writeln!(file, "pub const MINI_SDK_JS_GZ: &[u8] = include_bytes!(\"{}\");", mini_gz_str).unwrap();
+    let mini_gz_str = mini_gz_file
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    writeln!(
+        file,
+        "pub const MINI_SDK_JS_GZ: &[u8] = include_bytes!(\"{}\");",
+        mini_gz_str
+    )
+    .unwrap();
     writeln!(file, "pub const MINI_SDK_ETAG: &str = {:?};", mini_etag).unwrap();
 
-    let shield_sdk_path = manifest_dir.join("sdks").join("browser").join("bugfinder-shield.js");
+    let shield_sdk_path = manifest_dir
+        .join("sdks")
+        .join("browser")
+        .join("bugfinder-shield.js");
     let shield_raw = if shield_sdk_path.is_file() {
         fs::read(&shield_sdk_path).expect("read bugfinder-shield.js")
     } else {
@@ -167,7 +192,15 @@ fn main() {
     let shield_etag = fnv1a_hex(&shield_raw);
     let shield_gz_file = out_dir.join("shield_sdk.js.gz");
     fs::write(&shield_gz_file, gzip_best(&shield_raw)).expect("write shield_sdk.js.gz");
-    let shield_gz_str = shield_gz_file.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-    writeln!(file, "pub const SHIELD_SDK_JS_GZ: &[u8] = include_bytes!(\"{}\");", shield_gz_str).unwrap();
+    let shield_gz_str = shield_gz_file
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    writeln!(
+        file,
+        "pub const SHIELD_SDK_JS_GZ: &[u8] = include_bytes!(\"{}\");",
+        shield_gz_str
+    )
+    .unwrap();
     writeln!(file, "pub const SHIELD_SDK_ETAG: &str = {:?};", shield_etag).unwrap();
 }

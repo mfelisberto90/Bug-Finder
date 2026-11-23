@@ -78,7 +78,9 @@ impl<'a> CborCursor<'a> {
             }
             27 => {
                 let s = self.read_slice(8)?;
-                Ok(u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+                Ok(u64::from_be_bytes([
+                    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                ]))
             }
             _ => Err("Unsupported indefinite CBOR length".into()),
         }
@@ -164,7 +166,7 @@ fn cbor_map_get_text<'a>(entries: &'a [(CborVal, CborVal)], key: &str) -> Option
     })
 }
 
-fn cbor_map_get_int<'a>(entries: &'a [(CborVal, CborVal)], key: i64) -> Option<&'a CborVal> {
+fn cbor_map_get_int(entries: &[(CborVal, CborVal)], key: i64) -> Option<&CborVal> {
     entries.iter().find_map(|(k, v)| match k {
         CborVal::Int(i) if *i == key => Some(v),
         _ => None,
@@ -312,7 +314,8 @@ pub fn verify_registration(
         return Err("WebAuthn UP or AT flag missing during registration".into());
     }
 
-    let sign_count = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+    let sign_count =
+        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
     let cred_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
     if cred_len == 0 || cred_len > 1024 || auth_data.len() < 55 + cred_len + 2 {
         return Err("Invalid attested credentialId length".into());
@@ -329,28 +332,31 @@ pub fn verify_registration(
     })
 }
 
-pub fn verify_assertion(
-    expected_challenge_b64: &str,
-    expected_origins: &[String],
-    expected_rp_id: &str,
-    cose_alg: i32,
-    public_key_b64: &str,
-    stored_sign_count: u32,
-    client_data_b64: &str,
-    auth_data_b64: &str,
-    signature_b64: &str,
-) -> Result<u32, String> {
+pub struct WebAuthnAssertionInput<'a> {
+    pub expected_challenge_b64: &'a str,
+    pub expected_origins: &'a [String],
+    pub expected_rp_id: &'a str,
+    pub cose_alg: i32,
+    pub public_key_b64: &'a str,
+    pub stored_sign_count: u32,
+    pub client_data_b64: &'a str,
+    pub auth_data_b64: &'a str,
+    pub signature_b64: &'a str,
+    pub require_uv: bool,
+}
+
+pub fn verify_assertion(input: &WebAuthnAssertionInput<'_>) -> Result<u32, String> {
     let client_raw = parse_client_data(
-        client_data_b64,
+        input.client_data_b64,
         "webauthn.get",
-        expected_challenge_b64,
-        expected_origins,
+        input.expected_challenge_b64,
+        input.expected_origins,
     )?;
-    let auth_data = b64url_decode(auth_data_b64)?;
+    let auth_data = b64url_decode(input.auth_data_b64)?;
     if auth_data.len() < 37 {
         return Err("WebAuthn authData too short".into());
     }
-    let rp_hash = Sha256::digest(expected_rp_id.as_bytes());
+    let rp_hash = Sha256::digest(input.expected_rp_id.as_bytes());
     if !constant_time_eq(&auth_data[0..32], rp_hash.as_slice()) {
         return Err("WebAuthn RP ID hash mismatch".into());
     }
@@ -358,21 +364,26 @@ pub fn verify_assertion(
     if (flags & 0x01) == 0 {
         return Err("WebAuthn User Present (UP) flag missing".into());
     }
+    if input.require_uv && (flags & 0x04) == 0 {
+        return Err("WebAuthn User Verification (UV) required".into());
+    }
     let new_sign_count =
         u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
-    if (stored_sign_count > 0 || new_sign_count > 0) && new_sign_count <= stored_sign_count {
+    if (input.stored_sign_count > 0 || new_sign_count > 0)
+        && new_sign_count <= input.stored_sign_count
+    {
         return Err("WebAuthn signature counter regression detected".into());
     }
 
-    let pub_bytes = b64url_decode(public_key_b64)?;
-    let sig_bytes = b64url_decode(signature_b64)?;
+    let pub_bytes = b64url_decode(input.public_key_b64)?;
+    let sig_bytes = b64url_decode(input.signature_b64)?;
 
     let client_hash = Sha256::digest(&client_raw);
     let mut signed_data = Vec::with_capacity(auth_data.len() + 32);
     signed_data.extend_from_slice(&auth_data);
     signed_data.extend_from_slice(client_hash.as_slice());
 
-    let verifier = match cose_alg {
+    let verifier = match input.cose_alg {
         -7 => UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &pub_bytes),
         -8 => UnparsedPublicKey::new(&ED25519, &pub_bytes),
         _ => return Err("Unsupported stored Passkey algorithm".into()),
@@ -462,7 +473,8 @@ mod tests {
         let reg_cd_b64 = URL_SAFE_NO_PAD.encode(reg_cd_json.as_bytes());
         let att_b64 = build_test_attestation(rp_id, b"cred-alpha-1", pub_bytes, 1);
 
-        let verified = verify_registration(&reg_chall, &origins, rp_id, &reg_cd_b64, &att_b64).unwrap();
+        let verified =
+            verify_registration(&reg_chall, &origins, rp_id, &reg_cd_b64, &att_b64).unwrap();
         assert_eq!(verified.cose_alg, -7);
         assert_eq!(verified.sign_count, 1);
 
@@ -486,47 +498,72 @@ mod tests {
         signed.extend_from_slice(Sha256::digest(auth_cd_raw).as_slice());
         let sig = kp.sign(&rng, &signed).unwrap();
 
-        let next_cnt = verify_assertion(
-            &auth_chall,
-            &origins,
-            rp_id,
-            verified.cose_alg,
-            &verified.public_key_b64,
-            verified.sign_count,
-            &auth_cd_b64,
-            &URL_SAFE_NO_PAD.encode(&auth_data),
-            &URL_SAFE_NO_PAD.encode(sig.as_ref()),
-        )
+        let ad_b64 = URL_SAFE_NO_PAD.encode(&auth_data);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
+        let next_cnt = verify_assertion(&WebAuthnAssertionInput {
+            expected_challenge_b64: &auth_chall,
+            expected_origins: &origins,
+            expected_rp_id: rp_id,
+            cose_alg: verified.cose_alg,
+            public_key_b64: &verified.public_key_b64,
+            stored_sign_count: verified.sign_count,
+            client_data_b64: &auth_cd_b64,
+            auth_data_b64: &ad_b64,
+            signature_b64: &sig_b64,
+            require_uv: true,
+        })
         .unwrap();
         assert_eq!(next_cnt, 2);
 
+        // Missing UV flag (UP-only 0x01) must fail when require_uv = true
+        let mut ad_no_uv = auth_data.clone();
+        ad_no_uv[32] = 0x01;
+        let mut signed_no_uv = ad_no_uv.clone();
+        signed_no_uv.extend_from_slice(Sha256::digest(auth_cd_raw).as_slice());
+        let sig_no_uv = kp.sign(&rng, &signed_no_uv).unwrap();
+        assert!(verify_assertion(&WebAuthnAssertionInput {
+            expected_challenge_b64: &auth_chall,
+            expected_origins: &origins,
+            expected_rp_id: rp_id,
+            cose_alg: verified.cose_alg,
+            public_key_b64: &verified.public_key_b64,
+            stored_sign_count: verified.sign_count,
+            client_data_b64: &auth_cd_b64,
+            auth_data_b64: &URL_SAFE_NO_PAD.encode(&ad_no_uv),
+            signature_b64: &URL_SAFE_NO_PAD.encode(sig_no_uv.as_ref()),
+            require_uv: true,
+        })
+        .is_err());
+
         // Sign count regression -> rejected (clone protection)
-        assert!(verify_assertion(
-            &auth_chall,
-            &origins,
-            rp_id,
-            verified.cose_alg,
-            &verified.public_key_b64,
-            5,
-            &auth_cd_b64,
-            &URL_SAFE_NO_PAD.encode(&auth_data),
-            &URL_SAFE_NO_PAD.encode(sig.as_ref()),
-        )
+        assert!(verify_assertion(&WebAuthnAssertionInput {
+            expected_challenge_b64: &auth_chall,
+            expected_origins: &origins,
+            expected_rp_id: rp_id,
+            cose_alg: verified.cose_alg,
+            public_key_b64: &verified.public_key_b64,
+            stored_sign_count: 5,
+            client_data_b64: &auth_cd_b64,
+            auth_data_b64: &ad_b64,
+            signature_b64: &sig_b64,
+            require_uv: true,
+        })
         .is_err());
 
         // Evil origin -> rejected
         let bad_origins = vec!["https://evil.attacker.com".to_string()];
-        assert!(verify_assertion(
-            &auth_chall,
-            &bad_origins,
-            rp_id,
-            verified.cose_alg,
-            &verified.public_key_b64,
-            1,
-            &auth_cd_b64,
-            &URL_SAFE_NO_PAD.encode(&auth_data),
-            &URL_SAFE_NO_PAD.encode(sig.as_ref()),
-        )
+        assert!(verify_assertion(&WebAuthnAssertionInput {
+            expected_challenge_b64: &auth_chall,
+            expected_origins: &bad_origins,
+            expected_rp_id: rp_id,
+            cose_alg: verified.cose_alg,
+            public_key_b64: &verified.public_key_b64,
+            stored_sign_count: 1,
+            client_data_b64: &auth_cd_b64,
+            auth_data_b64: &ad_b64,
+            signature_b64: &sig_b64,
+            require_uv: true,
+        })
         .is_err());
     }
 }

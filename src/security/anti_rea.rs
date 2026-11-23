@@ -92,7 +92,13 @@ impl ShieldEngine {
         }
     }
 
-    pub fn allow_cooldown(&self, project_id: i64, key: &str, cooldown_ms: i64, now_ms: i64) -> bool {
+    pub fn allow_cooldown(
+        &self,
+        project_id: i64,
+        key: &str,
+        cooldown_ms: i64,
+        now_ms: i64,
+    ) -> bool {
         let mut guard = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
         let k = (project_id, key.to_string());
         if let Some(last) = guard.get_mut(&k) {
@@ -188,7 +194,9 @@ impl ShieldEngine {
             reached
         };
 
-        if burst_hit && self.allow_cooldown(project_id, &format!("burst:{actor_hmac}"), 300_000, now_ms) {
+        if burst_hit
+            && self.allow_cooldown(project_id, &format!("burst:{actor_hmac}"), 300_000, now_ms)
+        {
             return Some(DetectedLogThreat {
                 signal_type: "idor_or_enum_burst".to_string(),
                 category: "log_ids".to_string(),
@@ -364,14 +372,25 @@ fn detect_probe_in_text(text: &str) -> Option<&'static str> {
 
 fn extract_http_status(attrs: &Value) -> Option<u16> {
     let obj = attrs.as_object()?;
-    for key in ["http.response.status_code", "http.status_code", "status_code", "status"] {
+    for key in [
+        "http.response.status_code",
+        "http.status_code",
+        "status_code",
+        "status",
+    ] {
         if let Some(v) = obj.get(key) {
-            if let Some(n) = v.as_u64().or_else(|| v.get("value").and_then(|x| x.as_u64())) {
+            if let Some(n) = v
+                .as_u64()
+                .or_else(|| v.get("value").and_then(|x| x.as_u64()))
+            {
                 if (100..=599).contains(&n) {
                     return Some(n as u16);
                 }
             }
-            if let Some(s) = v.as_str().or_else(|| v.get("value").and_then(|x| x.as_str())) {
+            if let Some(s) = v
+                .as_str()
+                .or_else(|| v.get("value").and_then(|x| x.as_str()))
+            {
                 if let Ok(n) = s.trim().parse::<u16>() {
                     if (100..=599).contains(&n) {
                         return Some(n);
@@ -387,7 +406,10 @@ fn extract_log_path(attrs: &Value) -> Option<String> {
     let obj = attrs.as_object()?;
     for key in ["url.path", "http.target", "http.route", "path", "url"] {
         if let Some(v) = obj.get(key) {
-            if let Some(s) = v.as_str().or_else(|| v.get("value").and_then(|x| x.as_str())) {
+            if let Some(s) = v
+                .as_str()
+                .or_else(|| v.get("value").and_then(|x| x.as_str()))
+            {
                 let t = s.trim();
                 if !t.is_empty() {
                     return Some(t.chars().take(200).collect());
@@ -400,15 +422,27 @@ fn extract_log_path(attrs: &Value) -> Option<String> {
 
 fn extract_log_actor(attrs: &Value) -> Option<String> {
     let obj = attrs.as_object()?;
-    for key in ["client.address", "http.client_ip", "user.id", "actor_id", "session_id"] {
+    for key in [
+        "client.address",
+        "http.client_ip",
+        "user.id",
+        "actor_id",
+        "session_id",
+    ] {
         if let Some(v) = obj.get(key) {
-            if let Some(s) = v.as_str().or_else(|| v.get("value").and_then(|x| x.as_str())) {
+            if let Some(s) = v
+                .as_str()
+                .or_else(|| v.get("value").and_then(|x| x.as_str()))
+            {
                 let t = s.trim();
                 if !t.is_empty() {
                     return Some(t.chars().take(128).collect());
                 }
             }
-            if let Some(n) = v.as_i64().or_else(|| v.get("value").and_then(|x| x.as_i64())) {
+            if let Some(n) = v
+                .as_i64()
+                .or_else(|| v.get("value").and_then(|x| x.as_i64()))
+            {
                 return Some(n.to_string());
             }
         }
@@ -459,7 +493,10 @@ pub fn probe_self_runtime_integrity() -> RuntimeIntegrityReport {
     } else {
         RuntimeIntegrityReport {
             ok: false,
-            detail: format!("Runtime instrumentation / debugger indicator(s): {}", indicators.join(", ")),
+            detail: format!(
+                "Runtime instrumentation / debugger indicator(s): {}",
+                indicators.join(", ")
+            ),
             indicators,
         }
     }
@@ -501,7 +538,12 @@ mod tests {
         assert_eq!(single.risk_score, 50);
         assert_eq!(single.severity, "medium");
 
-        let combo = score_signals(&["cdp_automation".into(), "cdp_automation".into(), "honeypot_access".into()]).unwrap();
+        let combo = score_signals(&[
+            "cdp_automation".into(),
+            "cdp_automation".into(),
+            "honeypot_access".into(),
+        ])
+        .unwrap();
         assert_eq!(combo.risk_score, 100);
         assert_eq!(combo.severity, "critical");
 
@@ -511,11 +553,19 @@ mod tests {
             decide_quarantine(&policy, "browser", 90, "ip_hmac_1", None),
             None
         );
-        let br_q = decide_quarantine(&policy, "browser", 90, "ip_hmac_1", Some("sess_12345678")).unwrap();
+        let br_q =
+            decide_quarantine(&policy, "browser", 90, "ip_hmac_1", Some("sess_12345678")).unwrap();
         assert_eq!(br_q.0, "session");
 
         // Backend verified signal quarantines actor IP HMAC
-        let be_q = decide_quarantine(&policy, "backend_verified", 90, "ip_hmac_1", Some("sess_12345678")).unwrap();
+        let be_q = decide_quarantine(
+            &policy,
+            "backend_verified",
+            90,
+            "ip_hmac_1",
+            Some("sess_12345678"),
+        )
+        .unwrap();
         assert_eq!(be_q, ("ip".to_string(), "ip_hmac_1".to_string()));
     }
 
@@ -538,7 +588,9 @@ mod tests {
             span_id: None,
             attributes: json!({ "url.path": "/checkout" }),
         };
-        assert!(engine.inspect_log_for_threats(1, &policy, 1000, hash, &normal_log).is_none());
+        assert!(engine
+            .inspect_log_for_threats(1, &policy, 1000, hash, &normal_log)
+            .is_none());
 
         // Static favicon 404s x 30 must NOT trigger IDOR burst
         for i in 0..30 {
@@ -554,7 +606,9 @@ mod tests {
                 span_id: None,
                 attributes: json!({ "http.status_code": 404, "url.path": "/favicon.ico", "client.address": "1.2.3.4" }),
             };
-            assert!(engine.inspect_log_for_threats(1, &policy, 1000 + i, hash, &icon_log).is_none());
+            assert!(engine
+                .inspect_log_for_threats(1, &policy, 1000 + i, hash, &icon_log)
+                .is_none());
         }
 
         // 19 API 403s < 20 threshold -> no burst yet; 20th triggers idor_or_enum_burst
@@ -571,7 +625,9 @@ mod tests {
                 span_id: None,
                 attributes: json!({ "http.status_code": 403, "url.path": "/api/users/12", "client.address": "9.9.9.9" }),
             };
-            assert!(engine.inspect_log_for_threats(1, &policy, 2000 + i, hash, &api_403).is_none());
+            assert!(engine
+                .inspect_log_for_threats(1, &policy, 2000 + i, hash, &api_403)
+                .is_none());
         }
         let burst_20 = NormalizedLog {
             timestamp_ms: 2020,
@@ -585,7 +641,9 @@ mod tests {
             span_id: None,
             attributes: json!({ "http.status_code": 403, "url.path": "/api/users/20", "client.address": "9.9.9.9" }),
         };
-        let detected = engine.inspect_log_for_threats(1, &policy, 2020, hash, &burst_20).unwrap();
+        let detected = engine
+            .inspect_log_for_threats(1, &policy, 2020, hash, &burst_20)
+            .unwrap();
         assert_eq!(detected.signal_type, "idor_or_enum_burst");
 
         // Positive exploit signatures
@@ -601,7 +659,9 @@ mod tests {
             span_id: None,
             attributes: json!({}),
         };
-        let sqli = engine.inspect_log_for_threats(1, &policy, 3000, hash, &sqli_log).unwrap();
+        let sqli = engine
+            .inspect_log_for_threats(1, &policy, 3000, hash, &sqli_log)
+            .unwrap();
         assert_eq!(sqli.signal_type, "injection_probe");
 
         let trav_log = NormalizedLog {
@@ -617,7 +677,10 @@ mod tests {
             attributes: json!({}),
         };
         assert_eq!(
-            engine.inspect_log_for_threats(1, &policy, 3100, hash, &trav_log).unwrap().signal_type,
+            engine
+                .inspect_log_for_threats(1, &policy, 3100, hash, &trav_log)
+                .unwrap()
+                .signal_type,
             "injection_probe"
         );
     }
@@ -628,7 +691,10 @@ mod tests {
         assert!(inspect_csp_for_tamper(&ext).is_none());
 
         let evil = json!({ "csp-report": { "effective-directive": "script-src-elem", "blocked-uri": "https://evil.example/hook.js" } });
-        assert_eq!(inspect_csp_for_tamper(&evil).as_deref(), Some("https://evil.example/hook.js"));
+        assert_eq!(
+            inspect_csp_for_tamper(&evil).as_deref(),
+            Some("https://evil.example/hook.js")
+        );
     }
 
     #[test]

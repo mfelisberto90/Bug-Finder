@@ -11,45 +11,69 @@ type HmacSha256 = Hmac<Sha256>;
 /// Fixed-capacity OOM-proof map with deterministic FIFO eviction on overflow.
 pub struct BoundedMap<K, V> {
     cap: usize,
-    map: HashMap<K, V>,
-    order: VecDeque<K>,
+    next_gen: u64,
+    map: HashMap<K, (V, u64)>,
+    order: VecDeque<(K, u64)>,
 }
 
 impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
     pub fn new(cap: usize) -> Self {
         Self {
             cap: cap.max(16),
+            next_gen: 1,
             map: HashMap::with_capacity(cap.min(1024)),
             order: VecDeque::with_capacity(cap.min(1024)),
         }
     }
 
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.map.get_mut(key)
+        self.map.get_mut(key).map(|(v, _)| v)
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        if self.order.len() > self.cap.saturating_mul(2) {
+            let map = &self.map;
+            self.order
+                .retain(|(k, g)| map.get(k).map(|(_, cur)| *cur) == Some(*g));
+        }
     }
 
     pub fn insert(&mut self, key: K, value: V) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key, value);
+        let gen = self.next_gen;
+        self.next_gen = self.next_gen.wrapping_add(1);
+        if let Some((slot, slot_gen)) = self.map.get_mut(&key) {
+            *slot = value;
+            *slot_gen = gen;
+            self.order.push_back((key, gen));
+            self.compact_order_if_needed();
             return;
         }
         while self.map.len() >= self.cap {
-            if let Some(evict) = self.order.pop_front() {
-                self.map.remove(&evict);
+            if let Some((evict_k, evict_g)) = self.order.pop_front() {
+                if self.map.get(&evict_k).map(|(_, cur)| *cur) == Some(evict_g) {
+                    self.map.remove(&evict_k);
+                }
             } else {
                 break;
             }
         }
-        self.order.push_back(key.clone());
-        self.map.insert(key, value);
+        self.order.push_back((key.clone(), gen));
+        self.map.insert(key, (value, gen));
+        self.compact_order_if_needed();
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.map.remove(key)
+        let removed = self.map.remove(key).map(|(v, _)| v);
+        self.compact_order_if_needed();
+        removed
     }
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     pub fn retain<F>(&mut self, mut keep: F)
@@ -57,8 +81,9 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         F: FnMut(&K, &V) -> bool,
     {
         let map = &mut self.map;
-        map.retain(|k, v| keep(k, v));
-        self.order.retain(|k| map.contains_key(k));
+        map.retain(|k, (v, _)| keep(k, v));
+        self.order
+            .retain(|(k, g)| map.get(k).map(|(_, cur)| *cur) == Some(*g));
     }
 }
 
@@ -74,22 +99,32 @@ pub struct RateLimitDecision {
 }
 
 /// Multi-bucket HMAC-SHA256 rate limiter. Never stores raw emails or client IPs in memory keys.
+/// Separates auth/spray buckets from high-cardinality ingest buckets so floods cannot evict auth limits.
 pub struct HmacRateLimiter {
     app_key: [u8; 32],
-    buckets: Mutex<BoundedMap<String, Bucket>>,
+    auth_buckets: Mutex<BoundedMap<String, Bucket>>,
+    general_buckets: Mutex<BoundedMap<String, Bucket>>,
 }
 
 impl HmacRateLimiter {
     pub fn new(app_key: [u8; 32], max_buckets: usize) -> Self {
         Self {
             app_key,
-            buckets: Mutex::new(BoundedMap::new(max_buckets)),
+            auth_buckets: Mutex::new(BoundedMap::new(max_buckets.clamp(256, 8_192))),
+            general_buckets: Mutex::new(BoundedMap::new(max_buckets)),
+        }
+    }
+
+    fn target_mutex(&self, scope: &str) -> &Mutex<BoundedMap<String, Bucket>> {
+        if scope.starts_with("auth_") {
+            &self.auth_buckets
+        } else {
+            &self.general_buckets
         }
     }
 
     pub fn hash_key(&self, scope: &str, raw_id: &str) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.app_key).expect("HMAC accepts 32-byte key");
+        let mut mac = HmacSha256::new_from_slice(&self.app_key).expect("HMAC accepts 32-byte key");
         mac.update(scope.as_bytes());
         mac.update(b":");
         mac.update(raw_id.as_bytes());
@@ -105,7 +140,10 @@ impl HmacRateLimiter {
     ) -> RateLimitDecision {
         let key = self.hash_key(scope, raw_id);
         let now = Instant::now();
-        let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .target_mutex(scope)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(b) = guard.get_mut(&key) {
             if now.duration_since(b.window_start) >= window {
                 b.count = 1;
@@ -145,7 +183,10 @@ impl HmacRateLimiter {
     /// Clear ONLY the principal bucket on login success — never clear the IP spray bucket.
     pub fn clear_bucket(&self, scope: &str, raw_id: &str) {
         let key = self.hash_key(scope, raw_id);
-        let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .target_mutex(scope)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.remove(&key);
     }
 }
@@ -296,10 +337,12 @@ impl DsnAuthCache {
     }
 }
 
+type TokenCacheMap = BoundedMap<(String, Option<String>), (TenantCtx, Instant)>;
+
 /// Short-TTL positive cache for Bearer API token lookups with expiry revalidation & sync invalidation.
 pub struct ApiTokenCache {
     ttl: Duration,
-    inner: Mutex<BoundedMap<(String, Option<String>), (TenantCtx, Instant)>>,
+    inner: Mutex<TokenCacheMap>,
 }
 
 impl ApiTokenCache {
@@ -316,11 +359,14 @@ impl ApiTokenCache {
         org_slug_opt: Option<&str>,
         now_sec: i64,
     ) -> Option<TenantCtx> {
-        let key = (token_sha256.to_string(), org_slug_opt.map(ToString::to_string));
+        let key = (
+            token_sha256.to_string(),
+            org_slug_opt.map(ToString::to_string),
+        );
         let now = Instant::now();
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((ctx, exp)) = guard.get_mut(&key) {
-            let token_still_valid = ctx.token_expires_at.map_or(true, |e| e > now_sec);
+            let token_still_valid = ctx.token_expires_at.is_none_or(|e| e > now_sec);
             if now < *exp && token_still_valid {
                 return Some(ctx.clone());
             }
@@ -330,7 +376,10 @@ impl ApiTokenCache {
     }
 
     pub fn insert(&self, token_sha256: &str, org_slug_opt: Option<&str>, ctx: TenantCtx) {
-        let key = (token_sha256.to_string(), org_slug_opt.map(ToString::to_string));
+        let key = (
+            token_sha256.to_string(),
+            org_slug_opt.map(ToString::to_string),
+        );
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.insert(key, (ctx, Instant::now() + self.ttl));
     }
@@ -358,20 +407,70 @@ mod tests {
         }
         assert_eq!(bm.len(), 16);
 
+        // Regression test: repeated remove + insert must compact order queue and never prematurely evict
+        let mut bm2 = BoundedMap::new(16);
+        bm2.insert("hot".to_string(), 1);
+        for i in 0..200 {
+            let k = format!("k{i}");
+            bm2.insert(k.clone(), i);
+            bm2.remove(&k);
+        }
+        bm2.remove(&"hot".to_string());
+        bm2.insert("hot".to_string(), 99);
+        assert!(
+            bm2.order.len() <= 32,
+            "order grew unboundedly: {}",
+            bm2.order.len()
+        );
+        for i in 0..14 {
+            bm2.insert(format!("fill{i}"), i);
+        }
+        assert_eq!(bm2.get_mut(&"hot".to_string()).copied(), Some(99));
+
         let rl = HmacRateLimiter::new([7u8; 32], 128);
         for _ in 0..5 {
-            assert!(rl.check_and_record("auth_principal", "user@example.com", 5, Duration::from_secs(60)).allowed);
-            assert!(rl.check_and_record("auth_ip", "203.0.113.5", 10, Duration::from_secs(60)).allowed);
+            assert!(
+                rl.check_and_record(
+                    "auth_principal",
+                    "user@example.com",
+                    5,
+                    Duration::from_secs(60)
+                )
+                .allowed
+            );
+            assert!(
+                rl.check_and_record("auth_ip", "203.0.113.5", 10, Duration::from_secs(60))
+                    .allowed
+            );
         }
-        assert!(!rl.check_and_record("auth_principal", "user@example.com", 5, Duration::from_secs(60)).allowed);
+        assert!(
+            !rl.check_and_record(
+                "auth_principal",
+                "user@example.com",
+                5,
+                Duration::from_secs(60)
+            )
+            .allowed
+        );
 
         // Clearing principal on success must NOT reset IP bucket
         rl.clear_bucket("auth_principal", "user@example.com");
-        assert!(rl.check_and_record("auth_principal", "user@example.com", 5, Duration::from_secs(60)).allowed);
+        assert!(
+            rl.check_and_record(
+                "auth_principal",
+                "user@example.com",
+                5,
+                Duration::from_secs(60)
+            )
+            .allowed
+        );
         for _ in 0..5 {
             let _ = rl.check_and_record("auth_ip", "203.0.113.5", 10, Duration::from_secs(60));
         }
-        assert!(!rl.check_and_record("auth_ip", "203.0.113.5", 10, Duration::from_secs(60)).allowed);
+        assert!(
+            !rl.check_and_record("auth_ip", "203.0.113.5", 10, Duration::from_secs(60))
+                .allowed
+        );
     }
 
     #[test]

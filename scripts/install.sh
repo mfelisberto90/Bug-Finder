@@ -2,8 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="bugfinder-install"
-DEFAULT_REPO_SSH="${BUGFINDER_REPO:-git@github.com:mfelisberto90/Bug-Finder.git}"
-DEFAULT_REPO_HTTPS="https://github.com/mfelisberto90/Bug-Finder.git"
+DEFAULT_REPO_HTTPS="${BUGFINDER_REPO:-https://github.com/mfelisberto90/Bug-Finder.git}"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   PREFIX="/usr/local/bin"
@@ -185,10 +184,8 @@ if [[ -z "$REPO_DIR" ]]; then
       log "Updating existing source checkout in ${REPO_DIR}..."
       git -C "$REPO_DIR" pull --ff-only
     else
-      log "Cloning Bug-Finder repository into ${REPO_DIR}..."
-      if ! git clone --depth 1 "$DEFAULT_REPO_SSH" "$REPO_DIR" 2>/dev/null; then
-        git clone --depth 1 "$DEFAULT_REPO_HTTPS" "$REPO_DIR"
-      fi
+      log "Cloning Bug-Finder repository via HTTPS into ${REPO_DIR}..."
+      git -c http.sslVerify=true clone --depth 1 "$DEFAULT_REPO_HTTPS" "$REPO_DIR"
     fi
   fi
 fi
@@ -213,7 +210,7 @@ fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   [[ -d "${HOME}/.cargo/bin" ]] && export PATH="${HOME}/.cargo/bin:${PATH}"
-  command -v cargo >/dev/null 2>&1 || fail_missing "cargo (Rust toolchain)" "curl https://sh.rustup.rs -sSf | sh"
+  command -v cargo >/dev/null 2>&1 || fail_missing "cargo (Rust toolchain)" "curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh"
   command -v node >/dev/null 2>&1 || fail_missing "node" "Install Node.js 20+ (e.g. nvm install --lts)"
   command -v npm >/dev/null 2>&1 || fail_missing "npm" "Install Node.js + npm"
   command -v python3 >/dev/null 2>&1 || fail_missing "python3" "sudo apt-get install -y python3"

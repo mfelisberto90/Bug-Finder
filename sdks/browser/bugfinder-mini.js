@@ -19,9 +19,77 @@
     flushTimer: null,
     initialized: false,
     fetchWrapped: false,
+    xhrWrapped: false,
     consoleWrapped: false,
-    inConsole: false
+    inConsole: false,
+    recentEvents: Object.create(null)
   };
+
+  function safeJsonStringify(obj) {
+    try {
+      var seen = typeof WeakSet === "function" ? new WeakSet() : [];
+      return JSON.stringify(obj, function (_k, val) {
+        if (typeof val === "bigint") return val.toString();
+        if (val && typeof val === "object") {
+          if (typeof WeakSet === "function") {
+            if (seen.has(val)) return "[Circular]";
+            seen.add(val);
+          } else {
+            if (seen.indexOf(val) !== -1) return "[Circular]";
+            seen.push(val);
+          }
+        }
+        return val;
+      });
+    } catch (_) {
+      return "{}";
+    }
+  }
+
+  function formatUnknown(val) {
+    if (val instanceof Error) {
+      return (val.name || "Error") + ": " + (val.message || "");
+    }
+    if (val === null) return "null";
+    if (val === undefined) return "undefined";
+    if (typeof Element !== "undefined" && val instanceof Element) {
+      return "<" + val.tagName.toLowerCase() + (val.id ? "#" + val.id : "") + ">";
+    }
+    if (typeof val === "object") {
+      if (typeof val.message === "string" && val.message) {
+        return (typeof val.name === "string" && val.name ? val.name + ": " : "") + val.message;
+      }
+      var s = safeJsonStringify(val);
+      if (s && s !== "{}") return s.slice(0, 500);
+      return "[object]";
+    }
+    try {
+      return String(val);
+    } catch (_) {
+      return "[unstringifiable]";
+    }
+  }
+
+  function shouldDropDuplicate(fpKey) {
+    var now = Date.now();
+    var keys = Object.keys(cfg.recentEvents);
+    if (keys.length > 100) {
+      for (var i = 0; i < keys.length; i++) {
+        if (now - cfg.recentEvents[keys[i]] >= 5000) {
+          delete cfg.recentEvents[keys[i]];
+        }
+      }
+      if (Object.keys(cfg.recentEvents).length > 100) {
+        cfg.recentEvents = Object.create(null);
+      }
+    }
+    var prev = cfg.recentEvents[fpKey];
+    if (prev && now - prev < 5000) {
+      return true;
+    }
+    cfg.recentEvents[fpKey] = now;
+    return false;
+  }
 
   function isOwnTelemetryUrl(rawUrl) {
     try {
@@ -66,9 +134,17 @@
 
   function parseStack(stackStr) {
     if (!stackStr) return [];
-    return String(stackStr)
-      .split("\n")
-      .slice(1, 30)
+    var rawLines = String(stackStr).split("\n");
+    if (
+      rawLines.length > 0 &&
+      !/^\s*at\s+/.test(rawLines[0]) &&
+      !/^\s*[^@\s]*@(?:https?:|file:|blob:|webpack|eval|\/|\[native|.+:\d+:\d+)/.test(rawLines[0])
+    ) {
+      rawLines = rawLines.slice(1);
+    }
+    return rawLines
+      .slice(0, 30)
+      .filter(function (line) { return line && line.trim().length > 0; })
       .map(function (line) {
         var m = line.match(/^\s*at\s+(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?/) ||
                 line.match(/^\s*(.*?)@(.+?):(\d+):(\d+)/);
@@ -86,10 +162,10 @@
 
   function sendEnvelope(header, items, preferBeacon) {
     if (!cfg.endpoint) return;
-    var lines = [JSON.stringify(header)];
+    var lines = [safeJsonStringify(header)];
     for (var i = 0; i < items.length; i++) {
-      lines.push(JSON.stringify(items[i][0]));
-      lines.push(JSON.stringify(items[i][1]));
+      lines.push(safeJsonStringify(items[i][0]));
+      lines.push(safeJsonStringify(items[i][1]));
     }
     var body = lines.join("\n") + "\n";
     var url = cfg.endpoint + (cfg.dsnKey ? "?sentry_key=" + encodeURIComponent(cfg.dsnKey) : "");
@@ -109,7 +185,7 @@
         origFetch.call(root, url, {
           method: "POST",
           body: body,
-          keepalive: true,
+          keepalive: body.length <= 60000,
           headers: { "Content-Type": "text/plain;charset=UTF-8" }
         }).catch(function () {});
       }
@@ -117,15 +193,31 @@
   }
 
   function uuidHex() {
+    var cryptoObj = root.crypto || root.msCrypto;
+    if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+      var bytes = new Uint8Array(16);
+      cryptoObj.getRandomValues(bytes);
+      var out = "";
+      for (var i = 0; i < bytes.length; i++) {
+        out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+      }
+      return out;
+    }
     var s = "";
-    for (var i = 0; i < 32; i++) s += Math.floor(Math.random() * 16).toString(16);
+    for (var j = 0; j < 32; j++) s += Math.floor(Math.random() * 16).toString(16);
     return s;
   }
 
   function captureException(err, extra) {
-    var name = (err && err.name) || "Error";
-    var message = (err && err.message) || String(err || "Unknown error");
+    var name = (err && typeof err.name === "string" && err.name) || "Error";
+    var message = (err && typeof err.message === "string" && err.message)
+      ? err.message
+      : (err ? formatUnknown(err) : "Unknown error");
     var frames = parseStack(err && err.stack);
+    var topFrame = frames.length ? frames[frames.length - 1].filename || "" : "";
+    if (shouldDropDuplicate("ex:" + name + ":" + message.slice(0, 160) + ":" + topFrame)) {
+      return null;
+    }
     var eid = uuidHex();
     var payload = {
       event_id: eid,
@@ -150,7 +242,12 @@
     return eid;
   }
 
-  function captureMessage(msg, level) {
+  function captureMessage(msg, level, extra) {
+    var msgStr = formatUnknown(msg);
+    var lvl = level || "info";
+    if (shouldDropDuplicate("msg:" + lvl + ":" + msgStr.slice(0, 200))) {
+      return null;
+    }
     var eid = uuidHex();
     sendEnvelope(
       { event_id: eid, sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
@@ -158,11 +255,14 @@
         event_id: eid,
         timestamp: Date.now() / 1000,
         platform: "javascript",
-        level: level || "info",
+        level: lvl,
         environment: cfg.environment,
         release: cfg.release || undefined,
-        message: String(msg),
+        message: msgStr,
         tags: cfg.tags,
+        user: cfg.user || undefined,
+        extra: extra || undefined,
+        request: { url: typeof location !== "undefined" ? location.href : "" },
         breadcrumbs: { values: cfg.breadcrumbs.slice() }
       }]]
     );
@@ -213,7 +313,14 @@
     if (cfg.fetchWrapped || !origFetch || typeof root.fetch !== "function") return;
     cfg.fetchWrapped = true;
     root.fetch = function (input, initOpts) {
-      var urlStr = typeof input === "string" ? input : (input && input.url) || "";
+      var urlStr =
+        typeof input === "string"
+          ? input
+          : input && typeof input.url === "string"
+          ? input.url
+          : input && typeof input.href === "string"
+          ? input.href
+          : formatUnknown(input);
       if (isOwnTelemetryUrl(urlStr)) {
         return origFetch.apply(root, arguments);
       }
@@ -252,6 +359,58 @@
     };
   }
 
+  function installXhrCapture() {
+    if (cfg.xhrWrapped || typeof root.XMLHttpRequest !== "function" || !root.XMLHttpRequest.prototype) return;
+    cfg.xhrWrapped = true;
+    var proto = root.XMLHttpRequest.prototype;
+    var origOpen = proto.open;
+    var origSend = proto.send;
+    if (typeof origOpen !== "function" || typeof origSend !== "function") return;
+
+    proto.open = function (method, url) {
+      try {
+        this._bfMethod = String(method || "GET").toUpperCase();
+        this._bfUrl = url && typeof url.href === "string" ? url.href : String(url || "");
+      } catch (_) {}
+      return origOpen.apply(this, arguments);
+    };
+
+    proto.send = function () {
+      try {
+        var self = this;
+        var rawUrl = self._bfUrl || "";
+        if (rawUrl && !isOwnTelemetryUrl(rawUrl) && !self._bfBound && typeof self.addEventListener === "function") {
+          self._bfBound = true;
+          var method = self._bfMethod || "GET";
+          var safePath = rawUrl.split("?")[0].slice(0, 200);
+          self.addEventListener("load", function () {
+            addBreadcrumb({
+              type: "http",
+              category: "xhr",
+              level: self.status >= 500 ? "error" : "info",
+              message: method + " " + safePath + " -> " + (self.status || 0)
+            });
+            if (self.status >= 500) {
+              captureException(new Error("XHR HTTP " + self.status + " on " + method + " " + safePath), {
+                http_status: self.status,
+                http_method: method
+              });
+            }
+          });
+          self.addEventListener("error", function () {
+            addBreadcrumb({ type: "http", category: "xhr", level: "error", message: method + " " + safePath + " failed" });
+            captureException(new Error("XHR network error on " + method + " " + safePath), { http_method: method });
+          });
+          self.addEventListener("timeout", function () {
+            addBreadcrumb({ type: "http", category: "xhr", level: "error", message: method + " " + safePath + " timed out" });
+            captureException(new Error("XHR timeout on " + method + " " + safePath), { http_method: method });
+          });
+        }
+      } catch (_) {}
+      return origSend.apply(this, arguments);
+    };
+  }
+
   function installConsoleCapture(modeStr) {
     if (cfg.consoleWrapped || typeof console === "undefined") return;
     cfg.consoleWrapped = true;
@@ -262,8 +421,7 @@
     function formatArgs(args) {
       var out = [];
       for (var i = 0; i < args.length; i++) {
-        var a = args[i];
-        out.push(a instanceof Error ? a.name + ": " + a.message : typeof a === "object" ? "[object]" : String(a));
+        out.push(formatUnknown(args[i]));
       }
       return out.join(" ").slice(0, 800);
     }
@@ -308,17 +466,46 @@
     cfg.maxBreadcrumbs = options.maxBreadcrumbs || 50;
 
     if (options.captureFetch) installFetchCapture();
+    if (options.captureFetch || options.captureXhr) installXhrCapture();
     if (options.captureConsole) installConsoleCapture(options.captureConsole);
 
     if (typeof window !== "undefined" && !cfg.initialized) {
       cfg.initialized = true;
       window.addEventListener("error", function (ev) {
-        if (ev && ev.error) captureException(ev.error);
-        else if (ev && ev.message) captureMessage(ev.message, "error");
-      });
+        if (ev && ev.error) {
+          captureException(ev.error);
+        } else if (ev && ev.message) {
+          captureMessage(ev.message, "error");
+        } else if (ev && ev.target && ev.target !== root && ev.target.tagName) {
+          var el = ev.target;
+          var resUrl = el.src || el.href || el.currentSrc || "";
+          if (resUrl && !isOwnTelemetryUrl(resUrl)) {
+            captureMessage(
+              "Resource load failed: <" + el.tagName.toLowerCase() + "> " + String(resUrl).slice(0, 240),
+              "error",
+              { resource_tag: el.tagName.toLowerCase(), resource_url: String(resUrl).slice(0, 500) }
+            );
+          }
+        }
+      }, true);
       window.addEventListener("unhandledrejection", function (ev) {
         var reason = ev && ev.reason;
-        captureException(reason instanceof Error ? reason : new Error(String(reason || "Unhandled rejection")));
+        if (reason instanceof Error) {
+          captureException(reason);
+        } else {
+          captureException(new Error(formatUnknown(reason) || "Unhandled rejection"));
+        }
+      });
+      window.addEventListener("securitypolicyviolation", function (ev) {
+        if (!ev) return;
+        var dir = ev.effectiveDirective || ev.violatedDirective || "csp";
+        var blocked = ev.blockedURI || "inline";
+        captureMessage("CSP Violation (" + dir + "): " + blocked, "warning", {
+          violated_directive: dir,
+          blocked_uri: String(blocked).slice(0, 500),
+          source_file: ev.sourceFile || undefined,
+          line_number: ev.lineNumber || undefined
+        });
       });
       window.addEventListener("click", function (ev) {
         var t = ev && ev.target;

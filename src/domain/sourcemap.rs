@@ -2,7 +2,7 @@ use crate::runtime::trim_heap;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct MappedLocation {
@@ -144,12 +144,25 @@ impl SourceMapV3 {
             lines.push(segs);
         }
 
+        let seg_count: usize = lines.iter().map(Vec::len).sum();
+        let str_bytes: usize = sources.iter().map(|s| s.len()).sum::<usize>()
+            + names.iter().map(|s| s.len()).sum::<usize>()
+            + sources_content
+                .iter()
+                .filter_map(|o| o.as_ref().map(|s| s.len()))
+                .sum::<usize>();
+        let approx_bytes = raw.len().max(
+            seg_count * std::mem::size_of::<MappingSeg>()
+                + str_bytes
+                + lines.len() * std::mem::size_of::<Vec<MappingSeg>>(),
+        );
+
         Ok(Self {
             sources,
             names,
             sources_content,
             lines,
-            approx_bytes: raw.len(),
+            approx_bytes,
         })
     }
 
@@ -169,8 +182,10 @@ impl SourceMapV3 {
         let orig_col = seg.orig_col.unwrap_or(0).max(0) as u32;
         let name = seg.name_idx.and_then(|i| self.names.get(i).cloned());
 
-        let (pre_context, context_line, post_context) =
-            extract_context(self.sources_content.get(s_idx).and_then(|o| o.as_deref()), orig_line);
+        let (pre_context, context_line, post_context) = extract_context(
+            self.sources_content.get(s_idx).and_then(|o| o.as_deref()),
+            orig_line,
+        );
 
         Some(MappedLocation {
             source,
@@ -200,7 +215,10 @@ fn extract_context(
     let end = (idx + 6).min(lines.len());
     let pre = lines[start..idx].iter().map(|s| (*s).to_string()).collect();
     let ctx = Some(lines[idx].to_string());
-    let post = lines[idx + 1..end].iter().map(|s| (*s).to_string()).collect();
+    let post = lines[idx + 1..end]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     (pre, ctx, post)
 }
 
@@ -213,7 +231,7 @@ pub struct SourceMapCache {
 }
 
 struct CacheInner {
-    map: HashMap<String, SourceMapV3>,
+    map: HashMap<String, Arc<SourceMapV3>>,
     order: VecDeque<String>,
     total_bytes: usize,
 }
@@ -231,20 +249,25 @@ impl SourceMapCache {
         }
     }
 
-    pub fn get_or_parse(&self, key: &str, raw_bytes: &[u8]) -> Option<SourceMapV3> {
-        {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(found) = guard.map.get(key).cloned() {
-                guard.order.retain(|k| k != key);
-                guard.order.push_back(key.to_string());
-                return Some(found);
-            }
+    pub fn get_cached(&self, key: &str) -> Option<Arc<SourceMapV3>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = guard.map.get(key).cloned() {
+            guard.order.retain(|k| k != key);
+            guard.order.push_back(key.to_string());
+            return Some(found);
         }
+        None
+    }
 
-        let parsed = SourceMapV3::parse(raw_bytes).ok()?;
+    pub fn insert_parsed(&self, key: &str, parsed: Arc<SourceMapV3>) -> Arc<SourceMapV3> {
         let mut evicted = false;
         {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = guard.map.get(key).cloned() {
+                guard.order.retain(|k| k != key);
+                guard.order.push_back(key.to_string());
+                return existing;
+            }
             while (guard.total_bytes + parsed.approx_bytes > self.max_bytes
                 || guard.map.len() >= self.max_entries)
                 && !guard.order.is_empty()
@@ -258,14 +281,23 @@ impl SourceMapCache {
             }
             if parsed.approx_bytes <= self.max_bytes {
                 guard.total_bytes += parsed.approx_bytes;
-                guard.map.insert(key.to_string(), parsed.clone());
+                guard.order.retain(|k| k != key);
+                guard.map.insert(key.to_string(), Arc::clone(&parsed));
                 guard.order.push_back(key.to_string());
             }
         }
         if evicted {
             trim_heap();
         }
-        Some(parsed)
+        parsed
+    }
+
+    pub fn get_or_parse(&self, key: &str, raw_bytes: &[u8]) -> Option<Arc<SourceMapV3>> {
+        if let Some(cached) = self.get_cached(key) {
+            return Some(cached);
+        }
+        let parsed = Arc::new(SourceMapV3::parse(raw_bytes).ok()?);
+        Some(self.insert_parsed(key, parsed))
     }
 }
 
@@ -276,7 +308,7 @@ pub fn strip_url_basename(raw: &str) -> &str {
 
 pub fn demangle_event_with_maps<F>(ev: &mut Value, mut fetch_map: F) -> bool
 where
-    F: FnMut(Option<&str>, &str) -> Option<SourceMapV3>,
+    F: FnMut(Option<&str>, &str) -> Option<Arc<SourceMapV3>>,
 {
     let debug_id_by_file: HashMap<String, String> = ev
         .get("debug_meta")
@@ -377,7 +409,7 @@ mod tests {
             "sourcesContent": ["const a = 1;\nfunction submitOrder() {\n  throw new Error('boom');\n}\n"],
             "mappings": "AAEIA"
         }"#;
-        let sm = SourceMapV3::parse(sm_bytes).unwrap();
+        let sm = Arc::new(SourceMapV3::parse(sm_bytes).unwrap());
         let loc = sm.lookup(1, 0).unwrap();
         assert_eq!(loc.source, "src/checkout.ts");
         assert_eq!(loc.line, 3); // 0-based 2 => 1-based 3
@@ -399,9 +431,16 @@ mod tests {
                 }]
             }
         });
-        assert_eq!(strip_url_basename("https://cdn.example.com/app.min.js?v=99#top"), "app.min.js");
+        assert_eq!(
+            strip_url_basename("https://cdn.example.com/app.min.js?v=99#top"),
+            "app.min.js"
+        );
         let mapped = demangle_event_with_maps(&mut ev, |_, fname| {
-            if fname == "app.min.js" { Some(sm.clone()) } else { None }
+            if fname == "app.min.js" {
+                Some(Arc::clone(&sm))
+            } else {
+                None
+            }
         });
         assert!(mapped);
         let fr = &ev["exception"]["values"][0]["stacktrace"]["frames"][0];

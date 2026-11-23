@@ -46,19 +46,13 @@ const DEFAULT_WHOLE_KEYS: &[&str] = &[
     "socialsecurity",
 ];
 
-const EVENT_SECTIONS: &[&str] = &[
-    "request",
-    "extra",
-    "user",
-    "contexts",
-    "breadcrumbs",
-    "exception",
-    "threads",
-    "tags",
-    "logentry",
-    "message",
-    "csp",
-    "spans",
+const SAFE_TOP_LEVEL_KEYS: &[&str] = &[
+    "event_id",
+    "timestamp",
+    "level",
+    "platform",
+    "type",
+    "received",
 ];
 
 struct ScrubRegexes {
@@ -69,6 +63,7 @@ struct ScrubRegexes {
     query_secret: Regex,
     url_credentials: Regex,
     card_candidate: Regex,
+    phone_e164: Regex,
     email: Regex,
 }
 
@@ -94,16 +89,19 @@ fn regexes() -> &'static ScrubRegexes {
             r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\b",
         ),
         prefixed_secret: build_ascii_regex(
-            r"\b(?:sk_live_|sk_test_|rk_live_|rk_test_|whsec_|ghp_|gho_|glpat-|xoxb-|xoxp-|bf_)[A-Za-z0-9_\-]{12,}\b",
+            r"\b(?:sk_live_|sk_test_|rk_live_|rk_test_|sk-proj-|sk-ant-|whsec_|ghp_|gho_|ghu_|ghs_|glpat-|xoxb-|xoxp-|npm_|pypi-|bf_)[A-Za-z0-9_\-]{12,}\b|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_\-]{20,}\b|\bSG\.[A-Za-z0-9_\-]{12,}\.[A-Za-z0-9_\-]{12,}\b",
         ),
         query_secret: build_ascii_regex(
-            r"(?i)([?&](?:token|api_key|apikey|secret|password|passwd|auth|access_token|sentry_key)=)[A-Za-z0-9%._\-~+/]+",
+            r"(?i)([?&](?:token|api_key|apikey|secret|password|passwd|auth|access_token|refresh_token|client_secret|sentry_key|phone|code)=)[A-Za-z0-9%._\-~+/]+",
         ),
         url_credentials: build_ascii_regex(
-            r"(?i)(https?://)([A-Za-z0-9._%+\-]+):([A-Za-z0-9._%+\-!$&'()*+,;=]+)@",
+            r"(?i)((?:https?|postgres(?:ql)?|mysql|mariadb|redis(?:s)?|mongodb(?:\+srv)?|amqps?|smtp(?:s)?)://)([A-Za-z0-9._%+\-]+):([A-Za-z0-9._%+\-!$&'()*+,;=]+)@",
         ),
         card_candidate: build_ascii_regex(
             r"\b(?:\d[ \-]?){12,18}\d\b",
+        ),
+        phone_e164: build_ascii_regex(
+            r"(?:(?:\+\d{1,3}[ \-]?)|\b07\d{2,3}[ \-]?)\d{3,4}[ \-]?\d{3,4}(?:[ \-]?\d{2,4})?\b",
         ),
         email: build_ascii_regex(
             r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,16}\b",
@@ -133,7 +131,7 @@ pub fn is_luhn_valid(digits: &str) -> bool {
         sum += v;
         alt = !alt;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 fn normalize_whole_key(key: &str) -> String {
@@ -243,7 +241,11 @@ impl Scrubber {
     /// Org-level `scrub_ip_addresses` overrides the project setting (matching GlitchTip).
     pub fn from_filters_with_org(filters: &ProjectFilters, org_scrub_ip: bool) -> Self {
         Self {
-            safe_keys: filters.safe_keys.iter().map(|k| normalize_whole_key(k)).collect(),
+            safe_keys: filters
+                .safe_keys
+                .iter()
+                .map(|k| normalize_whole_key(k))
+                .collect(),
             sensitive_keys: filters
                 .sensitive_keys
                 .iter()
@@ -261,10 +263,17 @@ impl Scrubber {
             return false;
         }
         if self.aggressive_key_match {
-            if self.safe_keys.iter().any(|s| !s.is_empty() && whole.contains(s)) {
+            if self
+                .safe_keys
+                .iter()
+                .any(|s| !s.is_empty() && whole.contains(s))
+            {
                 return false;
             }
-            if self.sensitive_keys.iter().any(|s| !s.is_empty() && whole.contains(s))
+            if self
+                .sensitive_keys
+                .iter()
+                .any(|s| !s.is_empty() && whole.contains(s))
                 || DEFAULT_WHOLE_KEYS.iter().any(|k| whole.contains(k))
                 || DEFAULT_KEY_TOKENS.iter().any(|k| whole.contains(k))
             {
@@ -286,7 +295,8 @@ impl Scrubber {
 
     pub fn scrub_string(&self, input: &str) -> String {
         let mut report = ScrubReport::default();
-        self.scrub_string_with_report(input, &mut report).into_owned()
+        self.scrub_string_with_report(input, &mut report)
+            .into_owned()
     }
 
     pub fn scrub_string_with_report<'a>(
@@ -302,7 +312,10 @@ impl Scrubber {
         let has_prefixed = has_prefixed_secret_hint(input);
         let has_url_creds = input.contains("://") && input.contains('@');
         let has_query = input.contains('=') && (input.contains('?') || input.contains('&'));
-        let has_card_digits = input.bytes().filter(|b| b.is_ascii_digit()).count() >= 13;
+        let digit_count = input.bytes().filter(|b| b.is_ascii_digit()).count();
+        let has_card_digits = digit_count >= 13;
+        let has_phone_hint =
+            self.scrub_emails && digit_count >= 10 && (input.contains('+') || input.contains("07"));
         let has_email = self.scrub_emails && input.contains('@');
 
         if !(has_nul
@@ -313,6 +326,7 @@ impl Scrubber {
             || has_url_creds
             || has_query
             || has_card_digits
+            || has_phone_hint
             || has_email)
         {
             return Cow::Borrowed(input);
@@ -329,19 +343,18 @@ impl Scrubber {
             report.push_unique("pem_private_key");
             s = Cow::Owned(rx.pem_block.replace_all(&s, PLACEHOLDER).into_owned());
         }
-        if contains_ascii_ci(s.as_bytes(), b"bearer") || contains_ascii_ci(s.as_bytes(), b"basic")
+        if (contains_ascii_ci(s.as_bytes(), b"bearer") || contains_ascii_ci(s.as_bytes(), b"basic"))
+            && rx.auth_header.is_match(&s)
         {
-            if rx.auth_header.is_match(&s) {
-                for cap in rx.auth_header.captures_iter(&s) {
-                    if let Some(tok) = cap.get(2).map(|m| m.as_str()) {
-                        if tok.len() >= 12 {
-                            report.push_unique("auth_header");
-                            break;
-                        }
+            for cap in rx.auth_header.captures_iter(&s) {
+                if let Some(tok) = cap.get(2).map(|m| m.as_str()) {
+                    if tok.len() >= 12 {
+                        report.push_unique("auth_header");
+                        break;
                     }
                 }
-                s = Cow::Owned(rx.auth_header.replace_all(&s, "$1 [Filtered]").into_owned());
             }
+            s = Cow::Owned(rx.auth_header.replace_all(&s, "$1 [Filtered]").into_owned());
         }
         if s.contains("eyJ") && rx.jwt.is_match(&s) {
             report.push_unique("jwt");
@@ -365,8 +378,7 @@ impl Scrubber {
                     .into_owned(),
             );
         }
-        if s.contains('=') && (s.contains('?') || s.contains('&')) && rx.query_secret.is_match(&s)
-        {
+        if s.contains('=') && (s.contains('?') || s.contains('&')) && rx.query_secret.is_match(&s) {
             s = Cow::Owned(rx.query_secret.replace_all(&s, "$1[Filtered]").into_owned());
         }
         if s.bytes().filter(|b| b.is_ascii_digit()).count() >= 13 {
@@ -376,7 +388,7 @@ impl Scrubber {
                 .any(|m| is_luhn_valid(m.as_str()));
             if has_luhn {
                 let mut tmp = String::new();
-                std::mem::swap(&mut tmp, &mut s.to_mut());
+                std::mem::swap(&mut tmp, s.to_mut());
                 let replaced = rx
                     .card_candidate
                     .replace_all(&tmp, |caps: &regex::Captures| {
@@ -392,6 +404,10 @@ impl Scrubber {
                 s = Cow::Owned(replaced);
             }
         }
+        if self.scrub_emails && (s.contains('+') || s.contains("07")) && rx.phone_e164.is_match(&s)
+        {
+            s = Cow::Owned(rx.phone_e164.replace_all(&s, PLACEHOLDER).into_owned());
+        }
         if self.scrub_emails && s.contains('@') && rx.email.is_match(&s) {
             s = Cow::Owned(rx.email.replace_all(&s, PLACEHOLDER).into_owned());
         }
@@ -400,6 +416,9 @@ impl Scrubber {
 
     fn scrub_value(&self, val: &mut Value, depth: usize, report: &mut ScrubReport) {
         if depth >= MAX_SCRUB_DEPTH {
+            if !val.is_null() {
+                *val = Value::String("[DEPTH_TRUNCATED]".to_string());
+            }
             return;
         }
         match val {
@@ -427,7 +446,12 @@ impl Scrubber {
                                 *entry = Value::String(PLACEHOLDER.to_string());
                             }
                         }
-                    } else if self.scrub_ips && (k == "ip_address" || k == "ipAddress") {
+                    } else if self.scrub_ips
+                        && matches!(
+                            k.to_ascii_lowercase().as_str(),
+                            "ip_address" | "ipaddress" | "client_ip" | "remote_addr" | "remoteaddr"
+                        )
+                    {
                         if let Some(Value::String(ip)) = map.get_mut(&k) {
                             *ip = anonymize_ip(ip);
                         }
@@ -449,19 +473,37 @@ impl Scrubber {
         let Some(obj) = event.as_object_mut() else {
             return report;
         };
-        for section in EVENT_SECTIONS {
-            if let Some(val) = obj.get_mut(*section) {
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if SAFE_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            if key == "release" || key == "environment" {
+                if let Some(Value::String(s)) = obj.get_mut(&key) {
+                    if s.contains('\0') {
+                        *s = s.replace('\0', "");
+                    }
+                    if let Cow::Owned(clean) = self.scrub_string_with_report(s, &mut report) {
+                        *s = clean;
+                    }
+                }
+                continue;
+            }
+            if self.is_sensitive_key(&key) {
+                if let Some(entry) = obj.get_mut(&key) {
+                    if let Some(s) = entry.as_str() {
+                        if s != PLACEHOLDER && !s.is_empty() {
+                            let _ = self.scrub_string_with_report(s, &mut report);
+                        }
+                    }
+                    if !entry.is_null() {
+                        *entry = Value::String(PLACEHOLDER.to_string());
+                    }
+                }
+                continue;
+            }
+            if let Some(val) = obj.get_mut(&key) {
                 self.scrub_value(val, 0, &mut report);
-            }
-        }
-        if let Some(Value::String(rel)) = obj.get_mut("release") {
-            if rel.contains('\0') {
-                *rel = rel.replace('\0', "");
-            }
-        }
-        if let Some(Value::String(env)) = obj.get_mut("environment") {
-            if env.contains('\0') {
-                *env = env.replace('\0', "");
             }
         }
         report
@@ -491,19 +533,11 @@ fn contains_ascii_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
 
 fn has_prefixed_secret_hint(s: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "sk_live_",
-        "sk_test_",
-        "rk_live_",
-        "rk_test_",
-        "whsec_",
-        "ghp_",
-        "gho_",
-        "glpat-",
-        "xoxb-",
-        "xoxp-",
-        "bf_",
+        "sk_live_", "sk_test_", "rk_live_", "rk_test_", "sk-proj-", "sk-ant-", "whsec_", "ghp_",
+        "gho_", "ghu_", "ghs_", "glpat-", "xoxb-", "xoxp-", "npm_", "pypi-", "bf_", "AKIA", "ASIA",
+        "AIza", "SG.",
     ];
-    (s.contains('_') || s.contains('-')) && PREFIXES.iter().any(|p| s.contains(p))
+    PREFIXES.iter().any(|p| s.contains(p))
 }
 
 pub fn anonymize_ip(raw: &str) -> String {
@@ -559,7 +593,10 @@ mod tests {
 
         scrubber.scrub_event_in_place(&mut ev);
 
-        assert_eq!(ev["request"]["url"], "https://app.example.com/cb?token=[Filtered]&page=2");
+        assert_eq!(
+            ev["request"]["url"],
+            "https://app.example.com/cb?token=[Filtered]&page=2"
+        );
         assert_eq!(ev["request"]["headers"]["Authorization"], PLACEHOLDER);
         assert_eq!(ev["request"]["headers"]["User-Agent"], "Mozilla/5.0");
         assert_eq!(ev["request"]["data"]["userPassword"], PLACEHOLDER);
@@ -585,7 +622,11 @@ mod tests {
             "extra": { "password": "", "token": "[Filtered]" }
         });
         let rep0 = scrubber.scrub_event_with_report(&mut benign);
-        assert!(rep0.categories.is_empty(), "Unexpected false positive: {:?}", rep0.categories);
+        assert!(
+            rep0.categories.is_empty(),
+            "Unexpected false positive: {:?}",
+            rep0.categories
+        );
 
         // Live secret in log -> triggers live_prefixed_secret
         let mut leak_body = "Leaked key sk_live_0000111122223333".to_string(); // gitleaks:allow
@@ -606,5 +647,56 @@ mod tests {
         );
         assert!(matches!(clean, Cow::Borrowed(_)));
         assert!(clean_rep.categories.is_empty());
+    }
+
+    #[test]
+    fn scrubs_cloud_ai_db_uri_culprit_transaction_phones_and_truncates_depth() {
+        let filters = ProjectFilters {
+            scrub_emails: true,
+            ..ProjectFilters::default()
+        };
+        let scrubber = Scrubber::from_filters(&filters);
+        let mut nested = json!("safe");
+        for _ in 0..(MAX_SCRUB_DEPTH + 4) {
+            nested = json!({ "child": nested });
+        }
+        let mut ev = json!({
+            "event_id": "1234567890abcdef1234567890abcdef",
+            "culprit": "https://api.example.com/pay?api_key=leaked_in_culprit_12345", // gitleaks:allow
+            "transaction": "POST postgres://app:TopSecretPgPass@db.internal:5432/prod?refresh_token=rt_secret_999", // gitleaks:allow
+            "server_name": "Bearer secret_server_header_999",
+            "extra": {
+                "aws": "AKIAIOSFODNN7EXAMPLE", // gitleaks:allow
+                "openai": "sk-proj-test_0000111122223333", // gitleaks:allow
+                "gcp": "AIzaSyDummyTestKey0000000000000", // gitleaks:allow
+                "redis": "redis://default:redisSecretPass@10.0.0.1:6379/0",
+                "phone_uk": "+44 7700 900123",
+                "deep": nested,
+                "client_ip": "198.51.100.77"
+            }
+        });
+        let rep = scrubber.scrub_event_with_report(&mut ev);
+        assert!(rep.categories.contains(&"live_prefixed_secret"));
+        assert!(rep.categories.contains(&"url_credentials"));
+        assert_eq!(
+            ev["culprit"],
+            "https://api.example.com/pay?api_key=[Filtered]"
+        );
+        let tx_s = ev["transaction"].as_str().unwrap();
+        assert!(!tx_s.contains("TopSecretPgPass"));
+        assert!(!tx_s.contains("rt_secret_999"));
+        assert_eq!(ev["server_name"], "Bearer [Filtered]");
+        assert_eq!(ev["extra"]["aws"], PLACEHOLDER);
+        assert_eq!(ev["extra"]["openai"], PLACEHOLDER);
+        assert_eq!(ev["extra"]["gcp"], PLACEHOLDER);
+        assert!(!ev["extra"]["redis"]
+            .as_str()
+            .unwrap()
+            .contains("redisSecretPass"));
+        assert_eq!(ev["extra"]["phone_uk"], PLACEHOLDER);
+        assert_eq!(ev["extra"]["client_ip"], "198.51.100.0");
+        assert!(serde_json::to_string(&ev["extra"]["deep"])
+            .unwrap()
+            .contains("[DEPTH_TRUNCATED]"));
     }
 }

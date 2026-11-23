@@ -370,8 +370,16 @@ async function refreshSdkMeta(): Promise<void> {
   }
 }
 
+function canManageOrg(): boolean {
+  const r = (state.user?.role || "").toLowerCase();
+  return r === "owner" || r === "manager" || r === "admin";
+}
+
 async function refreshSelfCheck(): Promise<void> {
-  if (!state.orgSlug || !state.user) return;
+  if (!state.orgSlug || !state.user || !canManageOrg()) {
+    state.selfCheck = null;
+    return;
+  }
   const res = await apiFetch<SelfCheckReport>(
     `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/`
   );
@@ -616,14 +624,20 @@ async function loadCurrentTabData(): Promise<void> {
     if (monRes.ok && monRes.data) state.monitors = monRes.data;
     if (alRes.ok && alRes.data) state.alerts = alRes.data;
   } else if (state.tab === "projects") {
-    const [tokRes, memRes, invRes] = await Promise.all([
-      apiFetch<ApiTokenItem[]>(`/api/0/api-tokens/`),
-      apiFetch<MemberItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`),
-      apiFetch<InvitationItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/`)
-    ]);
-    if (tokRes.ok && tokRes.data) state.tokens = tokRes.data;
-    if (memRes.ok && memRes.data) state.members = memRes.data;
-    if (invRes.ok && invRes.data) state.invitations = invRes.data;
+    if (canManageOrg()) {
+      const [tokRes, memRes, invRes] = await Promise.all([
+        apiFetch<ApiTokenItem[]>(`/api/0/api-tokens/`),
+        apiFetch<MemberItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/`),
+        apiFetch<InvitationItem[]>(`/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/`)
+      ]);
+      if (tokRes.ok && tokRes.data) state.tokens = tokRes.data;
+      if (memRes.ok && memRes.data) state.members = memRes.data;
+      if (invRes.ok && invRes.data) state.invitations = invRes.data;
+    } else {
+      state.tokens = [];
+      state.members = [];
+      state.invitations = [];
+    }
   } else if (state.tab === "shield") {
     if (state.shieldSubTab === "anti-rea") {
       const q = state.shieldProjectFilter ? `?project_id=${state.shieldProjectFilter}` : "";
@@ -648,20 +662,25 @@ async function loadCurrentTabData(): Promise<void> {
       if (mfaRes.ok && mfaRes.data) state.mfaStatus = mfaRes.data;
       if (sessRes.ok && sessRes.data) state.sessions = sessRes.data;
     } else if (state.shieldSubTab === "audit") {
-      const [secRes, audRes, verRes] = await Promise.all([
-        apiFetch<OrgSecuritySettings>(
-          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/security-settings/`
-        ),
-        apiFetch<AuditLogItem[]>(
-          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/?limit=50`
-        ),
-        apiFetch<AuditVerifyResult>(
-          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/verify/`
-        )
-      ]);
-      if (secRes.ok && secRes.data) state.orgSecurity = secRes.data;
-      if (audRes.ok && audRes.data) state.auditLogs = audRes.data;
-      if (verRes.ok && verRes.data) state.auditVerify = verRes.data;
+      if (canManageOrg()) {
+        const [secRes, audRes, verRes] = await Promise.all([
+          apiFetch<OrgSecuritySettings>(
+            `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/security-settings/`
+          ),
+          apiFetch<AuditLogItem[]>(
+            `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/?limit=50`
+          ),
+          apiFetch<AuditVerifyResult>(
+            `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/verify/`
+          )
+        ]);
+        if (secRes.ok && secRes.data) state.orgSecurity = secRes.data;
+        if (audRes.ok && audRes.data) state.auditLogs = audRes.data;
+        if (verRes.ok && verRes.data) state.auditVerify = verRes.data;
+      } else {
+        state.auditLogs = [];
+        state.auditVerify = null;
+      }
     }
   } else if (state.tab === "selfcheck") {
     await refreshSelfCheck();
@@ -775,6 +794,10 @@ function toggleLiveTail(): void {
   };
   sseSource.addEventListener("log", onMsg);
   sseSource.addEventListener("issue", onMsg);
+  sseSource.addEventListener("error", () => {
+    stopLiveTail();
+    updateLiveTailDomInPlace();
+  });
   updateLiveTailDomInPlace();
 }
 
@@ -2086,12 +2109,14 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
       <div>
         <header class="mobile-top-bar">
           <div class="brand-title"><span class="brand-mark">BF</span> Bug-Finder</div>
-          <div class="row-gap">
+          <div class="row-gap mobile-top-controls">
+            <select id="mobile-org-select" name="mobile_org_slug" class="mobile-org-select" aria-label="Organization"></select>
             <button type="button" data-tab="shield" aria-label="Open Security Shield">Shield</button>
             <button type="button" data-tab="selfcheck" aria-label="Open Auto-Check">
               <span>Auto-Check</span>
               <span class="badge badge-ok" data-selfcheck-badge="1">OK</span>
             </button>
+            <button type="button" id="mobile-btn-logout" class="btn-ghost" aria-label="Sign Out">Sign Out</button>
           </div>
         </header>
         <div id="selfcheck-banner-slot"></div>
@@ -2210,22 +2235,23 @@ function syncSidebarChrome(): void {
     }
   });
 
-  const orgSel = document.getElementById("org-select") as HTMLSelectElement | null;
-  if (orgSel) {
-    const orgList = state.orgs.length
-      ? state.orgs
-      : state.orgSlug
-      ? [{ id: 0, slug: state.orgSlug, name: state.orgSlug, role: state.user?.role || "" }]
-      : [];
-    const sig = orgList.map((o) => `${o.slug}:${o.name}`).join("|");
-    if (orgSel.dataset.sig !== sig) {
-      orgSel.dataset.sig = sig;
-      orgSel.innerHTML = orgList
+  const orgList = state.orgs.length
+    ? state.orgs
+    : state.orgSlug
+    ? [{ id: 0, slug: state.orgSlug, name: state.orgSlug, role: state.user?.role || "" }]
+    : [];
+  const sig = orgList.map((o) => `${o.slug}:${o.name}`).join("|");
+  for (const selId of ["org-select", "mobile-org-select"]) {
+    const sel = document.getElementById(selId) as HTMLSelectElement | null;
+    if (!sel) continue;
+    if (sel.dataset.sig !== sig) {
+      sel.dataset.sig = sig;
+      sel.innerHTML = orgList
         .map((o) => `<option value="${esc(o.slug)}">${esc(o.name)} (${esc(o.slug)})</option>`)
         .join("");
     }
-    if (orgSel.value !== state.orgSlug) {
-      orgSel.value = state.orgSlug;
+    if (sel.value !== state.orgSlug) {
+      sel.value = state.orgSlug;
     }
   }
 
@@ -2594,26 +2620,71 @@ function bindChromeHandlers(): void {
     void switchOrganization(orgSel.value);
   });
 
+  const mobileOrgSel = document.getElementById("mobile-org-select") as HTMLSelectElement | null;
+  mobileOrgSel?.addEventListener("change", () => {
+    void switchOrganization(mobileOrgSel.value);
+  });
+
   const themeSel = document.getElementById("theme-select") as HTMLSelectElement | null;
   themeSel?.addEventListener("change", () => {
     applyTheme(themeSel.value as "system" | "light" | "dark");
   });
 
-  document.getElementById("btn-logout")?.addEventListener("click", async () => {
+  const performLogout = async () => {
     stopLiveTail();
     closeAllDialogs();
     await apiFetch("/api/auth/logout", { method: "POST", body: {} });
     state.needsSetup = false;
     state.user = null;
+    state.orgSlug = "";
     state.orgs = [];
-    state.mfaChallenge = null;
+    state.tab = "issues";
+    state.shieldSubTab = "anti-rea";
+    state.projects = [];
+    state.issues = [];
+    state.issueOffset = 0;
+    state.issueTotalHits = 0;
+    state.selectedIssue = null;
+    state.selectedIssueEvent = null;
+    state.logs = [];
+    state.liveEntries = [];
+    state.logsHasMore = false;
+    state.transactions = [];
+    state.releases = [];
+    state.monitors = [];
+    state.alerts = [];
+    state.tokens = [];
+    state.members = [];
+    state.invitations = [];
+    state.lastInviteUrl = null;
+    state.lastCreatedToken = null;
+    state.shieldEvents = [];
+    state.shieldSummary = { events_24h: 0, high_critical_24h: 0, secret_leaks_24h: 0, active_quarantines: 0 };
+    state.shieldQuarantine = [];
+    state.shieldProjectFilter = null;
+    state.mfaStatus = null;
     state.totpEnrollData = null;
     state.recoveryCodes = null;
-    state.auditVerify = null;
+    state.sessions = [];
+    state.orgSecurity = { scrub_ip_addresses: false, event_throttle_rate: 0, require_mfa_for_admins: false };
     state.auditLogs = [];
-    state.lastInviteUrl = null;
+    state.auditVerify = null;
+    state.mfaChallenge = null;
+    state.activeProjectModalId = null;
+    state.activeProjectKeys = [];
+    state.traceView = null;
+    state.selfCheck = null;
+    state.lastProbe = null;
+    state.connectProjectId = null;
     setCsrfToken("");
     render();
+  };
+
+  document.getElementById("btn-logout")?.addEventListener("click", () => {
+    void performLogout();
+  });
+  document.getElementById("mobile-btn-logout")?.addEventListener("click", () => {
+    void performLogout();
   });
 
   document.getElementById("btn-cmdk")?.addEventListener("click", () => {
@@ -2727,8 +2798,17 @@ function openReauthDialog(onSuccess: () => Promise<void> | void): void {
 function bindCopyButtons(scope: ParentNode): void {
   scope.querySelectorAll<HTMLButtonElement>("[data-copy-text]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      await navigator.clipboard?.writeText(btn.dataset.copyText || "").catch(() => {});
-      showToast("Copied to clipboard");
+      const txt = btn.dataset.copyText || "";
+      try {
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+          showToast("Clipboard unavailable — copy text manually");
+          return;
+        }
+        await navigator.clipboard.writeText(txt);
+        showToast("Copied to clipboard");
+      } catch {
+        showToast("Clipboard permission denied — copy text manually");
+      }
     });
   });
 }
@@ -2806,7 +2886,7 @@ function buildConnectSnippet(
   if (stack === "php") {
     return {
       heading: "PHP / Laravel (Drop-in GlitchTip + Sentry)",
-      note: "Compatible with GlitchTipClient, sentry-laravel, or standalone bugfinder.php without Composer dependencies.",
+      note: "Compatible with sentry-laravel, GlitchTip SDKs, or standalone bugfinder.php without Composer dependencies.",
       dsn,
       code: `# .env (or run: bugfinder init --dsn "${dsn}" --stack laravel)\nGLITCHTIP_ENABLED=true\nGLITCHTIP_DSN=${dsn}\nGLITCHTIP_API_URL=${origin}\nGLITCHTIP_ORGANIZATION=${state.orgSlug}\n\n# Pure PHP without Composer:\nrequire_once __DIR__ . '/bugfinder.php';`
     };
@@ -2862,6 +2942,9 @@ function startConnectSse(projId: number): void {
   };
   connectSse.addEventListener("issue", handleEv);
   connectSse.addEventListener("log", handleEv);
+  connectSse.addEventListener("error", () => {
+    stopConnectSse();
+  });
 }
 
 function renderConnectAppBody(): void {
@@ -4289,6 +4372,11 @@ window.addEventListener("keydown", (e) => {
     const dlg = document.getElementById("dlg-cmdk") as HTMLDialogElement | null;
     if (dlg && !dlg.open) openDialog(dlg);
   }
+});
+
+window.addEventListener("pagehide", () => {
+  stopLiveTail();
+  stopConnectSse();
 });
 
 boot();

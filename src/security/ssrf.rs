@@ -60,6 +60,8 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         || is_teredo
         || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 deprecated site-local
+        || (seg[0..6] == [0, 0, 0, 0, 0xffff, 0]) // ::ffff:0:0:0/96 SIIT IPv4-translated
         || (seg[0] == 0x2001 && seg[1] == 0x0db8)
 }
 
@@ -82,7 +84,9 @@ pub fn validate_webhook_url(raw: &str, allow_http_dev: bool) -> Result<Validated
         ("https", r)
     } else if let Some(r) = trimmed.strip_prefix("http://") {
         if !allow_http_dev {
-            return Err(SsrfError("Webhook URL must use https:// in production".into()));
+            return Err(SsrfError(
+                "Webhook URL must use https:// in production".into(),
+            ));
         }
         ("http", r)
     } else {
@@ -120,12 +124,13 @@ pub fn validate_webhook_url(raw: &str, allow_http_dev: bool) -> Result<Validated
         (authority.to_ascii_lowercase(), p)
     };
 
-    if host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host == "metadata.google.internal"
+    let host_trimmed = host.trim_end_matches('.');
+    if host_trimmed.is_empty()
+        || host_trimmed == "localhost"
+        || host_trimmed.ends_with(".localhost")
+        || host_trimmed.ends_with(".local")
+        || host_trimmed.ends_with(".internal")
+        || host_trimmed == "metadata.google.internal"
     {
         return Err(SsrfError("Blocked internal webhook hostname".into()));
     }
@@ -152,7 +157,9 @@ pub fn validate_webhook_url(raw: &str, allow_http_dev: bool) -> Result<Validated
     }
     for addr in &addrs {
         if is_blocked_ip(addr.ip()) {
-            return Err(SsrfError("Webhook DNS resolved to blocked private IP".into()));
+            return Err(SsrfError(
+                "Webhook DNS resolved to blocked private IP".into(),
+            ));
         }
     }
 
@@ -178,7 +185,11 @@ mod tests {
         assert!(validate_webhook_url("https://[::127.0.0.1]/hook", false).is_err());
         assert!(validate_webhook_url("https://[64:ff9b::127.0.0.1]/hook", false).is_err());
         assert!(validate_webhook_url("https://[2002:7f00:0001::1]/hook", false).is_err());
-        assert!(validate_webhook_url("https://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/hook", false).is_err());
+        assert!(validate_webhook_url(
+            "https://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/hook",
+            false
+        )
+        .is_err());
         assert!(validate_webhook_url("https://127.0.0.1?foo=bar", false).is_err());
         assert!(validate_webhook_url("https://127.0.0.1#frag", false).is_err());
         assert!(validate_webhook_url("https://user:pass@93.184.216.34/hook", false).is_err());
@@ -186,6 +197,8 @@ mod tests {
         assert!(validate_webhook_url("https://93.184.216.34/hook\n", false).is_ok()); // trimmed
         assert!(validate_webhook_url("https://93.184.216.34/ho ok", false).is_err());
         assert!(validate_webhook_url("https://internal.service.local/hook", false).is_err());
+        assert!(validate_webhook_url("https://localhost./hook", false).is_err());
+        assert!(validate_webhook_url("https://[fec0::1]/hook", false).is_err());
         assert!(validate_webhook_url("http://hooks.example.com/hook", false).is_err());
         let ok = validate_webhook_url("https://93.184.216.34/webhook?a=1", false).unwrap();
         assert_eq!(ok.port, 443);

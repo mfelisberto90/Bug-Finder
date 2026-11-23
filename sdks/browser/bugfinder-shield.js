@@ -44,7 +44,9 @@
     refXhrAtInit: null,
     refWsAtInit: null,
     sentSigs: Object.create(null),
-    lockedDown: false
+    lockedDown: false,
+    timer: null,
+    observer: null
   };
 
   function parseShieldEndpoint(dsn) {
@@ -72,8 +74,18 @@
   }
 
   function randomSessionId() {
+    var cryptoObj = root.crypto || root.msCrypto;
+    if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+      var bytes = new Uint8Array(12);
+      cryptoObj.getRandomValues(bytes);
+      var out = "";
+      for (var i = 0; i < bytes.length; i++) {
+        out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+      }
+      return out;
+    }
     var s = "";
-    for (var i = 0; i < 24; i++) s += Math.floor(Math.random() * 16).toString(16);
+    for (var j = 0; j < 24; j++) s += Math.floor(Math.random() * 16).toString(16);
     return s;
   }
 
@@ -84,16 +96,18 @@
     try {
       if (origBeacon && raw.length <= 60000) {
         var payload = typeof Blob === "function"
-          ? new Blob([raw], { type: "application/json" })
+          ? new Blob([raw], { type: "text/plain;charset=UTF-8" })
           : raw;
         if (origBeacon(url, payload)) return;
       }
       if (origFetch) {
-        origFetch(url, {
+        origFetch.call(root, url, {
           method: "POST",
+          mode: "cors",
+          credentials: "omit",
           body: raw,
-          keepalive: true,
-          headers: { "Content-Type": "application/json" }
+          keepalive: raw.length <= 60000,
+          headers: { "Content-Type": "text/plain;charset=UTF-8" }
         }).catch(function () {});
       }
     } catch (_) {}
@@ -202,6 +216,7 @@
         detected.push("runtime_hook_tamper");
         details.hook = "fetch";
       } else if (
+        !cfg.allowFetchPatching &&
         cfg.refXhrAtInit &&
         typeof XMLHttpRequest !== "undefined" &&
         XMLHttpRequest.prototype &&
@@ -261,6 +276,7 @@
         }
       });
       if (document.documentElement) {
+        cfg.observer = obs;
         obs.observe(document.documentElement, { childList: true, subtree: true });
       }
     } catch (_) {}
@@ -312,13 +328,29 @@
         checkNow();
       }, 5000);
       if (t && typeof t.unref === "function") t.unref();
+      cfg.timer = t;
     }
+  }
+
+  function destroy() {
+    if (cfg.timer) {
+      try { clearInterval(cfg.timer); } catch (_) {}
+      cfg.timer = null;
+    }
+    if (cfg.observer) {
+      try { cfg.observer.disconnect(); } catch (_) {}
+      cfg.observer = null;
+    }
+    cfg.initialized = false;
+    cfg.lockedDown = false;
+    cfg.sentSigs = Object.create(null);
   }
 
   var api = {
     init: init,
     scan: checkNow,
     report: emitThreat,
+    destroy: destroy,
     isLockedDown: function () { return cfg.lockedDown; }
   };
   try {

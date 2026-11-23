@@ -5,7 +5,7 @@
 [![Binary](https://img.shields.io/badge/Single%20Binary-~6.5%20MB-2563eb)](#quickstart)
 [![Telemetry](https://img.shields.io/badge/Protocols-Sentry%20%7C%20GlitchTip%20%7C%20OTLP-7c3aed)](#connect-any-app-in-30-seconds)
 [![Security](https://img.shields.io/badge/Defense-Anti--REA%20Shield%20%2B%20FORCE%20RLS-dc2626)](#anti-rea-security-shield-secret-leak-radar--mini-ids)
-[![License: MIT](https://img.shields.io/badge/License-MIT-0d9488.svg)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0d9488.svg)](LICENSE)
 
 **Ultra-lightweight Error Tracking, Structured Logs, Performance Tracing, Uptime Heartbeats & Active Runtime Security (Anti-REA Shield + Mini-IDS) in pure Rust** — compiled into a single **~6.5 MB** native executable running at **~8–11 MB VmRSS**, with drop-in compatibility for **Sentry SDKs**, **GlitchTip clients**, and **OpenTelemetry OTLP/HTTP**.
 

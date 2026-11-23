@@ -46,12 +46,14 @@ pub struct AppState {
     pub shield_engine: ShieldEngine,
     pub oidc_client: Option<Arc<OidcClient>>,
     pub live_tx: broadcast::Sender<LiveStreamEvent>,
+    pub sse_sem: Arc<tokio::sync::Semaphore>,
 }
 
 pub async fn build_storage(config: &AppConfig) -> Result<Arc<dyn StorageBackend>, String> {
     if config.is_postgres() {
         let url = config.database_url.as_deref().unwrap_or("");
-        let pg = PostgresStorage::connect_with_key(url, !config.skip_migrations, config.app_key).await?;
+        let pg =
+            PostgresStorage::connect_with_key(url, !config.skip_migrations, config.app_key).await?;
         Ok(pg)
     } else {
         let sqlite = SqliteStorage::open_with_key(&config.sqlite_path(), config.app_key)?;
@@ -59,10 +61,7 @@ pub async fn build_storage(config: &AppConfig) -> Result<Arc<dyn StorageBackend>
     }
 }
 
-pub fn build_app_state(
-    config: Arc<AppConfig>,
-    storage: Arc<dyn StorageBackend>,
-) -> Arc<AppState> {
+pub fn build_app_state(config: Arc<AppConfig>, storage: Arc<dyn StorageBackend>) -> Arc<AppState> {
     let metrics = Arc::new(AppMetrics::default());
     let self_monitor = Arc::new(SelfMonitor::new(config.data_dir.clone()));
     let shield_engine = ShieldEngine::new();
@@ -101,5 +100,6 @@ pub fn build_app_state(
         shield_engine,
         oidc_client,
         live_tx,
+        sse_sem: Arc::new(tokio::sync::Semaphore::new(64)),
     })
 }

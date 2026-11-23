@@ -1,8 +1,6 @@
 use crate::config::AppConfig;
 use crate::domain::envelope::{parse_envelope, EnvelopeItem};
-use crate::domain::models::{
-    now_ms, LogLevel, NormalizedLog, ProjectFilters, TenantCtx,
-};
+use crate::domain::models::{now_ms, LogLevel, NormalizedLog, ProjectFilters, TenantCtx};
 use crate::domain::scrubber::Scrubber;
 use crate::domain::sourcemap::SourceMapV3;
 use crate::runtime::current_vm_rss_bytes;
@@ -10,7 +8,7 @@ use crate::storage::{IssueQueryParams, LogQueryParams};
 use crate::{build_storage, AppState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,6 +40,8 @@ pub struct SelfCheckItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfErrorRecord {
     pub id: u64,
+    #[serde(skip_serializing, default)]
+    pub organization_id: Option<i64>,
     pub timestamp_ms: i64,
     pub source: String,
     pub severity: String,
@@ -90,6 +90,8 @@ struct PersistedCrash {
 struct MonitorState {
     next_id: u64,
     acknowledged_up_to_id: u64,
+    acknowledged_per_org: HashMap<i64, u64>,
+    cleared_per_org: HashMap<i64, u64>,
     entries: VecDeque<SelfErrorRecord>,
 }
 
@@ -128,6 +130,7 @@ impl SelfMonitor {
                 if let Ok(crash) = serde_json::from_str::<PersistedCrash>(&raw) {
                     entries.push_back(SelfErrorRecord {
                         id: next_id,
+                        organization_id: None,
                         timestamp_ms: crash.timestamp_ms,
                         source: "rust_panic".to_string(),
                         severity: "error".to_string(),
@@ -147,6 +150,8 @@ impl SelfMonitor {
             inner: Mutex::new(MonitorState {
                 next_id,
                 acknowledged_up_to_id: 0,
+                acknowledged_per_org: HashMap::new(),
+                cleared_per_org: HashMap::new(),
                 entries,
             }),
         }
@@ -154,6 +159,30 @@ impl SelfMonitor {
 
     pub fn record(
         &self,
+        source: &str,
+        severity: &str,
+        component: &str,
+        message: &str,
+        detail: Option<&str>,
+    ) {
+        self.record_scoped(None, source, severity, component, message, detail);
+    }
+
+    pub fn record_for_org(
+        &self,
+        org_id: i64,
+        source: &str,
+        severity: &str,
+        component: &str,
+        message: &str,
+        detail: Option<&str>,
+    ) {
+        self.record_scoped(Some(org_id), source, severity, component, message, detail);
+    }
+
+    fn record_scoped(
+        &self,
+        organization_id: Option<i64>,
         source: &str,
         severity: &str,
         component: &str,
@@ -175,7 +204,8 @@ impl SelfMonitor {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pos) = guard.entries.iter().position(|e| {
-            e.source == clean_source
+            e.organization_id == organization_id
+                && e.source == clean_source
                 && e.component == clean_component
                 && e.message == clean_msg
         }) {
@@ -201,6 +231,7 @@ impl SelfMonitor {
         guard.next_id += 1;
         guard.entries.push_back(SelfErrorRecord {
             id,
+            organization_id,
             timestamp_ms: ts,
             source: clean_source,
             severity: clean_severity,
@@ -223,11 +254,46 @@ impl SelfMonitor {
         (list, unack)
     }
 
+    pub fn snapshot_for_org(&self, org_id: i64) -> (Vec<SelfErrorRecord>, usize) {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cleared = guard.cleared_per_org.get(&org_id).copied().unwrap_or(0);
+        let ack = guard
+            .acknowledged_per_org
+            .get(&org_id)
+            .copied()
+            .unwrap_or(guard.acknowledged_up_to_id)
+            .max(cleared);
+        let list: Vec<SelfErrorRecord> = guard
+            .entries
+            .iter()
+            .rev()
+            .filter(|e| {
+                (e.organization_id == Some(org_id) || e.organization_id.is_none()) && e.id > cleared
+            })
+            .cloned()
+            .collect();
+        let unack = list.iter().filter(|e| e.id > ack).count();
+        (list, unack)
+    }
+
     pub fn acknowledge_all(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.acknowledged_up_to_id = guard.next_id.saturating_sub(1);
         drop(guard);
         let _ = fs::remove_file(self.data_dir.join(CRASH_FILE_NAME));
+    }
+
+    pub fn acknowledge_for_org(&self, org_id: i64, is_owner: bool) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let top = guard.next_id.saturating_sub(1);
+        guard.acknowledged_per_org.insert(org_id, top);
+        if is_owner {
+            guard.acknowledged_up_to_id = top;
+        }
+        drop(guard);
+        if is_owner {
+            let _ = fs::remove_file(self.data_dir.join(CRASH_FILE_NAME));
+        }
     }
 
     pub fn clear_all(&self) {
@@ -236,6 +302,18 @@ impl SelfMonitor {
         guard.acknowledged_up_to_id = guard.next_id.saturating_sub(1);
         drop(guard);
         let _ = fs::remove_file(self.data_dir.join(CRASH_FILE_NAME));
+    }
+
+    pub fn clear_for_org(&self, org_id: i64, is_owner: bool) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let top = guard.next_id.saturating_sub(1);
+        guard.entries.retain(|e| e.organization_id != Some(org_id));
+        guard.acknowledged_per_org.insert(org_id, top);
+        guard.cleared_per_org.insert(org_id, top);
+        drop(guard);
+        if is_owner && org_id == 1 {
+            let _ = fs::remove_file(self.data_dir.join(CRASH_FILE_NAME));
+        }
     }
 
     pub fn uptime_sec(&self) -> u64 {
@@ -313,7 +391,10 @@ fn check_data_dir_item(data_dir: &Path) -> SelfCheckItem {
             category: "runtime".into(),
             title: "Data Directory Writable & Key Permissions".into(),
             detail: format!("Cannot write inside {}: {err}", data_dir.display()),
-            fix: Some(format!("Ensure user has read/write permissions on {}", data_dir.display())),
+            fix: Some(format!(
+                "Ensure user has read/write permissions on {}",
+                data_dir.display()
+            )),
         };
     }
 
@@ -347,7 +428,10 @@ fn check_data_dir_item(data_dir: &Path) -> SelfCheckItem {
         status: CheckStatus::Ok,
         category: "runtime".into(),
         title: "Data Directory Writable & Key Permissions".into(),
-        detail: format!("{} is writable and .app_key permissions are locked down (0600).", data_dir.display()),
+        detail: format!(
+            "{} is writable and .app_key permissions are locked down (0600).",
+            data_dir.display()
+        ),
         fix: None,
     }
 }
@@ -363,7 +447,9 @@ fn check_disk_budget_item(db_size_bytes: u64, max_db_mb: u64) -> SelfCheckItem {
             status: CheckStatus::Error,
             category: "runtime".into(),
             title: "Database Disk Budget".into(),
-            detail: format!("{mb:.2} MiB used of {max_db_mb} MiB limit ({pct:.1}%). Circuit breaker active."),
+            detail: format!(
+                "{mb:.2} MiB used of {max_db_mb} MiB limit ({pct:.1}%). Circuit breaker active."
+            ),
             fix: Some("Increase BUGFINDER_MAX_DB_MB or reduce BUGFINDER_RETENTION_DAYS.".into()),
         }
     } else if pct >= 80.0 {
@@ -373,7 +459,10 @@ fn check_disk_budget_item(db_size_bytes: u64, max_db_mb: u64) -> SelfCheckItem {
             category: "runtime".into(),
             title: "Database Disk Budget".into(),
             detail: format!("{mb:.2} MiB used of {max_db_mb} MiB limit ({pct:.1}%)."),
-            fix: Some("Approaching DB limit; review BUGFINDER_MAX_DB_MB or BUGFINDER_RETENTION_DAYS.".into()),
+            fix: Some(
+                "Approaching DB limit; review BUGFINDER_MAX_DB_MB or BUGFINDER_RETENTION_DAYS."
+                    .into(),
+            ),
         }
     } else {
         SelfCheckItem {
@@ -398,7 +487,9 @@ fn check_memory_item(vm_rss_bytes: Option<u64>) -> SelfCheckItem {
                     category: "runtime".into(),
                     title: "Process Memory Footprint (VmRSS)".into(),
                     detail: format!("Current VmRSS is {mb:.2} MiB (above 32 MiB soft target)."),
-                    fix: Some("Monitor active SSE clients or restart process after heavy burst.".into()),
+                    fix: Some(
+                        "Monitor active SSE clients or restart process after heavy burst.".into(),
+                    ),
                 }
             } else {
                 SelfCheckItem {
@@ -406,7 +497,9 @@ fn check_memory_item(vm_rss_bytes: Option<u64>) -> SelfCheckItem {
                     status: CheckStatus::Ok,
                     category: "runtime".into(),
                     title: "Process Memory Footprint (VmRSS)".into(),
-                    detail: format!("Current VmRSS is {mb:.2} MiB (ultra-low RAM target < 15 MiB nominal)."),
+                    detail: format!(
+                        "Current VmRSS is {mb:.2} MiB (ultra-low RAM target < 15 MiB nominal)."
+                    ),
                     fix: None,
                 }
             }
@@ -429,8 +522,12 @@ fn check_security_posture_item(config: &AppConfig) -> SelfCheckItem {
             status: CheckStatus::Error,
             category: "security".into(),
             title: "Production Security Posture".into(),
-            detail: "BUGFINDER_DEV_ALLOW_HTTP_WEBHOOKS is enabled while BUGFINDER_ENV is production.".into(),
-            fix: Some("Unset BUGFINDER_DEV_ALLOW_HTTP_WEBHOOKS or set it to 0 in production.".into()),
+            detail:
+                "BUGFINDER_DEV_ALLOW_HTTP_WEBHOOKS is enabled while BUGFINDER_ENV is production."
+                    .into(),
+            fix: Some(
+                "Unset BUGFINDER_DEV_ALLOW_HTTP_WEBHOOKS or set it to 0 in production.".into(),
+            ),
         }
     } else if !config.is_dev && !config.force_secure_cookies && config.trusted_proxies.is_empty() {
         SelfCheckItem {
@@ -481,7 +578,9 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
             };
             let fix = match status {
                 CheckStatus::Ok => None,
-                CheckStatus::Warn => Some("Enable WAL mode on SQLite or check database file lock.".into()),
+                CheckStatus::Warn => {
+                    Some("Enable WAL mode on SQLite or check database file lock.".into())
+                }
                 CheckStatus::Error => Some(
                     "Verify database file permissions/PostgreSQL FORCE RLS & NOBYPASSRLS role."
                         .into(),
@@ -504,27 +603,62 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
                 "Storage health check failed",
                 Some(&err),
             );
-            state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .self_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             checks.push(SelfCheckItem {
                 id: "storage_health".into(),
                 status: CheckStatus::Error,
                 category: "runtime".into(),
                 title: "Storage Engine & Integrity".into(),
                 detail: scrub_self_text(&err, 256),
-                fix: Some("Inspect SQLite file / DATABASE_URL connectivity and file permissions.".into()),
+                fix: Some(
+                    "Inspect SQLite file / DATABASE_URL connectivity and file permissions.".into(),
+                ),
             });
         }
     }
 
-    // 2. Disk budget
+    // 2. Disk budget + blocking FS/proc diagnostics off the async worker
     let db_size_bytes = state.storage.db_size_bytes().await;
-    checks.push(check_disk_budget_item(db_size_bytes, state.config.max_db_mb));
+    checks.push(check_disk_budget_item(
+        db_size_bytes,
+        state.config.max_db_mb,
+    ));
+
+    let data_dir_clone = state.config.data_dir.clone();
+    let (data_dir_item, vm_rss_bytes, rt_integrity) = tokio::task::spawn_blocking(move || {
+        (
+            check_data_dir_item(&data_dir_clone),
+            current_vm_rss_bytes(),
+            crate::security::anti_rea::probe_self_runtime_integrity(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            SelfCheckItem {
+                id: "data_dir_writable".into(),
+                status: CheckStatus::Warn,
+                category: "runtime".into(),
+                title: "Data Directory Writable & Key Permissions".into(),
+                detail: "Diagnostics task join failed.".into(),
+                fix: None,
+            },
+            None,
+            crate::security::anti_rea::RuntimeIntegrityReport {
+                ok: true,
+                indicators: Vec::new(),
+                detail: "Runtime integrity check unavailable".into(),
+            },
+        )
+    });
 
     // 3. Data dir & key permissions
-    checks.push(check_data_dir_item(&state.config.data_dir));
+    checks.push(data_dir_item);
 
     // 4. Memory footprint
-    let vm_rss_bytes = current_vm_rss_bytes();
     checks.push(check_memory_item(vm_rss_bytes));
 
     // 5. BatchWriter queue depth
@@ -574,7 +708,9 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
                     category: "setup".into(),
                     title: "Projects & Active DSN Key".into(),
                     detail: format!("{} projects, {active_dsns} active DSN keys.", list.len()),
-                    fix: Some("Open 'Projects & SDK' to create a project and issue a DSN key.".into()),
+                    fix: Some(
+                        "Open 'Projects & SDK' to create a project and issue a DSN key.".into(),
+                    ),
                 });
             } else {
                 checks.push(SelfCheckItem {
@@ -582,7 +718,10 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
                     status: CheckStatus::Ok,
                     category: "setup".into(),
                     title: "Projects & Active DSN Key".into(),
-                    detail: format!("{} project(s) configured with {active_dsns} active DSN key(s).", list.len()),
+                    detail: format!(
+                        "{} project(s) configured with {active_dsns} active DSN key(s).",
+                        list.len()
+                    ),
                     fix: None,
                 });
             }
@@ -663,15 +802,21 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
             status: CheckStatus::Warn,
             category: "setup".into(),
             title: "Telemetry Ingestion Active".into(),
-            detail: "No events or structured logs have been ingested yet for this organization.".into(),
-            fix: Some("Click 'Run End-to-End Self-Test' or configure the 1-line SDK snippet below.".into()),
+            detail: "No events or structured logs have been ingested yet for this organization."
+                .into(),
+            fix: Some(
+                "Click 'Run End-to-End Self-Test' or configure the 1-line SDK snippet below."
+                    .into(),
+            ),
         });
     }
 
     // 8. Alert rules & SMTP configuration
     match state.storage.list_alert_rules(ctx).await {
         Ok(rules) => {
-            let needs_smtp = rules.iter().any(|r| r.channel_type.eq_ignore_ascii_case("email"));
+            let needs_smtp = rules
+                .iter()
+                .any(|r| r.channel_type.eq_ignore_ascii_case("email"));
             if needs_smtp && state.config.smtp.is_none() {
                 checks.push(SelfCheckItem {
                     id: "alerts_configured".into(),
@@ -688,7 +833,10 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
                     category: "setup".into(),
                     title: "Alert Rules & Delivery Channels".into(),
                     detail: "No alert rules configured yet.".into(),
-                    fix: Some("Open 'Uptime & Alerts' to add a Webhook, Slack, Discord, or Email rule.".into()),
+                    fix: Some(
+                        "Open 'Uptime & Alerts' to add a Webhook, Slack, Discord, or Email rule."
+                            .into(),
+                    ),
                 });
             } else {
                 checks.push(SelfCheckItem {
@@ -794,7 +942,10 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
             category: "security".into(),
             title: "Owner Multi-Factor Authentication (TOTP / Passkey)".into(),
             detail: format!("{n} owner account(s) do not have MFA enabled yet."),
-            fix: Some("Open Security Shield -> Account & MFA to enroll TOTP or a WebAuthn Passkey.".into()),
+            fix: Some(
+                "Open Security Shield -> Account & MFA to enroll TOTP or a WebAuthn Passkey."
+                    .into(),
+            ),
         }),
         Err(err) => checks.push(SelfCheckItem {
             id: "mfa_owner_posture".into(),
@@ -862,11 +1013,12 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
         status: CheckStatus::Ok,
         category: "security".into(),
         title: "At-Rest AEAD Encryption (HKDF-SHA256 + AES-256-GCM)".into(),
-        detail: "AES-256-GCM AEAD active for MFA TOTP secrets and webhook HMAC secrets via HKDF-SHA256.".into(),
+        detail:
+            "AES-256-GCM AEAD active for MFA TOTP secrets and webhook HMAC secrets via HKDF-SHA256."
+                .into(),
         fix: None,
     });
 
-    let rt_integrity = crate::security::anti_rea::probe_self_runtime_integrity();
     checks.push(SelfCheckItem {
         id: "runtime_anti_rea_integrity".into(),
         status: if rt_integrity.ok {
@@ -886,8 +1038,9 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
         },
     });
 
-    // 11. Internal self errors
-    let (self_errors, unacknowledged_error_count) = state.self_monitor.snapshot();
+    // 11. Internal self errors (tenant-scoped view)
+    let (self_errors, unacknowledged_error_count) =
+        state.self_monitor.snapshot_for_org(ctx.organization_id);
     let has_unack_err = self_errors
         .iter()
         .take(unacknowledged_error_count)
@@ -974,7 +1127,10 @@ pub async fn run_live_self_probe(
             state
                 .self_monitor
                 .record("self_probe", "error", "storage", &msg, None);
-            state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .self_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             steps.push(SelfProbeStep {
                 name: "storage_roundtrip".into(),
                 ok: false,
@@ -989,7 +1145,10 @@ pub async fn run_live_self_probe(
                 "Storage roundtrip probe failed",
                 Some(&err),
             );
-            state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .self_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             steps.push(SelfProbeStep {
                 name: "storage_roundtrip".into(),
                 ok: false,
@@ -1011,7 +1170,10 @@ pub async fn run_live_self_probe(
             "PII/secret scrubber self-test failed",
             None,
         );
-        state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .self_errors_total
+            .fetch_add(1, Ordering::Relaxed);
     }
     steps.push(SelfProbeStep {
         name: "pii_scrubber".into(),
@@ -1029,7 +1191,8 @@ pub async fn run_live_self_probe(
 {"version":2,"items":[{"timestamp":1730000000,"level":"info","severity_number":9,"body":"selfcheck probe"}]}
 "#;
     match parse_envelope(env_payload) {
-        Ok(parsed) if matches!(parsed.items.first(), Some(EnvelopeItem::Logs(l)) if l.len() == 1) => {
+        Ok(parsed) if matches!(parsed.items.first(), Some(EnvelopeItem::Logs(l)) if l.len() == 1) =>
+        {
             steps.push(SelfProbeStep {
                 name: "envelope_parser".into(),
                 ok: true,
@@ -1044,7 +1207,10 @@ pub async fn run_live_self_probe(
                 "Envelope parser self-test failed",
                 None,
             );
-            state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .self_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             steps.push(SelfProbeStep {
                 name: "envelope_parser".into(),
                 ok: false,
@@ -1068,7 +1234,10 @@ pub async fn run_live_self_probe(
             "SourceMap v3 VLQ self-test failed",
             None,
         );
-        state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .self_errors_total
+            .fetch_add(1, Ordering::Relaxed);
     }
     steps.push(SelfProbeStep {
         name: "sourcemap_vlq".into(),
@@ -1099,13 +1268,15 @@ pub async fn run_live_self_probe(
                     span_id: None,
                     attributes: json!({ "self_check": true, "project": proj.slug }),
                 };
-                match state.batch_writer.try_enqueue(crate::storage::IngestWriteItem::Logs {
-                    organization_id: ctx.organization_id,
-                    project_id: proj.id,
-                    project_slug: proj.slug.clone(),
-                    auto_promote_level: None,
-                    logs: vec![log],
-                }) {
+                match state
+                    .batch_writer
+                    .try_enqueue(crate::storage::IngestWriteItem::Logs {
+                        organization_id: ctx.organization_id,
+                        project_id: proj.id,
+                        project_slug: proj.slug.clone(),
+                        auto_promote_level: None,
+                        logs: vec![log],
+                    }) {
                     Ok(()) => {
                         state.batch_writer.flush_now().await;
                         match state
@@ -1130,12 +1301,20 @@ pub async fn run_live_self_probe(
                             .await
                         {
                             Ok(rows) if rows.iter().any(|r| r.body.contains(&marker)) => {
-                                state.metrics.ingest_logs_total.fetch_add(1, Ordering::Relaxed);
+                                state
+                                    .metrics
+                                    .ingest_logs_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let fts_label = if state.config.is_postgres() {
+                                    "PG tsvector verified"
+                                } else {
+                                    "FTS5 verified"
+                                };
                                 steps.push(SelfProbeStep {
                                     name: "ingest_pipeline".into(),
                                     ok: true,
                                     detail: format!(
-                                        "Queued, flushed, indexed, and queried synthetic log in project '{}' (FTS5 verified).",
+                                        "Queued, flushed, indexed, and queried synthetic log in project '{}' ({fts_label}).",
                                         proj.slug
                                     ),
                                 });
@@ -1148,7 +1327,10 @@ pub async fn run_live_self_probe(
                                     "Synthetic log missing after flush",
                                     None,
                                 );
-                                state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                                state
+                                    .metrics
+                                    .self_errors_total
+                                    .fetch_add(1, Ordering::Relaxed);
                                 steps.push(SelfProbeStep {
                                     name: "ingest_pipeline".into(),
                                     ok: false,
@@ -1163,7 +1345,10 @@ pub async fn run_live_self_probe(
                                     "Synthetic log query failed",
                                     Some(&err),
                                 );
-                                state.metrics.self_errors_total.fetch_add(1, Ordering::Relaxed);
+                                state
+                                    .metrics
+                                    .self_errors_total
+                                    .fetch_add(1, Ordering::Relaxed);
                                 steps.push(SelfProbeStep {
                                     name: "ingest_pipeline".into(),
                                     ok: false,
@@ -1185,7 +1370,8 @@ pub async fn run_live_self_probe(
                 steps.push(SelfProbeStep {
                     name: "ingest_pipeline".into(),
                     ok: false,
-                    detail: "No project available in organization to verify ingestion pipeline.".into(),
+                    detail: "No project available in organization to verify ingestion pipeline."
+                        .into(),
                 });
             }
         }
@@ -1202,7 +1388,11 @@ pub async fn run_live_self_probe(
     SelfProbeResult { ok, steps, report }
 }
 
-pub async fn run_doctor_cli(config: &AppConfig, explicit_url: Option<&str>, json_mode: bool) -> i32 {
+pub async fn run_doctor_cli(
+    config: &AppConfig,
+    explicit_url: Option<&str>,
+    json_mode: bool,
+) -> i32 {
     let mut items: Vec<SelfCheckItem> = Vec::new();
 
     // 1. Data directory & .app_key permissions
@@ -1222,7 +1412,9 @@ pub async fn run_doctor_cli(config: &AppConfig, explicit_url: Option<&str>, json
             category: "runtime".into(),
             title: "Previous Fatal Self-Crash".into(),
             detail: format!("Crash artifact found at {}: {msg}", crash_path.display()),
-            fix: Some("Inspect crash details in UI Auto-Check tab and acknowledge once resolved.".into()),
+            fix: Some(
+                "Inspect crash details in UI Auto-Check tab and acknowledge once resolved.".into(),
+            ),
         });
     } else {
         items.push(SelfCheckItem {
@@ -1279,7 +1471,10 @@ pub async fn run_doctor_cli(config: &AppConfig, explicit_url: Option<&str>, json
                     category: "setup".into(),
                     title: "Initial Organization & Owner Setup".into(),
                     detail: "No organization or admin account created yet.".into(),
-                    fix: Some("Start Bug-Finder and open http://127.0.0.1:8080 to run 1-minute setup.".into()),
+                    fix: Some(
+                        "Start Bug-Finder and open http://127.0.0.1:8080 to run 1-minute setup."
+                            .into(),
+                    ),
                 }),
                 Ok(false) => items.push(SelfCheckItem {
                     id: "initial_setup".into(),
@@ -1436,7 +1631,9 @@ mod tests {
         let (items, unack) = monitor.snapshot();
         assert_eq!(items.len(), 1);
         assert_eq!(unack, 1);
-        assert!(!items[0].message.contains("secret_unit_test_value_1234567890"));
+        assert!(!items[0]
+            .message
+            .contains("secret_unit_test_value_1234567890"));
         assert!(items[0].message.contains("[Filtered]"));
         assert!(items[0]
             .detail
@@ -1469,6 +1666,20 @@ mod tests {
         assert_eq!(bounded.len(), 128);
         assert_eq!(bounded[0].message, "err #139");
 
+        // Org A & Org B isolation check
+        monitor.record_for_org(1, "ui_client", "error", "spa", "Org 1 failure", None);
+        monitor.record_for_org(2, "ui_client", "error", "spa", "Org 2 failure", None);
+        let (org1_items, _) = monitor.snapshot_for_org(1);
+        assert!(org1_items.iter().all(|e| e.organization_id != Some(2)));
+        assert!(!org1_items
+            .iter()
+            .any(|e| e.message.contains("Org 2 failure")));
+        monitor.clear_for_org(2, false);
+        let (org1_after_org2_clear, _) = monitor.snapshot_for_org(1);
+        assert!(org1_after_org2_clear
+            .iter()
+            .any(|e| e.message.contains("Org 1 failure")));
+
         monitor.clear_all();
         let (cleared, unack_cleared) = monitor.snapshot();
         assert!(cleared.is_empty());
@@ -1490,7 +1701,9 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(unack, 1);
         assert_eq!(items[0].source, "rust_panic");
-        assert!(!items[0].message.contains("bf_secret_crash_token_1234567890"));
+        assert!(!items[0]
+            .message
+            .contains("bf_secret_crash_token_1234567890"));
         assert!(items[0].message.contains("[Filtered]"));
 
         monitor.acknowledge_all();

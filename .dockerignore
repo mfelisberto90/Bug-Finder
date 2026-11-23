@@ -1,0 +1,16 @@
+.git/
+target/
+dist/
+data/
+ui/node_modules/
+ui/dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+*.log
+*.profraw
+*.profdata
+docs/screenshots/*.raw

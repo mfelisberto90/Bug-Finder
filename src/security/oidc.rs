@@ -38,6 +38,8 @@ pub struct OidcDiscovery {
 pub struct JwkKey {
     pub kid: Option<String>,
     pub kty: String,
+    #[serde(default, rename = "use")]
+    pub use_: Option<String>,
     pub alg: Option<String>,
     pub crv: Option<String>,
     pub n: Option<String>,
@@ -198,7 +200,22 @@ fn encode_pkcs1_rsa_pub_der(n: &[u8], e: &[u8]) -> Result<Vec<u8>, String> {
     Ok(seq)
 }
 
-fn verify_with_jwk(alg: &str, key: &JwkKey, signing_input: &[u8], sig: &[u8]) -> Result<(), String> {
+fn verify_with_jwk(
+    alg: &str,
+    key: &JwkKey,
+    signing_input: &[u8],
+    sig: &[u8],
+) -> Result<(), String> {
+    if let Some(ref k_use) = key.use_ {
+        if k_use != "sig" {
+            return Err("JWK key use is not sig".into());
+        }
+    }
+    if let Some(ref k_alg) = key.alg {
+        if k_alg != alg {
+            return Err("JWK alg mismatch with JWT header".into());
+        }
+    }
     match alg {
         "RS256" => {
             if key.kty != "RSA" {
@@ -397,6 +414,24 @@ impl OidcClient {
         Ok((target.url, agent))
     }
 
+    fn read_bounded_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        resp: ureq::Response,
+        label: &str,
+    ) -> Result<T, String> {
+        use std::io::Read;
+        const MAX_OIDC_BODY: usize = 512 * 1024;
+        let mut buf = Vec::with_capacity(8192);
+        resp.into_reader()
+            .take((MAX_OIDC_BODY + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| format!("{label} read failed"))?;
+        if buf.len() > MAX_OIDC_BODY {
+            return Err(format!("{label} exceeded 512 KiB"));
+        }
+        serde_json::from_slice(&buf).map_err(|_| format!("Invalid {label} JSON"))
+    }
+
     fn fetch_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, String> {
         let (safe_url, agent) = self.build_http_agent(url)?;
         let resp = agent
@@ -404,16 +439,13 @@ impl OidcClient {
             .set("Accept", "application/json")
             .call()
             .map_err(|e| format!("OIDC HTTP GET failed: {e}"))?;
-        let text = resp
-            .into_string()
-            .map_err(|e| format!("OIDC response read failed: {e}"))?;
-        if text.len() > 512 * 1024 {
-            return Err("OIDC metadata exceeds 512 KiB".into());
-        }
-        serde_json::from_str(&text).map_err(|e| format!("OIDC JSON parse failed: {e}"))
+        self.read_bounded_json(resp, "OIDC metadata")
     }
 
-    pub fn load_metadata_blocking(&self, force_refresh: bool) -> Result<(OidcDiscovery, JwkSet), String> {
+    pub fn load_metadata_blocking(
+        &self,
+        force_refresh: bool,
+    ) -> Result<(OidcDiscovery, JwkSet), String> {
         if !force_refresh {
             let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = guard.as_ref() {
@@ -442,13 +474,26 @@ impl OidcClient {
         Ok((doc, jwks))
     }
 
-    pub fn build_authorize_url_blocking(&self, state: &str, nonce: &str, code_verifier: &str) -> Result<String, String> {
+    pub fn build_authorize_url_blocking(
+        &self,
+        state: &str,
+        nonce: &str,
+        code_verifier: &str,
+    ) -> Result<String, String> {
         let (doc, _) = self.load_metadata_blocking(false)?;
+        let auth_ep = doc.authorization_endpoint.trim();
+        if auth_ep.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err("OIDC authorization_endpoint contains invalid characters".into());
+        }
+        let scheme_ok = auth_ep.starts_with("https://")
+            || (self.allow_http_dev && auth_ep.starts_with("http://"));
+        if !scheme_ok {
+            return Err("OIDC authorization_endpoint must use https://".into());
+        }
         let challenge = pkce_s256_challenge(code_verifier);
-        let sep = if doc.authorization_endpoint.contains('?') { '&' } else { '?' };
+        let sep = if auth_ep.contains('?') { '&' } else { '?' };
         Ok(format!(
-            "{}{sep}response_type=code&client_id={}&redirect_uri={}&scope=openid%20email%20profile&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
-            doc.authorization_endpoint,
+            "{auth_ep}{sep}response_type=code&client_id={}&redirect_uri={}&scope=openid%20email%20profile&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
             url_encode(&self.config.client_id),
             url_encode(&self.config.redirect_uri),
             url_encode(state),
@@ -482,11 +527,7 @@ impl OidcClient {
             .set("Accept", "application/json")
             .send_string(&body)
             .map_err(|_| "OIDC token exchange request failed".to_string())?;
-        let text = resp
-            .into_string()
-            .map_err(|_| "OIDC token response read failed".to_string())?;
-        let val: Value =
-            serde_json::from_str(&text).map_err(|_| "Invalid OIDC token response JSON".to_string())?;
+        let val: Value = self.read_bounded_json(resp, "OIDC token response")?;
         let id_token = val
             .get("id_token")
             .and_then(|v| v.as_str())
@@ -552,8 +593,11 @@ mod tests {
         let rng = SystemRandom::new();
 
         // 1. ES256 P-256 test key & token
-        let pkcs8_ec = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-        let ec_kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_ec.as_ref(), &rng).unwrap();
+        let pkcs8_ec =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let ec_kp =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_ec.as_ref(), &rng)
+                .unwrap();
         let ec_pub = ec_kp.public_key().as_ref();
         assert_eq!(ec_pub.len(), 65);
 
@@ -561,6 +605,7 @@ mod tests {
             keys: vec![JwkKey {
                 kid: Some("ec1".into()),
                 kty: "EC".into(),
+                use_: Some("sig".into()),
                 alg: Some("ES256".into()),
                 crv: Some("P-256".into()),
                 n: None,
@@ -601,14 +646,46 @@ mod tests {
         // Negative cases: alg:none, HS256, expired, wrong nonce, unverified email
         let none_hdr = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let none_jwt = format!("{none_hdr}.{pay}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
-        assert!(verify_id_token_jwt(&none_jwt, &jwks, "https://idp.example.com", "client-1", "n-ok", 1_900_000_000).is_err());
+        assert!(verify_id_token_jwt(
+            &none_jwt,
+            &jwks,
+            "https://idp.example.com",
+            "client-1",
+            "n-ok",
+            1_900_000_000
+        )
+        .is_err());
 
         let hs_hdr = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","kid":"ec1"}"#);
         let hs_jwt = format!("{hs_hdr}.{pay}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
-        assert!(verify_id_token_jwt(&hs_jwt, &jwks, "https://idp.example.com", "client-1", "n-ok", 1_900_000_000).is_err());
+        assert!(verify_id_token_jwt(
+            &hs_jwt,
+            &jwks,
+            "https://idp.example.com",
+            "client-1",
+            "n-ok",
+            1_900_000_000
+        )
+        .is_err());
 
-        assert!(verify_id_token_jwt(&jwt, &jwks, "https://idp.example.com", "client-1", "wrong-nonce", 1_900_000_000).is_err());
-        assert!(verify_id_token_jwt(&jwt, &jwks, "https://idp.example.com", "client-1", "n-ok", 2_000_000_500).is_err());
+        assert!(verify_id_token_jwt(
+            &jwt,
+            &jwks,
+            "https://idp.example.com",
+            "client-1",
+            "wrong-nonce",
+            1_900_000_000
+        )
+        .is_err());
+        assert!(verify_id_token_jwt(
+            &jwt,
+            &jwks,
+            "https://idp.example.com",
+            "client-1",
+            "n-ok",
+            2_000_000_500
+        )
+        .is_err());
 
         // 2. EdDSA Ed25519 test key & token
         let pkcs8_ed = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -617,6 +694,7 @@ mod tests {
             keys: vec![JwkKey {
                 kid: Some("ed1".into()),
                 kty: "OKP".into(),
+                use_: Some("sig".into()),
                 alg: Some("EdDSA".into()),
                 crv: Some("Ed25519".into()),
                 n: None,
@@ -629,7 +707,53 @@ mod tests {
         let ed_msg = format!("{ed_hdr}.{pay}");
         let ed_sig = ed_kp.sign(ed_msg.as_bytes());
         let ed_jwt = format!("{ed_msg}.{}", URL_SAFE_NO_PAD.encode(ed_sig.as_ref()));
-        assert!(verify_id_token_jwt(&ed_jwt, &ed_jwks, "https://idp.example.com", "client-1", "n-ok", 1_900_000_000).is_ok());
+        assert!(verify_id_token_jwt(
+            &ed_jwt,
+            &ed_jwks,
+            "https://idp.example.com",
+            "client-1",
+            "n-ok",
+            1_900_000_000
+        )
+        .is_ok());
+
+        // Reject unverified email and enc-use JWK
+        let unverified_pay = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "iss": "https://idp.example.com",
+                "sub": "u-1",
+                "aud": "client-1",
+                "exp": 2_000_000_000i64,
+                "nonce": "n-ok",
+                "email": "dev@example.com",
+                "email_verified": false
+            }))
+            .unwrap(),
+        );
+        let unv_msg = format!("{hdr}.{unverified_pay}");
+        let unv_sig = ec_kp.sign(&rng, unv_msg.as_bytes()).unwrap();
+        let unv_jwt = format!("{unv_msg}.{}", URL_SAFE_NO_PAD.encode(unv_sig.as_ref()));
+        assert!(verify_id_token_jwt(
+            &unv_jwt,
+            &jwks,
+            "https://idp.example.com",
+            "client-1",
+            "n-ok",
+            1_900_000_000
+        )
+        .is_err());
+
+        let mut enc_only = ed_jwks.clone();
+        enc_only.keys[0].use_ = Some("enc".into());
+        assert!(verify_id_token_jwt(
+            &ed_jwt,
+            &enc_only,
+            "https://idp.example.com",
+            "client-1",
+            "n-ok",
+            1_900_000_000
+        )
+        .is_err());
 
         // Also validate PKCS#1 RSA DER encoder produces valid ASN.1 sequence
         let fake_n = vec![0xab; 256];
