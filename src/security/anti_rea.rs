@@ -32,7 +32,7 @@ fn ids_rx() -> &'static IdsRegexes {
             r#"(?i)(?:\bunion\s+(?:all\s+)?select\s+(?:null|\d+|'|")|'\s*or\s+'?1'?\s*=\s*'?1|;\s*(?:waitfor\s+delay|pg_sleep\s*\(|sleep\s*\(\s*\d))"#,
         ),
         traversal: build_ascii_rx(
-            r"(?i)(?:(?:\.\./|\.\.\\|%2e%2e/|%2e%2e%2f){2,})(?:etc/passwd|etc/shadow|win\.ini|proc/self|\.env\b|\.git/config)",
+            r"(?i)(?:(?:\.\./|\.\.\\|%2e%2e/|%2e%2e%2f){1,})(?:etc/passwd|etc/shadow|win\.ini|proc/self|\.env\b|\.git/config)|(?:/etc/passwd\b|/etc/shadow\b|/proc/self/environ\b)",
         ),
         ssrf: build_ascii_rx(
             r"(?i)(?:169\.254\.169\.254/latest/meta-data|metadata\.google\.internal/computemetadata)",
@@ -236,6 +236,8 @@ pub fn score_signals(signals: &[String]) -> Option<ScoredSignals> {
             "canary_route_hit" => (75, "anti_rea"),
             "injection_probe" => (75, "log_ids"),
             "honeypot_access" => (70, "anti_rea"),
+            "scanner_user_agent" => (70, "edge_waf"),
+            "anomalous_http_probe" => (70, "edge_waf"),
             "sourcemap_harvest" => (65, "anti_rea"),
             "idor_or_enum_burst" => (65, "log_ids"),
             "secret_leak" => (60, "secret_leak"),
@@ -254,6 +256,8 @@ pub fn score_signals(signals: &[String]) -> Option<ScoredSignals> {
                 "canary_route_hit" => "canary_route_hit",
                 "injection_probe" => "injection_probe",
                 "honeypot_access" => "honeypot_access",
+                "scanner_user_agent" => "scanner_user_agent",
+                "anomalous_http_probe" => "anomalous_http_probe",
                 "sourcemap_harvest" => "sourcemap_harvest",
                 "idor_or_enum_burst" => "idor_or_enum_burst",
                 "secret_leak" => "secret_leak",
@@ -368,6 +372,63 @@ fn detect_probe_in_text(text: &str) -> Option<&'static str> {
         return Some("jndi_ssti");
     }
     None
+}
+
+fn decode_percent_once(input: &[u8], max_bytes: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(input.len().min(max_bytes));
+    let mut had_null = false;
+    let mut i = 0usize;
+    let limit = input.len().min(max_bytes);
+    while i < limit {
+        let b = input[i];
+        if b == 0 {
+            had_null = true;
+            i += 1;
+            continue;
+        }
+        if b == b'%' && i + 2 < limit {
+            let hi = (input[i + 1] as char).to_digit(16);
+            let lo = (input[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                let decoded = ((h << 4) | l) as u8;
+                if decoded == 0 {
+                    had_null = true;
+                } else {
+                    out.push(decoded);
+                }
+                i += 3;
+                continue;
+            }
+        }
+        if b == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    (out, had_null)
+}
+
+/// Bounded `< 5 µs` HTTP URI/query exploit inspector (2-pass percent-decoding + linear ASCII regexes).
+/// Immune to ReDoS and CPU amplification attacks.
+pub fn detect_http_exploit_probe(raw_uri: &str) -> Option<&'static str> {
+    if raw_uri.len() > 4096 {
+        return Some("uri_overflow");
+    }
+    if raw_uri.as_bytes().contains(&0) {
+        return Some("null_byte");
+    }
+    let (pass1, null1) = decode_percent_once(raw_uri.as_bytes(), 4096);
+    if null1 {
+        return Some("null_byte");
+    }
+    let (pass2, null2) = decode_percent_once(&pass1, 4096);
+    if null2 {
+        return Some("null_byte");
+    }
+    let decoded = String::from_utf8_lossy(&pass2);
+    detect_probe_in_text(&decoded).or_else(|| detect_probe_in_text(raw_uri))
 }
 
 fn extract_http_status(attrs: &Value) -> Option<u16> {
@@ -712,5 +773,38 @@ mod tests {
         assert_eq!(h1a, h1b);
         assert_eq!(h1a.len(), 64);
         assert_ne!(h1a, h2);
+    }
+
+    #[test]
+    fn http_exploit_probe_catches_double_encoded_attacks_and_allows_normal_queries() {
+        assert_eq!(
+            detect_http_exploit_probe("/items?id=1%27%20UNION%20SELECT%20NULL,NULL"),
+            Some("sqli")
+        );
+        assert_eq!(
+            detect_http_exploit_probe("/download?f=%252e%252e%252fetc%252fpasswd"),
+            Some("path_traversal")
+        );
+        assert_eq!(
+            detect_http_exploit_probe("/file?name=report.pdf%00.png"),
+            Some("null_byte")
+        );
+        assert_eq!(
+            detect_http_exploit_probe(&format!("/search?q={}", "a".repeat(4100))),
+            Some("uri_overflow")
+        );
+        assert!(detect_http_exploit_probe(
+            "/api/0/organizations/acme/issues/?query=TypeError+Failed+to+fetch&limit=50"
+        )
+        .is_none());
+
+        let scored = score_signals(&[
+            "scanner_user_agent".to_string(),
+            "anomalous_http_probe".to_string(),
+        ])
+        .expect("edge_waf signals must score");
+        assert_eq!(scored.category, "edge_waf");
+        assert_eq!(scored.risk_score, 100);
+        assert_eq!(scored.severity, "critical");
     }
 }

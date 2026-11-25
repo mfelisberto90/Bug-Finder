@@ -26,22 +26,107 @@ const SCANNER_USER_AGENTS: &[&str] = &[
     "nikto",
     "ffuf",
     "gobuster",
+    "feroxbuster",
     "masscan",
     "zgrab",
     "dirbuster",
+    "wpscan",
+    "acunetix",
+    "nessus",
+    "havij",
+    "nmap scripting engine",
 ];
 
-const CANARY_PATHS: &[&str] = &[
+const CANARY_EXACT_OR_PREFIXES: &[&str] = &[
     "/.env",
-    "/.git/config",
+    "/.git",
+    "/.aws",
+    "/.ssh",
+    "/.svn",
+    "/.ds_store",
+    "/wp-admin",
     "/wp-login.php",
+    "/wp-includes",
     "/xmlrpc.php",
     "/phpmyadmin",
+    "/pma",
     "/admin.php",
+    "/config.php",
+    "/vendor/phpunit",
+    "/actuator",
+    "/server-status",
+    "/server-info",
+    "/cgi-bin/",
 ];
+
+const SENSITIVE_DUMP_SUFFIXES: &[&str] = &[
+    ".sql", ".sql.gz", ".bak", ".old", ".swp", ".orig", ".env.bak",
+];
+
+const BENIGN_404_ASSET_SUFFIXES: &[&str] = &[
+    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".css", ".txt",
+];
+
+/// Matches decoy canary endpoints, nested dotfiles (`/api/.env`, `/v1/.git/HEAD`), and DB/backup
+/// dump probes while explicitly exempting RFC 8615 `/.well-known/*` browser/WebAuthn routes.
+pub fn is_canary_or_dotfile_probe(path: &str) -> bool {
+    let low = path.trim().to_ascii_lowercase();
+    if low.starts_with("/.well-known/") || low == "/.well-known" {
+        return false;
+    }
+    if CANARY_EXACT_OR_PREFIXES.iter().any(|p| {
+        low == *p
+            || low
+                .strip_prefix(*p)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('.'))
+    }) {
+        return true;
+    }
+    if SENSITIVE_DUMP_SUFFIXES.iter().any(|ext| low.ends_with(ext)) {
+        return true;
+    }
+    for seg in low.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg == ".env"
+            || seg.starts_with(".env.")
+            || seg == ".git"
+            || seg == ".aws"
+            || seg == ".ssh"
+            || seg == ".svn"
+            || seg == ".htpasswd"
+            || seg == ".htaccess"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rejects HTTP/WebDAV/proxy verbs that legitimate browsers and Sentry/OTLP SDKs never emit.
+pub fn is_anomalous_http_method(method: &str) -> bool {
+    matches!(
+        method,
+        "TRACE"
+            | "TRACK"
+            | "CONNECT"
+            | "PROPFIND"
+            | "PROPPATCH"
+            | "MKCOL"
+            | "COPY"
+            | "MOVE"
+            | "LOCK"
+            | "UNLOCK"
+            | "SEARCH"
+            | "DEBUG"
+    )
+}
 
 pub struct ScannerGuard {
     bans: Mutex<BoundedMap<String, Instant>>,
+    strikes: Mutex<BoundedMap<String, u32>>,
+    probe_bursts: Mutex<BoundedMap<String, (Instant, u32)>>,
     active_sessions: Mutex<BoundedMap<String, i64>>,
 }
 
@@ -62,6 +147,8 @@ impl ScannerGuard {
     pub fn new() -> Self {
         Self {
             bans: Mutex::new(BoundedMap::new(4096)),
+            strikes: Mutex::new(BoundedMap::new(4096)),
+            probe_bursts: Mutex::new(BoundedMap::new(4096)),
             active_sessions: Mutex::new(BoundedMap::new(16384)),
         }
     }
@@ -120,11 +207,65 @@ impl ScannerGuard {
     }
 
     pub fn ban_15m(&self, ip_hmac: &str) {
+        let strike_num = {
+            let mut s_guard = self.strikes.lock().unwrap_or_else(|e| e.into_inner());
+            let key = ip_hmac.to_string();
+            if let Some(cnt) = s_guard.get_mut(&key) {
+                *cnt = cnt.saturating_add(1);
+                *cnt
+            } else {
+                s_guard.insert(key, 1);
+                1
+            }
+        };
+        let ttl_secs = if strike_num >= 2 { 3600 } else { 900 };
         let mut guard = self.bans.lock().unwrap_or_else(|e| e.into_inner());
         guard.insert(
             ip_hmac.to_string(),
-            Instant::now() + Duration::from_secs(900),
+            Instant::now() + Duration::from_secs(ttl_secs),
         );
+    }
+
+    /// Behavioral enumeration scorer: quarantines unauthenticated IPs that trigger `>= 20` non-asset
+    /// `404` responses within `60s` (catching custom recon scripts that spoof browser User-Agents).
+    pub fn record_unauth_404_and_should_ban(&self, ip_hmac: &str, path: &str) -> bool {
+        let low = path.trim().to_ascii_lowercase();
+        if low == "/favicon.ico"
+            || low.starts_with("/.well-known/")
+            || low.starts_with("/apple-touch-icon")
+            || BENIGN_404_ASSET_SUFFIXES
+                .iter()
+                .any(|ext| low.ends_with(ext))
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let reached = {
+            let mut guard = self.probe_bursts.lock().unwrap_or_else(|e| e.into_inner());
+            let key = ip_hmac.to_string();
+            match guard.get_mut(&key) {
+                Some((win_start, count))
+                    if now.duration_since(*win_start) <= Duration::from_secs(60) =>
+                {
+                    *count = count.saturating_add(1);
+                    if *count >= 20 {
+                        *count = 0;
+                        *win_start = now;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => {
+                    guard.insert(key, (now, 1));
+                    false
+                }
+            }
+        };
+        if reached {
+            self.ban_15m(ip_hmac);
+        }
+        reached
     }
 }
 
@@ -468,6 +609,12 @@ pub async fn security_headers_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_string();
+    let full_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
+    let method_str = req.method().as_str().to_string();
     let headers = req.headers().clone();
 
     let peer_ip = req
@@ -523,8 +670,9 @@ pub async fn security_headers_middleware(
                 .query()
                 .is_some_and(|q| q.contains("sentry_key=") || q.contains("glitchtip_key=")));
 
-    // CGNAT-safe scanner & honeypot guard: only verified active sessions and public-ingest DSN auth skip checks
-    if !has_active_session && !has_ingest_auth {
+    // CGNAT-safe deterministic Edge WAF & honeypot guard (< 5 µs, zero OOM):
+    // Only verified active sessions and public-ingest DSN auth skip checks.
+    let unauth_ip_hmac = if !has_active_session && !has_ingest_auth {
         let ip_hmac = state
             .rate_limiter
             .hash_key("honeypot", &client_ip.to_string());
@@ -534,10 +682,14 @@ pub async fn security_headers_middleware(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let is_canary = CANARY_PATHS.iter().any(|c| path.eq_ignore_ascii_case(c));
+        let is_canary = is_canary_or_dotfile_probe(&path);
         let is_scanner = SCANNER_USER_AGENTS.iter().any(|s| ua.contains(s));
+        let is_bad_method = is_anomalous_http_method(&method_str);
+        let exploit_probe = crate::security::anti_rea::detect_http_exploit_probe(&full_uri);
 
-        if (already_banned || is_canary || is_scanner) && session_sha.is_some() {
+        if (already_banned || is_canary || is_scanner || is_bad_method || exploit_probe.is_some())
+            && session_sha.is_some()
+        {
             if let Some(ref sha) = session_sha {
                 if let Ok(Some(_sess)) = state
                     .storage
@@ -559,14 +711,26 @@ pub async fn security_headers_middleware(
                 apply_security_headers(&mut resp, &path, &nonce, is_https);
                 return resp;
             }
-            if is_canary || is_scanner {
+            if is_bad_method {
+                state.scanner_guard.ban_15m(&ip_hmac);
+                let mut resp =
+                    (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response();
+                apply_security_headers(&mut resp, &path, &nonce, is_https);
+                return resp;
+            }
+            if is_canary || is_scanner || exploit_probe.is_some() {
                 state.scanner_guard.ban_15m(&ip_hmac);
                 let mut resp = (StatusCode::NOT_FOUND, "Not found").into_response();
                 apply_security_headers(&mut resp, &path, &nonce, is_https);
                 return resp;
             }
+            Some(ip_hmac)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let mut req = req;
     req.extensions_mut().insert(CspNonce(nonce.clone()));
@@ -574,6 +738,13 @@ pub async fn security_headers_middleware(
     req.extensions_mut().insert(PeerIp(peer_ip));
 
     let mut resp = next.run(req).await;
+    if resp.status() == StatusCode::NOT_FOUND {
+        if let Some(ref ip_hmac) = unauth_ip_hmac {
+            let _ = state
+                .scanner_guard
+                .record_unauth_404_and_should_ban(ip_hmac, &path);
+        }
+    }
     if resp.status().is_server_error() {
         state.self_monitor.record(
             "http_5xx",
@@ -699,5 +870,47 @@ mod tests {
         assert!(guard.is_active_session(&sha));
         guard.untrack_session(&sha);
         assert!(!guard.is_active_session(&sha));
+    }
+
+    #[test]
+    fn edge_waf_catches_nested_dotfiles_dumps_and_methods_while_allowing_well_known() {
+        assert!(is_canary_or_dotfile_probe("/.env"));
+        assert!(is_canary_or_dotfile_probe("/.env.production"));
+        assert!(is_canary_or_dotfile_probe("/api/v1/.env"));
+        assert!(is_canary_or_dotfile_probe("/.git/HEAD"));
+        assert!(is_canary_or_dotfile_probe("/wp-admin/install.php"));
+        assert!(is_canary_or_dotfile_probe("/db/dump-2026.sql.gz"));
+        assert!(is_canary_or_dotfile_probe("/config.php.bak"));
+
+        // RFC 8615 /.well-known/ routes (WebAuthn, security.txt, DevTools) must never be blocked
+        assert!(!is_canary_or_dotfile_probe("/.well-known/webauthn"));
+        assert!(!is_canary_or_dotfile_probe(
+            "/.well-known/appspecific/com.chrome.devtools.json"
+        ));
+        assert!(!is_canary_or_dotfile_probe(
+            "/api/0/organizations/acme/issues/"
+        ));
+
+        assert!(is_anomalous_http_method("PROPFIND"));
+        assert!(is_anomalous_http_method("TRACE"));
+        assert!(is_anomalous_http_method("CONNECT"));
+        assert!(!is_anomalous_http_method("GET"));
+        assert!(!is_anomalous_http_method("POST"));
+
+        let guard = ScannerGuard::new();
+        // Static icon misses never trigger behavioral 404 ban
+        for _ in 0..30 {
+            assert!(!guard.record_unauth_404_and_should_ban("hmac_benign", "/favicon.ico"));
+        }
+        assert!(!guard.is_banned("hmac_benign"));
+
+        // 20 unknown route probes within 60s quarantine the attacker IP HMAC
+        for i in 0..19 {
+            assert!(
+                !guard.record_unauth_404_and_should_ban("hmac_enum", &format!("/hidden-admin-{i}"))
+            );
+        }
+        assert!(guard.record_unauth_404_and_should_ban("hmac_enum", "/hidden-admin-20"));
+        assert!(guard.is_banned("hmac_enum"));
     }
 }

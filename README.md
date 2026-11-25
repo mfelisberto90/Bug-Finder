@@ -4,10 +4,10 @@
 [![Memory](https://img.shields.io/badge/VmRSS-~8--11%20MB-16a34a)](#measured-benchmarks-empirical-single-host-comparison)
 [![Binary](https://img.shields.io/badge/Single%20Binary-~6.5%20MB-2563eb)](#quickstart)
 [![Telemetry](https://img.shields.io/badge/Protocols-Sentry%20%7C%20GlitchTip%20%7C%20OTLP-7c3aed)](#connect-any-app-in-30-seconds)
-[![Security](https://img.shields.io/badge/Defense-Anti--REA%20Shield%20%2B%20FORCE%20RLS-dc2626)](#anti-rea-security-shield-secret-leak-radar--mini-ids)
+[![Security](https://img.shields.io/badge/Defense-Edge%20WAF%20%2B%20Anti--REA%20%2B%20FORCE%20RLS-dc2626)](#anti-rea-security-shield-deterministic-edge-waf-secret-leak-radar--mini-ids)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0d9488.svg)](LICENSE)
 
-**Ultra-lightweight Error Tracking, Structured Logs, Performance Tracing, Uptime Heartbeats & Active Runtime Security (Anti-REA Shield + Mini-IDS) in pure Rust** — compiled into a single **~6.5 MB** native executable running at **~8–11 MB VmRSS**, with drop-in compatibility for **Sentry SDKs**, **GlitchTip clients**, and **OpenTelemetry OTLP/HTTP**.
+**Ultra-lightweight Error Tracking, Structured Logs, Performance Tracing, Uptime Heartbeats & Active Runtime Defense (Deterministic `< 5 µs` Edge WAF + Anti-REA Shield + Mini-IDS) in pure Rust** — compiled into a single **~6.5 MB** native executable running at **~8–11 MB VmRSS**, with drop-in compatibility for **Sentry SDKs**, **GlitchTip clients**, and **OpenTelemetry OTLP/HTTP**.
 
 ![Bug-Finder Issues Inbox](docs/screenshots/issues-inbox.png)
 
@@ -19,7 +19,7 @@ Bug-Finder combines observability and application self-defense into one self-con
 2. **Structured Logs, OpenTelemetry OTLP & Live Tail** — Ingest Sentry `log` v2 envelopes, OTLP/HTTP (`application/x-protobuf` and JSON on `/v1/logs`), direct JSON logs, or terminal streams via `bugfinder wrap`/`pipe`, all correlated by `trace_id`/`span_id` and streamed live via SSE or CLI `bugfinder tail`.
 3. **Performance & Release Health** — Track endpoint latency percentiles (`p50` / `p95`), crash-free session rates, and issue volume across releases.
 4. **Uptime Heartbeats & Multi-Channel Alerts** — Check-in endpoints (`/heartbeat_check/:uuid/`) for cron jobs and microservices, plus event/threshold/fatal/uptime/security alerting to **Telegram** (AEAD-encrypted bot token), **Discord** Rich Embeds, **Slack**, **HMAC-signed Webhooks**, and native **TLS SMTP**.
-5. **Anti-REA Security Shield, Secret Leak Radar & Log-Driven Mini-IDS** — Active protection against reverse engineering, automated browser bots (CDP/Playwright/Puppeteer/WebDriver), monkey-patched hooks, source-map harvesting, canary endpoints (`/.env`, `/.git/config`), exploit payloads in logs, and accidental credential leaks (`JWT`, Bearer, PEM, API keys, Luhn PANs), paired with CGNAT-safe session/HMAC-IP quarantines and `ETag`-cached edge blocklist syncing.
+5. **Deterministic Edge WAF Guard, Anti-REA Security Shield, Secret Leak Radar & Mini-IDS** — Sub-5-microsecond (`< 5 µs`, `O(n)` zero-allocation) protection against dotfile/canary reconnaissance (`/.env*`, `/.git/*`, `/wp-admin`, `*.sql`, `*.bak`), anomalous HTTP/WebDAV verbs (`PROPFIND`, `TRACE`, `CONNECT`), double-encoded `SQLi` / `Path Traversal` / `SSRF` / `JNDI` URI probes, stealth `404` enumeration bursts, automated browser bots (CDP/Playwright/Puppeteer/WebDriver), monkey-patched hooks, source-map harvesting, and accidental credential leaks (`JWT`, Bearer, PEM, API keys, Luhn PANs) — all backed by CGNAT-safe session exemptions, escalating `HMAC-SHA256` IP quarantines, and `ETag`-cached edge blocklist syncing.
 6. **Zero-Leak Same-Origin Proxy Pattern** — Serve the `< 3 KB` Mini-SDK, Anti-REA Shield, and ingestion endpoints under neutral first-party paths (`/_obs/*`) while locking the admin UI completely behind Cloudflare Zero Trust Access or a private VPN.
 7. **Enterprise Security, Auto-Check & AI MCP Server** — PostgreSQL 17 `ENABLE + FORCE ROW LEVEL SECURITY` (`NOBYPASSRLS`), `enc:v1:` AEAD at rest, immutable `SHA-256` hash-chained audit logs, TOTP 2FA + WebAuthn Passkeys + OIDC PKCE SSO, self-diagnostics (`Auto-Check` / `bugfinder doctor`), and a read-only stdio **MCP server** for AI debugging assistants.
 
@@ -90,20 +90,23 @@ Zero-dependency TypeScript SPA designed for fast mobile triage with bottom Thumb
 
 ---
 
-## Anti-REA Security Shield, Secret Leak Radar & Mini-IDS
+## Anti-REA Security Shield, Deterministic Edge WAF, Secret Leak Radar & Mini-IDS
 
-Beyond passive crash logging, Bug-Finder ships an integrated active defense subsystem across three layers — **Browser Runtime**, **Backend Middleware**, and **Log/Payload Inspection** (`sdks/browser/bugfinder-shield.js` + `src/security/anti_rea.rs`):
+Beyond passive crash logging, Bug-Finder ships an integrated active defense subsystem across four layers — **HTTP Edge WAF Guard**, **Browser Runtime**, **Monitored Backend Telemetry**, and **Log/Payload Inspection** (`src/security/headers.rs` + `sdks/browser/bugfinder-shield.js` + `src/security/anti_rea.rs`):
 
-### What Anti-REA & Mini-IDS Cover
+> **Why Deterministic Rust O(n) Edge Defense Over Neural/LLM Request Classifiers?** Placing neural encoder or LLM classifiers (e.g., 400M+ parameter BERT/System-1 models) synchronously in front of HTTP traffic consumes `2.8–4.3 GB` of CPU RAM and `100–3,000 ms` per request — turning any `200 req/s` `ffuf`/`nuclei` scan into an instant CPU self-DDoS while introducing false positives behind shared 4G/5G CGNAT. Bug-Finder's `ScannerGuard` + `IdsRegexes` execute in **`< 5 µs`** using linear-time ASCII finite automata (`unicode(false)`, ReDoS-immune) and fixed-capacity `BoundedMap` HMAC tables (`< 512 KB` ceiling).
+
+### What Edge WAF, Anti-REA & Mini-IDS Cover
 
 | Layer | Detections & Active Controls |
 |---|---|
+| **Deterministic HTTP Edge WAF (`ScannerGuard`)** | Blocks nested dotfile & canary probes (`/.env*`, `/api/.env`, `/.git/*`, `/.aws/*`, `/wp-admin*`, `/phpmyadmin*`, `/vendor/phpunit*`, `/actuator*`, `*.sql`, `*.bak` while exempting RFC 8615 `/.well-known/*`), offensive scanner User-Agents (`sqlmap`, `nuclei`, `nikto`, `ffuf`, `gobuster`, `feroxbuster`, `masscan`, `zgrab`, `wpscan`, `acunetix`, `nessus`, `nmap`), non-browser HTTP verbs (`PROPFIND`, `TRACE`, `CONNECT`, `SEARCH`, `DEBUG`), 2-pass percent-decoded URI exploits (`SQLi`, `../../etc/passwd`, `%00` null-byte, `169.254.169.254` SSRF, `${jndi:...}`), and stealth `404` enumeration bursts (`>= 20` non-asset misses in `60s`) with escalating `15m -> 60m` `HMAC-SHA256` IP quarantines. |
 | **Browser Anti-REA (`bugfinder-shield.js`)** | Detects `navigator.webdriver` / `HeadlessChrome` / `PhantomJS` (`webdriver_detected`), DevTools/CDP & automation bindings (`$cdc_*`, `cdc_*`, `__playwright__binding__`, `__pwInitScripts`, `_phantom`, `__nightmare`), post-init monkey-patching of `fetch`, `XMLHttpRequest.prototype.open`, `WebSocket`, or `Function.prototype.toString` (`runtime_hook_tamper`), getter traps on canary globals (`__BF_INTERNAL_SECRETS__` -> `honeypot_access`), and optional `MutationObserver` script-origin enforcement (`dom_script_injection`). |
 | **Enforcement Modes (`detect` / `defend` / `lockdown`)** | Deduplicates identical signal signatures for 30s (`sendBeacon` / `keepalive` `fetch`); skips `localhost`/`127.0.0.1`/`::1` unless `allowLocalhost: true`. When `risk_score >= threshold` under `defend` or `lockdown`, clears configured `clearStorageKeys` across `localStorage`/`sessionStorage` and enters locked-down state (`isLockedDown()`). |
-| **Backend Traps & Blocklist Sync** | Monitored backends can report server-side `sourcemap_harvest` (`*.js.map`) or `canary_route_hit` (`/.env`, `/.git/config`) signals with `Authorization: Bearer <API_TOKEN>` (`shield:write`) and sync `ETag`-cached HMAC-IP / session blocklists via `GET /api/0/projects/:org/:proj/shield/blocklist/` using project-derived HMAC keys (without exposing the master `app_key`). |
-| **Log-Driven Mini-IDS (`Log-IDS`)** | Evaluates ingested logs in real time for SQL injection (`UNION SELECT`, sleep payloads), multi-level path traversal (`../../etc/passwd`, `.env`, `.git/config`), cloud metadata SSRF (`169.254.169.254/latest/meta-data`, `metadata.google.internal`), JNDI/SSTI (`${jndi:...}`, `{{ 7*7 }}`), and `401`/`403`/`404` IDOR/enumeration bursts (`>= 20` hits per actor in 60s, ignoring static assets). |
+| **Backend WAF Telemetry & Blocklist Sync** | Monitored backends report server-side WAF blocks (`canary_route_hit`, `scanner_user_agent`, `anomalous_http_probe`, `injection_probe`, `idor_or_enum_burst`, `sourcemap_harvest`) to `POST /api/:project_id/shield/` (upgrading to `backend_verified` IP-HMAC quarantine with `Authorization: Bearer bf_...` `shield:write` tokens) and sync `ETag`-cached blocklists via `GET /api/0/projects/:org/:proj/shield/blocklist/` without exposing the master `app_key`. |
+| **Log-Driven Mini-IDS (`Log-IDS`)** | Evaluates ingested logs in real time for SQL injection (`UNION SELECT`, sleep payloads), path traversal (`../etc/passwd`, `.env`, `.git/config`), cloud metadata SSRF (`169.254.169.254/latest/meta-data`, `metadata.google.internal`), JNDI/SSTI (`${jndi:...}`, `{{ 7*7 }}`), and `401`/`403`/`404` IDOR/enumeration bursts (`>= 20` hits per actor in 60s, ignoring static assets). |
 | **Secret Leak Radar** | Redacts emails, `Bearer` / JWT tokens, PEM private keys, API keys (`sk_live_...`, `ghp_...`, `bf_...`), URL query secrets, and Luhn-validated payment card numbers (`[Filtered]`) in-place before persistence or SSE broadcast, emitting security alerts when leaks hit logs or events. |
-| **CGNAT-Safe Quarantine** | Unauthenticated browser signals can only quarantine the **browser `session_id`** (never a shared mobile/CGNAT IP); IP-level HMAC quarantines require `backend_verified` API token authentication. |
+| **CGNAT-Safe Quarantine** | Verified active authenticated sessions (`sha256(cookie)`) are strictly exempted from shared-IP scanner bans so mobile 4G/5G CGNAT users never suffer collateral lockouts; unauthenticated browser signals quarantine only the **browser `session_id`**, while IP-level HMAC quarantines require server-side `Edge WAF` or `backend_verified` API token confirmation. |
 | **Self Runtime Integrity** | Inspects `/proc/self/status` (`TracerPid`), `/proc/self/maps` (`frida-agent`, `frida-gadget`, `libfrida`, `gdbserver`), and `LD_PRELOAD`/`LD_AUDIT` inside `Auto-Check`; optional `BUGFINDER_ANTI_PTRACE=1` calls `prctl(PR_SET_DUMPABLE, 0)` on Linux. |
 
 ### Threat Signal Weights (Capped at Score `100`)
@@ -111,11 +114,13 @@ Beyond passive crash logging, Bug-Finder ships an integrated active defense subs
 | Signal | Weight | Category | Trigger Summary |
 |---|---|---|---|
 | `runtime_debugger_attached` | `80` | `anti_rea` | Attached process/runtime debugger check (`sys.gettrace()` / `TracerPid`) |
-| `canary_route_hit` | `75` | `anti_rea` | Probe hit decoys such as `/.env` or `/.git/config` |
-| `injection_probe` | `75` | `log_ids` | SQLi, traversal, cloud metadata SSRF, or JNDI/SSTI in logs/paths |
+| `canary_route_hit` | `75` | `anti_rea` | Probe hit decoys/dotfiles such as `/.env*`, `/.git/*`, `/wp-admin`, or `*.sql` |
+| `injection_probe` | `75` | `log_ids` | SQLi, traversal, `%00` null-byte, cloud metadata SSRF, or JNDI/SSTI in URIs/logs |
 | `honeypot_access` | `70` | `anti_rea` | Access to trap getters defined in `canaryGlobals` |
+| `scanner_user_agent` | `70` | `edge_waf` | Offensive recon scanner signatures (`nuclei`, `sqlmap`, `ffuf`, `gobuster`, `zgrab`) |
+| `anomalous_http_probe` | `70` | `edge_waf` | Non-browser HTTP verbs (`PROPFIND`, `TRACE`, `CONNECT`) or URI overflow probes |
 | `sourcemap_harvest` | `65` | `anti_rea` | Unauthorized scraping of `.js.map` bundles |
-| `idor_or_enum_burst` | `65` | `log_ids` | `>= 20` `401`/`403`/`404` hits from one actor within 60s |
+| `idor_or_enum_burst` | `65` | `log_ids` | `>= 20` `401`/`403`/`404` non-asset hits from one actor within 60s |
 | `secret_leak` | `60` | `secret_leak` | Credentials/secrets detected & redacted by Secret Leak Radar |
 | `cdp_automation` | `50` | `anti_rea` | Headless ChromeDriver / Playwright / Nightmare / Phantom globals |
 | `webdriver_detected` | `45` | `anti_rea` | `navigator.webdriver === true` or `HeadlessChrome` user-agent |
@@ -346,7 +351,7 @@ cargo test
 
 ## Searchable Topics
 
-`rust` · `error-tracking` · `sentry-alternative` · `glitchtip` · `observability` · `opentelemetry` · `log-aggregation` · `uptime-monitoring` · `self-hosted` · `low-memory` · `anti-reverse-engineering` · `security-monitoring` · `intrusion-detection` · `secret-scanning` · `sqlite` · `postgresql` · `row-level-security` · `mcp-server` · `axum` · `single-binary`
+`rust` · `waf` · `web-application-firewall` · `error-tracking` · `sentry-alternative` · `glitchtip` · `observability` · `opentelemetry` · `log-aggregation` · `uptime-monitoring` · `self-hosted` · `low-memory` · `anti-reverse-engineering` · `security-monitoring` · `intrusion-detection` · `secret-scanning` · `sqlite` · `postgresql` · `row-level-security` · `mcp-server`
 
 ## License
 
