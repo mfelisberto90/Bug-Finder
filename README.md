@@ -15,7 +15,7 @@
 
 Bug-Finder combines observability and application self-defense into one self-contained Rust server without external queues or caches:
 
-1. **Error Tracking & SourceMap v3 Demangling** — Full-text FTS5 issue search, deterministic grouping & smart regression detection, stack traces with source context, breadcrumbs, CSV formula-safe exports, inbound filters (crawler/extension/domain allowlists), and LRU-cached SourceMap v3 VLQ demangling in pure Rust.
+1. **Error Tracking, Root-Cause Diagnosis & Private SourceMaps** — Full-text FTS5 issue search, deterministic grouping & smart regression detection, stack traces with source context (`in_app` vs collapsed SDK/external frames), full `Extra`/`Tags`/`Request`/`Release` metadata panels, deterministic root-cause diagnosis with one-click **Copy AI Fix Prompt** (`<untrusted_error_telemetry>` Anti-Agentjacking boundary), third-party widget noise filtering, and LRU-cached SourceMap v3 VLQ demangling (`debug_id` + hashed bundle basename fallback + `bugfinder sourcemaps upload`).
 2. **Structured Logs, OpenTelemetry OTLP & Live Tail** — Ingest Sentry `log` v2 envelopes, OTLP/HTTP (`application/x-protobuf` and JSON on `/v1/logs`), direct JSON logs, or terminal streams via `bugfinder wrap`/`pipe`, all correlated by `trace_id`/`span_id` and streamed live via SSE or CLI `bugfinder tail`.
 3. **Performance & Release Health** — Track endpoint latency percentiles (`p50` / `p95`), crash-free session rates, and issue volume across releases.
 4. **Uptime Heartbeats & Multi-Channel Alerts** — Check-in endpoints (`/heartbeat_check/:uuid/`) for cron jobs and microservices, plus event/threshold/fatal/uptime/security alerting to **Telegram** (AEAD-encrypted bot token), **Discord** Rich Embeds, **Slack**, **HMAC-signed Webhooks**, and native **TLS SMTP**.
@@ -100,7 +100,7 @@ Beyond passive crash logging, Bug-Finder ships an integrated active defense subs
 
 | Layer | Detections & Active Controls |
 |---|---|
-| **Deterministic HTTP Edge WAF (`ScannerGuard`)** | Blocks nested dotfile & canary probes (`/.env*`, `/api/.env`, `/.git/*`, `/.aws/*`, `/wp-admin*`, `/phpmyadmin*`, `/vendor/phpunit*`, `/actuator*`, `*.sql`, `*.bak` while exempting RFC 8615 `/.well-known/*`), offensive scanner User-Agents (`sqlmap`, `nuclei`, `nikto`, `ffuf`, `gobuster`, `feroxbuster`, `masscan`, `zgrab`, `wpscan`, `acunetix`, `nessus`, `nmap`), non-browser HTTP verbs (`PROPFIND`, `TRACE`, `CONNECT`, `SEARCH`, `DEBUG`), 2-pass percent-decoded URI exploits (`SQLi`, `../../etc/passwd`, `%00` null-byte, `169.254.169.254` SSRF, `${jndi:...}`), and stealth `404` enumeration bursts (`>= 20` non-asset misses in `60s`) with escalating `15m -> 60m` `HMAC-SHA256` IP quarantines. |
+| **Deterministic HTTP Edge WAF (`ScannerGuard`)** | Blocks nested & root hidden dotfiles/canary probes (`/.env*`, `/.pypirc`, `/.npmrc`, `/api/.env`, `/.git/*`, `/.aws/*`, `/wp-admin*`, `/phpmyadmin*`, `/vendor/phpunit*`, `/actuator*`, `*.sql`, `*.bak` while exempting RFC 8615 `/.well-known/*`), offensive scanner User-Agents (`sqlmap`, `nuclei`, `nikto`, `ffuf`, `gobuster`, `feroxbuster`, `masscan`, `zgrab`, `wpscan`, `acunetix`, `nessus`, `nmap`), non-browser HTTP verbs (`PROPFIND`, `TRACE`, `CONNECT`, `SEARCH`, `DEBUG`), 2-pass percent-decoded URI exploits (`SQLi`, `../../etc/passwd`, `%00` null-byte, `169.254.169.254` SSRF, `${jndi:...}`), and stealth `404` enumeration bursts (`>= 20` non-asset misses in `60s`) with escalating `15m -> 60m` `HMAC-SHA256` IP quarantines. |
 | **Browser Anti-REA (`bugfinder-shield.js`)** | Detects `navigator.webdriver` / `HeadlessChrome` / `PhantomJS` (`webdriver_detected`), DevTools/CDP & automation bindings (`$cdc_*`, `cdc_*`, `__playwright__binding__`, `__pwInitScripts`, `_phantom`, `__nightmare`), post-init monkey-patching of `fetch`, `XMLHttpRequest.prototype.open`, `WebSocket`, or `Function.prototype.toString` (`runtime_hook_tamper`), getter traps on canary globals (`__BF_INTERNAL_SECRETS__` -> `honeypot_access`), and optional `MutationObserver` script-origin enforcement (`dom_script_injection`). |
 | **Enforcement Modes (`detect` / `defend` / `lockdown`)** | Deduplicates identical signal signatures for 30s (`sendBeacon` / `keepalive` `fetch`); skips `localhost`/`127.0.0.1`/`::1` unless `allowLocalhost: true`. When `risk_score >= threshold` under `defend` or `lockdown`, clears configured `clearStorageKeys` across `localStorage`/`sessionStorage` and enters locked-down state (`isLockedDown()`). |
 | **Backend WAF Telemetry & Blocklist Sync** | Monitored backends report server-side WAF blocks (`canary_route_hit`, `scanner_user_agent`, `anomalous_http_probe`, `injection_probe`, `idor_or_enum_burst`, `sourcemap_harvest`) to `POST /api/:project_id/shield/` (upgrading to `backend_verified` IP-HMAC quarantine with `Authorization: Bearer bf_...` `shield:write` tokens) and sync `ETag`-cached blocklists via `GET /api/0/projects/:org/:proj/shield/blocklist/` without exposing the master `app_key`. |
@@ -293,7 +293,10 @@ bugfinder backup --data ./data --out ./backups/bugfinder-$(date +%F).db
 bugfinder test-event --dsn http://<KEY>@127.0.0.1:8080/1
 bugfinder test-log   --dsn http://<KEY>@127.0.0.1:8080/1
 
-# Launch read-only MCP stdio server for AI coding assistants (issues, logs, traces, self-check)
+# Upload private hidden SourceMaps (.js.map) for exact stacktrace demangling without exposing maps publicly
+bugfinder sourcemaps upload --url http://127.0.0.1:8080 --org acme-cloud --project web --release web@1.0.0 --token bf_... --dir ./dist --delete-after-upload
+
+# Launch read-only MCP stdio server for AI coding assistants (list_issues, get_issue_detail, diagnose_issue, query_logs, get_trace_context)
 bugfinder mcp --org acme-cloud --token bf_...
 ```
 

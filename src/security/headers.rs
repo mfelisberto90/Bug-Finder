@@ -101,6 +101,17 @@ pub fn is_canary_or_dotfile_probe(path: &str) -> bool {
             return true;
         }
     }
+    // Block generic root hidden dotfiles/directories (e.g. /.pypirc, /.npmrc, /.netrc,
+    // /.bash_history, /.DS_Store) on the very first probe while keeping /.well-known/* exempt above.
+    let no_query = low.split(&['?', '#'][..]).next().unwrap_or(&low);
+    let trimmed_root = no_query.trim_start_matches('/');
+    if let Some(rest) = trimmed_root.strip_prefix('.') {
+        if let Some(first) = rest.as_bytes().first().copied() {
+            if first.is_ascii_alphanumeric() || first == b'_' || first == b'-' {
+                return true;
+            }
+        }
+    }
     false
 }
 
@@ -881,6 +892,9 @@ mod tests {
         assert!(is_canary_or_dotfile_probe("/wp-admin/install.php"));
         assert!(is_canary_or_dotfile_probe("/db/dump-2026.sql.gz"));
         assert!(is_canary_or_dotfile_probe("/config.php.bak"));
+        assert!(is_canary_or_dotfile_probe("/.pypirc"));
+        assert!(is_canary_or_dotfile_probe("/.npmrc"));
+        assert!(is_canary_or_dotfile_probe("/.netrc?v=1"));
 
         // RFC 8615 /.well-known/ routes (WebAuthn, security.txt, DevTools) must never be blocked
         assert!(!is_canary_or_dotfile_probe("/.well-known/webauthn"));

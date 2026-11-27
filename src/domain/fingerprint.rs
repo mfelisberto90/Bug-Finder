@@ -187,7 +187,26 @@ pub fn extract_issue_metadata(ev: &Value) -> ComputedIssueMetadata {
                         let chosen = frames
                             .iter()
                             .rev()
-                            .find(|f| f.get("in_app").and_then(|v| v.as_bool()) == Some(true))
+                            .find(|f| {
+                                let name = f
+                                    .get("filename")
+                                    .or_else(|| f.get("abs_path"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                f.get("in_app").and_then(|v| v.as_bool()) == Some(true)
+                                    && !is_internal_or_non_app_frame(name)
+                            })
+                            .or_else(|| {
+                                frames.iter().rev().find(|f| {
+                                    let name = f
+                                        .get("filename")
+                                        .or_else(|| f.get("abs_path"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    f.get("in_app").and_then(|v| v.as_bool()) != Some(false)
+                                        && !is_internal_or_non_app_frame(name)
+                                })
+                            })
                             .or_else(|| frames.last());
                         if let Some(frame) = chosen {
                             let file = frame
@@ -344,7 +363,58 @@ const EXTENSION_PREFIXES: &[&str] = &[
     "safari-extension://",
     "safari-web-extension://",
     "ms-browser-extension://",
+    "edge-extension://",
 ];
+
+const THIRD_PARTY_WIDGET_HOSTS: &[&str] = &[
+    "translate.googleapis.com",
+    "translate-pa.googleapis.com",
+    "googletagmanager.com",
+    "google-analytics.com",
+    "connect.facebook.net",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "cloudflareinsights.com",
+    "static.cloudflareinsights.com",
+    "hotjar.com",
+    "intercom.io",
+    "tawk.to",
+    "crisp.chat",
+];
+
+/// Returns true if a frame path/URL clearly belongs to a third-party widget/tracker.
+pub fn is_third_party_widget_url(raw: &str) -> bool {
+    let low = raw.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    THIRD_PARTY_WIDGET_HOSTS
+        .iter()
+        .any(|host| low.contains(host))
+}
+
+/// Returns true if a stack frame belongs to the telemetry SDK, browser automation eval,
+/// browser extensions, `node_modules`, or an external third-party widget.
+pub fn is_internal_or_non_app_frame(raw: &str) -> bool {
+    let low = raw.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return true;
+    }
+    if EXTENSION_PREFIXES.iter().any(|p| low.starts_with(p)) {
+        return true;
+    }
+    if is_third_party_widget_url(&low) {
+        return true;
+    }
+    low.contains("bugfinder-mini.js")
+        || low.contains("bugfinder-shield.js")
+        || low.contains("/_obs/m.js")
+        || low.contains("/_obs/s.js")
+        || low.starts_with("pptr:")
+        || low.contains("puppeteer")
+        || low.contains("playwright")
+        || low.contains("node_modules")
+}
 
 pub fn is_origin_allowed(origin_or_referer: &str, allowed_domains: &[String]) -> bool {
     if allowed_domains.is_empty() {
@@ -456,6 +526,43 @@ pub fn evaluate_inbound_filters(
         }
     }
 
+    if filters.ignore_third_party_scripts {
+        if let Some(vals) = ev
+            .get("exception")
+            .and_then(|e| e.get("values"))
+            .and_then(|v| v.as_array())
+        {
+            let mut saw_third_party = false;
+            let mut saw_app_frame = false;
+            for exc in vals {
+                if let Some(frames) = exc
+                    .get("stacktrace")
+                    .and_then(|s| s.get("frames"))
+                    .and_then(|f| f.as_array())
+                {
+                    for fr in frames {
+                        let fname = fr
+                            .get("filename")
+                            .or_else(|| fr.get("abs_path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if fname.is_empty() {
+                            continue;
+                        }
+                        if is_third_party_widget_url(fname) {
+                            saw_third_party = true;
+                        } else if !is_internal_or_non_app_frame(fname) {
+                            saw_app_frame = true;
+                        }
+                    }
+                }
+            }
+            if saw_third_party && !saw_app_frame {
+                return FilterDecision::Drop("third_party_script");
+            }
+        }
+    }
+
     if !filters.ignore_messages.is_empty() {
         let meta = extract_issue_metadata(ev);
         let lower_title = meta.title.to_ascii_lowercase();
@@ -547,6 +654,50 @@ mod tests {
                 &filters
             ),
             FilterDecision::Accept
+        );
+
+        let widget_only = json!({
+            "exception": {
+                "values": [{
+                    "type": "TypeError",
+                    "value": "NetworkError",
+                    "stacktrace": {
+                        "frames": [
+                            { "filename": "https://app.acme.example/sdk/bugfinder-mini.js", "in_app": true },
+                            { "filename": "https://translate.googleapis.com/translate_a/element.js", "in_app": true }
+                        ]
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            evaluate_inbound_filters(
+                &widget_only,
+                Some("https://app.acme.example"),
+                None,
+                &filters
+            ),
+            FilterDecision::Drop("third_party_script")
+        );
+
+        let sdk_plus_app = json!({
+            "exception": {
+                "values": [{
+                    "type": "TypeError",
+                    "value": "Failed to fetch",
+                    "stacktrace": {
+                        "frames": [
+                            { "filename": "https://app.acme.example/assets/app.js", "function": "submitLead", "in_app": true },
+                            { "filename": "https://app.acme.example/sdk/bugfinder-mini.js", "function": "root.fetch", "in_app": true }
+                        ]
+                    }
+                }]
+            }
+        });
+        let meta = extract_issue_metadata(&sdk_plus_app);
+        assert_eq!(
+            meta.culprit,
+            "https://app.acme.example/assets/app.js in submitLead"
         );
     }
 }

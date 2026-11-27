@@ -112,6 +112,7 @@ export interface ShieldPolicy {
 export interface ProjectFilters {
   allowed_domains: string[];
   ignore_browser_extensions: boolean;
+  ignore_third_party_scripts?: boolean;
   ignore_crawlers: boolean;
   ignore_localhost: boolean;
   ignore_messages: string[];
@@ -193,6 +194,18 @@ export interface IssueSummary {
   environment: string;
 }
 
+export interface IssueDiagnosis {
+  category: string;
+  severity_hint: string;
+  summary: string;
+  root_cause_file: string | null;
+  suggested_fix: string;
+  search_command: string;
+  ai_fix_prompt: string;
+  source_mapped: boolean;
+  is_noise_candidate: boolean;
+}
+
 export interface IssueEventDetail {
   id: string;
   event_id: string;
@@ -206,6 +219,7 @@ export interface IssueEventDetail {
   span_id: string | null;
   tags: Record<string, unknown>;
   payload: Record<string, any>;
+  diagnosis?: IssueDiagnosis;
 }
 
 export interface LogEventItem {

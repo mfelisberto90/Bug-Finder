@@ -1801,3 +1801,192 @@ mod tests {
         assert_eq!(events[4].0, "[ERROR] independent error B");
     }
 }
+
+fn collect_sourcemap_files(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    if depth > 8 || out.len() >= 500 {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed reading sourcemap directory {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name == "node_modules" || name == ".git" {
+                continue;
+            }
+            collect_sourcemap_files(&p, depth + 1, out)?;
+        } else if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+            let low = fname.to_ascii_lowercase();
+            if low.ends_with(".js.map") || low.ends_with(".mjs.map") {
+                out.push(p);
+                if out.len() >= 500 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_uri_component_strict(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+pub fn run_sourcemaps_upload_cli(
+    base_url: &str,
+    org: &str,
+    project: &str,
+    release: &str,
+    token: &str,
+    dir: &Path,
+    delete_after_upload: bool,
+) -> Result<usize, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("base URL must start with http:// or https://".into());
+    }
+    if !dir.is_dir() {
+        return Err(format!(
+            "Sourcemap directory does not exist: {}",
+            dir.display()
+        ));
+    }
+    let mut files = Vec::new();
+    collect_sourcemap_files(dir, 0, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "No .js.map or .mjs.map files found under {}",
+            dir.display()
+        ));
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build();
+    let endpoint_base = format!(
+        "{base}/api/0/organizations/{}/projects/{}/releases/{}/sourcemaps/",
+        encode_uri_component_strict(org.trim()),
+        encode_uri_component_strict(project.trim()),
+        encode_uri_component_strict(release.trim())
+    );
+
+    let mut uploaded = 0usize;
+    for path in files {
+        let bytes =
+            fs::read(&path).map_err(|e| format!("Failed reading {}: {e}", path.display()))?;
+        if bytes.len() > 10 * 1024 * 1024 {
+            return Err(format!("Sourcemap {} exceeds 10 MiB limit", path.display()));
+        }
+        let parsed: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Invalid JSON in {}: {e}", path.display()))?;
+        let fname = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Invalid filename: {}", path.display()))?;
+        let mut url = format!(
+            "{endpoint_base}?filename={}",
+            encode_uri_component_strict(fname)
+        );
+        if let Some(did) = parsed
+            .get("debugId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            url.push_str("&debug_id=");
+            url.push_str(&encode_uri_component_strict(did));
+        }
+        let resp = agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", token.trim()))
+            .set("Content-Type", "application/json")
+            .send_bytes(&bytes)
+            .map_err(|e| format!("Failed uploading {fname}: {e}"))?;
+        if !(200..300).contains(&resp.status()) {
+            return Err(format!(
+                "Upload rejected for {fname}: HTTP {}",
+                resp.status()
+            ));
+        }
+        uploaded += 1;
+        if delete_after_upload {
+            fs::remove_file(&path).map_err(|e| {
+                format!(
+                    "Uploaded {fname} but failed removing {}: {e}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(uploaded)
+}
+
+#[cfg(test)]
+mod sourcemap_cli_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use tempfile::TempDir;
+
+    #[test]
+    fn uploads_hidden_sourcemaps_and_optionally_deletes_local_files() {
+        let dir = TempDir::new().unwrap();
+        let assets = dir.path().join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let map_path = assets.join("index-B8xK2pLm.js.map");
+        fs::write(
+            &map_path,
+            r#"{"version":3,"sources":["src/App.tsx"],"names":[],"mappings":"AAAA","debugId":"did-123"}"#,
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = sock.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            );
+            req
+        });
+
+        let url = format!("http://{addr}");
+        let count = run_sourcemaps_upload_cli(
+            &url,
+            "acme",
+            "web",
+            "web@1.0.0",
+            "tok_test_abc",
+            dir.path(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(!map_path.exists());
+        let raw_req = handle.join().unwrap();
+        assert!(raw_req.contains("filename=index-B8xK2pLm.js.map"));
+        assert!(raw_req.contains("debug_id=did-123"));
+        assert!(raw_req.contains("Authorization: Bearer tok_test_abc"));
+    }
+}

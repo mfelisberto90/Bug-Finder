@@ -1143,8 +1143,17 @@ pub async fn list_issue_events(
     if let Err(r) = require_scope(&ctx, "event:read") {
         return *r;
     }
+    let issue = state.storage.get_issue(&ctx, issue_id).await.ok().flatten();
     match state.storage.list_issue_events(&ctx, issue_id, 25).await {
-        Ok(list) => Json(list).into_response(),
+        Ok(mut list) => {
+            for ev in &mut list {
+                ev.diagnosis = Some(crate::domain::diagnosis::diagnose_issue_event(
+                    issue.as_ref(),
+                    ev,
+                ));
+            }
+            Json(list).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
@@ -1167,8 +1176,15 @@ pub async fn get_issue_event(
     if let Err(r) = require_scope(&ctx, "event:read") {
         return *r;
     }
+    let issue = state.storage.get_issue(&ctx, issue_id).await.ok().flatten();
     match state.storage.get_issue_event(&ctx, issue_id, &ev_id).await {
-        Ok(Some(ev)) => Json(ev).into_response(),
+        Ok(Some(mut ev)) => {
+            ev.diagnosis = Some(crate::domain::diagnosis::diagnose_issue_event(
+                issue.as_ref(),
+                &ev,
+            ));
+            Json(ev).into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Event not found" })),
@@ -1565,8 +1581,10 @@ pub async fn upload_sourcemap(
         Ok(c) => c,
         Err(r) => return *r,
     };
-    if let Err(r) = require_scope(&ctx, "project:releases") {
-        return *r;
+    if !(ctx.has_scope("project:releases") || ctx.has_scope("project:write")) {
+        if let Err(r) = require_scope(&ctx, "project:releases") {
+            return *r;
+        }
     }
     if !ctx.role.can_mutate_issues() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();

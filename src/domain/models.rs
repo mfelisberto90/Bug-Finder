@@ -388,6 +388,7 @@ impl Default for ShieldPolicy {
 pub struct ProjectFilters {
     pub allowed_domains: Vec<String>,
     pub ignore_browser_extensions: bool,
+    pub ignore_third_party_scripts: bool,
     pub ignore_crawlers: bool,
     pub ignore_localhost: bool,
     pub ignore_messages: Vec<String>,
@@ -408,6 +409,7 @@ impl Default for ProjectFilters {
         Self {
             allowed_domains: Vec::new(),
             ignore_browser_extensions: true,
+            ignore_third_party_scripts: true,
             ignore_crawlers: true,
             ignore_localhost: false,
             ignore_messages: Vec::new(),
@@ -609,6 +611,8 @@ pub struct IssueEventDetailDto {
     pub span_id: Option<String>,
     pub tags: Value,
     pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis: Option<crate::domain::diagnosis::IssueDiagnosisDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

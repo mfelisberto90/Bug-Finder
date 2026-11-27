@@ -22,8 +22,51 @@
     xhrWrapped: false,
     consoleWrapped: false,
     inConsole: false,
+    slowMs: 5000,
+    sessionPinged: false,
     recentEvents: Object.create(null)
   };
+
+  function nowMs() {
+    try {
+      if (typeof performance !== "undefined" && typeof performance.now === "function") {
+        return performance.now();
+      }
+    } catch (_) {}
+    return Date.now();
+  }
+
+  function isAppFrameUrl(raw) {
+    if (!raw) return false;
+    var low = String(raw).toLowerCase();
+    return (
+      low.indexOf("node_modules") === -1 &&
+      low.indexOf("bugfinder-mini.js") === -1 &&
+      low.indexOf("bugfinder-shield.js") === -1 &&
+      low.indexOf("/_obs/m.js") === -1 &&
+      low.indexOf("/_obs/s.js") === -1 &&
+      low.indexOf("pptr:") !== 0 &&
+      low.indexOf("puppeteer") === -1 &&
+      low.indexOf("playwright") === -1 &&
+      low.indexOf("chrome-extension://") !== 0 &&
+      low.indexOf("moz-extension://") !== 0 &&
+      low.indexOf("safari-extension://") !== 0 &&
+      low.indexOf("safari-web-extension://") !== 0 &&
+      low.indexOf("translate.googleapis.com") === -1 &&
+      low.indexOf("translate-pa.googleapis.com") === -1 &&
+      low.indexOf("googletagmanager.com") === -1 &&
+      low.indexOf("google-analytics.com") === -1
+    );
+  }
+
+  function isStreamingUrl(urlStr) {
+    var low = String(urlStr || "").toLowerCase();
+    return (
+      low.indexOf("/stream") !== -1 ||
+      low.indexOf("/tail") !== -1 ||
+      low.indexOf("/events") !== -1
+    );
+  }
 
   function safeJsonStringify(obj) {
     try {
@@ -154,7 +197,7 @@
           filename: m[2],
           lineno: Number(m[3]),
           colno: Number(m[4]),
-          in_app: !m[2].includes("node_modules")
+          in_app: isAppFrameUrl(m[2])
         };
       })
       .reverse();
@@ -326,19 +369,36 @@
       }
       var method = ((initOpts && initOpts.method) || (input && input.method) || "GET").toUpperCase();
       var safePath = urlStr.split("?")[0].slice(0, 200);
+      var startedAt = nowMs();
       return origFetch.apply(root, arguments).then(
         function (resp) {
+          var dur = Math.max(0, Math.round(nowMs() - startedAt));
+          var st = resp ? resp.status : 0;
           addBreadcrumb({
             type: "http",
             category: "fetch",
-            level: resp && resp.status >= 500 ? "error" : "info",
-            message: method + " " + safePath + " -> " + (resp ? resp.status : 0)
+            level: st >= 500 ? "error" : "info",
+            data: { status_code: st, duration_ms: dur, method: method },
+            message: method + " " + safePath + " -> " + st + " (" + dur + " ms)"
           });
           if (resp && resp.status >= 500) {
             captureException(new Error("HTTP " + resp.status + " on " + method + " " + safePath), {
               http_status: resp.status,
-              http_method: method
+              http_method: method,
+              duration_ms: dur
             });
+          } else if (dur > cfg.slowMs && !isStreamingUrl(safePath)) {
+            var ctype = "";
+            try { ctype = resp && resp.headers && resp.headers.get("content-type") || ""; } catch (_) {}
+            if (String(ctype).toLowerCase().indexOf("text/event-stream") === -1) {
+              captureMessage("Slow API request (" + dur + " ms): " + method + " " + safePath, "warning", {
+                url: safePath,
+                method: method,
+                status_code: st,
+                duration_ms: dur,
+                slow_threshold_ms: cfg.slowMs
+              });
+            }
           }
           return resp;
         },
@@ -346,13 +406,18 @@
           if (err && err.name === "AbortError") {
             throw err;
           }
+          var dur = Math.max(0, Math.round(nowMs() - startedAt));
           addBreadcrumb({
             type: "http",
             category: "fetch",
             level: "error",
-            message: method + " " + safePath + " failed"
+            data: { duration_ms: dur, method: method },
+            message: method + " " + safePath + " failed (" + dur + " ms)"
           });
-          captureException(err instanceof Error ? err : new Error("Network failure on " + method + " " + safePath));
+          captureException(err instanceof Error ? err : new Error("Network failure on " + method + " " + safePath), {
+            http_method: method,
+            duration_ms: dur
+          });
           throw err;
         }
       );
@@ -383,27 +448,44 @@
           self._bfBound = true;
           var method = self._bfMethod || "GET";
           var safePath = rawUrl.split("?")[0].slice(0, 200);
+          var xhrStartedAt = 0;
+          self.addEventListener("loadstart", function () {
+            xhrStartedAt = nowMs();
+          });
           self.addEventListener("load", function () {
+            var dur = xhrStartedAt ? Math.max(0, Math.round(nowMs() - xhrStartedAt)) : 0;
             addBreadcrumb({
               type: "http",
               category: "xhr",
               level: self.status >= 500 ? "error" : "info",
-              message: method + " " + safePath + " -> " + (self.status || 0)
+              data: { status_code: self.status || 0, duration_ms: dur, method: method },
+              message: method + " " + safePath + " -> " + (self.status || 0) + " (" + dur + " ms)"
             });
             if (self.status >= 500) {
               captureException(new Error("XHR HTTP " + self.status + " on " + method + " " + safePath), {
                 http_status: self.status,
-                http_method: method
+                http_method: method,
+                duration_ms: dur
+              });
+            } else if (dur > cfg.slowMs && !isStreamingUrl(safePath)) {
+              captureMessage("Slow API request (" + dur + " ms): " + method + " " + safePath, "warning", {
+                url: safePath,
+                method: method,
+                status_code: self.status || 0,
+                duration_ms: dur,
+                slow_threshold_ms: cfg.slowMs
               });
             }
           });
           self.addEventListener("error", function () {
-            addBreadcrumb({ type: "http", category: "xhr", level: "error", message: method + " " + safePath + " failed" });
-            captureException(new Error("XHR network error on " + method + " " + safePath), { http_method: method });
+            var dur = xhrStartedAt ? Math.max(0, Math.round(nowMs() - xhrStartedAt)) : 0;
+            addBreadcrumb({ type: "http", category: "xhr", level: "error", data: { duration_ms: dur, method: method }, message: method + " " + safePath + " failed (" + dur + " ms)" });
+            captureException(new Error("XHR network error on " + method + " " + safePath), { http_method: method, duration_ms: dur });
           });
           self.addEventListener("timeout", function () {
-            addBreadcrumb({ type: "http", category: "xhr", level: "error", message: method + " " + safePath + " timed out" });
-            captureException(new Error("XHR timeout on " + method + " " + safePath), { http_method: method });
+            var dur = xhrStartedAt ? Math.max(0, Math.round(nowMs() - xhrStartedAt)) : 0;
+            addBreadcrumb({ type: "http", category: "xhr", level: "error", data: { duration_ms: dur, method: method }, message: method + " " + safePath + " timed out (" + dur + " ms)" });
+            captureException(new Error("XHR timeout on " + method + " " + safePath), { http_method: method, duration_ms: dur });
           });
         }
       } catch (_) {}
@@ -464,6 +546,18 @@
     cfg.release = options.release || "";
     cfg.environment = options.environment || "production";
     cfg.maxBreadcrumbs = options.maxBreadcrumbs || 50;
+    if (options.slowThresholdMs && Number(options.slowThresholdMs) >= 500) {
+      cfg.slowMs = Number(options.slowThresholdMs);
+    }
+
+    if (cfg.release && !cfg.sessionPinged && cfg.endpoint) {
+      cfg.sessionPinged = true;
+      sendEnvelope(
+        { sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+        [[{ type: "session" }, { init: true, status: "ok", errors: 0, sid: uuidHex(), attrs: { release: cfg.release, environment: cfg.environment } }]],
+        true
+      );
+    }
 
     if (options.captureFetch) installFetchCapture();
     if (options.captureFetch || options.captureXhr) installXhrCapture();
@@ -507,16 +601,84 @@
           line_number: ev.lineNumber || undefined
         });
       });
+      var clickHist = [];
       window.addEventListener("click", function (ev) {
         var t = ev && ev.target;
-        if (t && t.tagName) {
-          addBreadcrumb({
-            type: "ui",
-            category: "ui.click",
-            message: t.tagName.toLowerCase() + (t.id ? "#" + t.id : "")
-          });
-        }
+        if (!t || !t.tagName) return;
+        var sel = t.tagName.toLowerCase() + (t.id ? "#" + t.id : "");
+        addBreadcrumb({
+          type: "ui",
+          category: "ui.click",
+          message: sel
+        });
+        try {
+          var interactive = typeof t.closest === "function"
+            ? t.closest("button,a,[role='button']")
+            : null;
+          if (interactive && !interactive.closest("[data-private],input,textarea,select")) {
+            var iTag = interactive.tagName ? interactive.tagName.toLowerCase() : "el";
+            var actionAttr = interactive.getAttribute("data-action");
+            var iSel = iTag + (interactive.id ? "#" + interactive.id : "") + (actionAttr ? "[data-action=" + actionAttr.slice(0, 32) + "]" : "");
+            var nowTs = Date.now();
+            clickHist = clickHist.filter(function (c) { return nowTs - c.ts <= 1200; });
+            clickHist.push({ sel: iSel, ts: nowTs });
+            var sameCount = 0;
+            for (var ci = 0; ci < clickHist.length; ci++) {
+              if (clickHist[ci].sel === iSel) sameCount++;
+            }
+            if (sameCount >= 4) {
+              clickHist = [];
+              captureMessage("Rage click on " + iSel, "warning", {
+                target_selector: iSel,
+                click_count: sameCount,
+                window_ms: 1200
+              });
+            }
+          }
+        } catch (_) {}
       }, true);
+      try {
+        if (typeof PerformanceObserver === "function") {
+          var latestLcp = 0;
+          var clsValue = 0;
+          var vitalsReported = false;
+          var lcpObs = new PerformanceObserver(function (list) {
+            var entries = list.getEntries();
+            if (entries && entries.length) {
+              latestLcp = Math.round(entries[entries.length - 1].startTime || 0);
+            }
+          });
+          lcpObs.observe({ type: "largest-contentful-paint", buffered: true });
+          var clsObs = new PerformanceObserver(function (list) {
+            var entries = list.getEntries();
+            for (var ei = 0; ei < entries.length; ei++) {
+              if (!entries[ei].hadRecentInput) {
+                clsValue += entries[ei].value || 0;
+              }
+            }
+          });
+          clsObs.observe({ type: "layout-shift", buffered: true });
+          var flushVitals = function () {
+            if (vitalsReported) return;
+            vitalsReported = true;
+            if (latestLcp > 4000) {
+              captureMessage("Poor Web Vital: LCP " + latestLcp + " ms", "warning", {
+                metric: "LCP",
+                value_ms: latestLcp,
+                threshold_ms: 4000
+              });
+            }
+            if (clsValue > 0.25) {
+              captureMessage("Poor Web Vital: CLS " + clsValue.toFixed(3), "warning", {
+                metric: "CLS",
+                value: Number(clsValue.toFixed(3)),
+                threshold: 0.25
+              });
+            }
+          };
+          window.addEventListener("pagehide", flushVitals);
+        }
+      } catch (_) {}
       window.addEventListener("pagehide", function () { flushLogs(true); });
     }
   }
@@ -551,6 +713,7 @@
           shieldEndpoint: ds.shieldEndpoint || "",
           environment: ds.env || "production",
           release: ds.release || "",
+          slowThresholdMs: ds.slowMs ? Number(ds.slowMs) : 5000,
           captureFetch: capFetch,
           captureConsole: ds.captureConsole || ""
         });

@@ -863,11 +863,28 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
 
     // 9. API Tokens & hygiene
     let mut tokens_without_expiry: usize = 0;
+    let mut expired_tokens: usize = 0;
+    let mut over_365d_tokens: usize = 0;
     let mut total_tokens: usize = 0;
     match state.storage.list_api_tokens(ctx).await {
         Ok(tokens) => {
+            let now = chrono::Utc::now();
             total_tokens = tokens.len();
-            tokens_without_expiry = tokens.iter().filter(|t| t.expires_at.is_none()).count();
+            for tok in &tokens {
+                match tok.expires_at.as_deref() {
+                    None => tokens_without_expiry += 1,
+                    Some(exp_s) => {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp_s) {
+                            let exp_utc = dt.with_timezone(&chrono::Utc);
+                            if exp_utc <= now {
+                                expired_tokens += 1;
+                            } else if (exp_utc - now).num_days() > 366 {
+                                over_365d_tokens += 1;
+                            }
+                        }
+                    }
+                }
+            }
             if tokens.is_empty() {
                 checks.push(SelfCheckItem {
                     id: "api_tokens_configured".into(),
@@ -984,7 +1001,9 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
         }),
     }
 
-    checks.push(if total_tokens == 0 || tokens_without_expiry == 0 {
+    checks.push(if total_tokens == 0
+        || (tokens_without_expiry == 0 && expired_tokens == 0 && over_365d_tokens == 0)
+    {
         SelfCheckItem {
             id: "api_token_hygiene".into(),
             status: CheckStatus::Ok,
@@ -993,7 +1012,9 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
             detail: if total_tokens == 0 {
                 "No non-expiring API tokens present.".into()
             } else {
-                format!("All {total_tokens} active API token(s) have expiration deadlines.")
+                format!(
+                    "All {total_tokens} active API token(s) carry <=365 day rotation deadlines."
+                )
             },
             fix: None,
         }
@@ -1003,8 +1024,10 @@ pub async fn evaluate_self_check(state: &AppState, ctx: &TenantCtx) -> SelfCheck
             status: CheckStatus::Warn,
             category: "security".into(),
             title: "Scoped API Token Expiration Hygiene".into(),
-            detail: format!("{tokens_without_expiry} of {total_tokens} API token(s) have no expiration date."),
-            fix: Some("Rotate non-expiring tokens to time-bounded 30-90 day scoped tokens in Projects & SDK.".into()),
+            detail: format!(
+                "{tokens_without_expiry} without expiry, {expired_tokens} expired, {over_365d_tokens} >365d out of {total_tokens} API token(s)."
+            ),
+            fix: Some("Rotate API tokens to time-bounded <=365 day (30-90d recommended for CLI, <=365d for service/WAF daemons) in Projects & SDK.".into()),
         }
     });
 
