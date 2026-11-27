@@ -20,14 +20,14 @@
 
 ---
 
-## What Bug-Finder v2.0 Covers
+## What Bug-Finder v2.1 Covers
 
-1. **Sub-Millisecond Error Tracking & Private SourceMaps**: Adaptive `BatchWriter` (`0 ms` idle flush, `5 ms` burst coalesce), immediate `< 0.2 ms` live SSE stream, FTS5 search, deterministic grouping & regression detection, root-cause diagnosis (`diagnose_issue` with `<untrusted_error_telemetry>` prompt-injection isolation), third-party widget filtering, and private SourceMap v3 VLQ demangling (`debug_id` + hashed bundle basename fallback + `bugfinder sourcemaps upload`).
-2. **Structured Logs, OpenTelemetry OTLP & Trace Correlation**: Ingest Sentry `log` v2 envelopes, OTLP/HTTP (`application/x-protobuf` and JSON on `/v1/logs`), direct JSON logs, or terminal streams (`bugfinder wrap` / `pipe`), correlated via `trace_id`/`span_id` and same-origin `traceparent` propagation.
+1. **Sub-Millisecond Error Tracking & Private SourceMaps**: Adaptive `BatchWriter` (`0 ms` idle flush, `5 ms` burst coalesce, `16 MiB` bounded memory with per-item NUL-byte resilience), immediate `< 0.2 ms` live SSE stream with `watch::channel` graceful shutdown (`<= 5 s` drain), FTS5 search, deterministic grouping & regression detection, root-cause diagnosis (`diagnose_issue` with `<untrusted_error_telemetry>` prompt-injection isolation), third-party widget filtering, and streaming zero-DOM private SourceMap v3 VLQ demangling (`debug_id` + hashed bundle basename fallback + per-org quota + `bugfinder sourcemaps upload`).
+2. **Structured Logs, OpenTelemetry OTLP & Trace Correlation**: Ingest Sentry `log` v2 envelopes, OTLP/HTTP (`application/x-protobuf` and JSON on `/v1/logs`, plus `/v1/traces` and `/v1/metrics` `202` endpoints), direct JSON logs, or terminal streams (`bugfinder wrap` / `pipe`), correlated via `trace_id`/`span_id` and same-origin `traceparent` propagation.
 3. **1-Prompt Autonomous AI Integration**: Open **Connect App -> AI Auto-Setup (1-Prompt)** or run `bugfinder ai-prompt` (also published generically at `GET /llms.txt`) to generate one self-contained prompt containing every tracking, proxy, WAF, SourceMap, and MCP endpoint so your AI coding agent wires everything in one pass.
 4. **7-Layer Verification Shell (`bugfinder check` & `./scripts/check.sh`)**: Verify server health, CSP, `/llms.txt`, error/session dry-probe ingest, OTLP log dry-probe, Shield + `ETag` blocklist, app HTML SDK/SRI tags, SourceMap zero-leak, and Edge WAF blocking in `< 250 ms`.
-5. **Deterministic `< 1 µs` Rust SIMD Edge WAF & Secret Leak Radar**: Single-pass `AhoCorasick` URI/UA inspection (`SQLi`, 2-pass traversal, AWS/GCP/Oracle/Alibaba cloud metadata IPv4/IPv6 SSRF including `fd00:ec2::254`, `XSS`, `Command Injection`, `JNDI/SSTI`, `Prototype Pollution`, root dotfiles, `.js.map` scraping, WebDAV methods), CGNAT-safe `ShardedBoundedMap<[u8; 32], V, 16>` lockless-contention counters, and SIMD-prefiltered PII/credential scrubbing (`~15 ns` on clean strings) starting in the browser before transmission.
-6. **Zero-Python Toolchain & Enterprise Cryptography**: Native `bugfinder lint` (`< 3 ms`) and `bugfinder keygen` eliminate Python dependencies in dev and CI; `100%` OS CSPRNG (`OsRng`) entropy, PostgreSQL 17 `ENABLE + FORCE ROW LEVEL SECURITY` (`NOBYPASSRLS`), `enc:v1:` AEAD secrets, database-enforced append-only `audit_logs` triggers, TOTP 2FA, WebAuthn Passkeys, and OIDC PKCE SSO.
+5. **Deterministic `< 1 µs` Rust SIMD Edge WAF & Secret Leak Radar**: Single-pass `AhoCorasick` URI/UA inspection with 2-pass stack percent decoding (`SQLi`, path traversal, AWS/GCP/Oracle/Alibaba cloud metadata IPv4/IPv6 SSRF including `fd00:ec2::254`, `XSS`, `Command Injection`, `JNDI/SSTI`, `Prototype Pollution`, root dotfiles, `.js.map` 404 blocking without CGNAT bans, WebDAV methods), CGNAT-safe `ShardedBoundedMap<[u8; 32], V, 16>` counters, and SIMD-prefiltered PII/credential scrubbing (`~15 ns` on clean strings) starting in the browser before transmission (`bugfinder-mini.js` preserves `Request` headers and exposes `window.__bfOrigFetch`).
+6. **Zero-Python Toolchain, Zero-CVE Supply Chain & Enterprise Cryptography**: Native `bugfinder lint` (`< 3 ms`, blocking `gitleaks:allow` and Python drift) and `bugfinder keygen` eliminate Python dependencies in dev and CI. Direct `sqlx-core` + `sqlx-postgres`, `rusqlite 0.43`, and `ruzstd 0.9.1` (with RFC 8878 `<= 8 MiB` frame window pre-check) keep the dependency graph at `239` crates with `0` active CVEs verified on every CI run via OSV.dev. Secrets use `100%` OS CSPRNG (`OsRng`) and `enc:v2:` AEAD (`HKDF-SHA256` + `AES-256-GCM`) with `BUGFINDER_PREVIOUS_APP_KEYS` rotation, backed by PostgreSQL 17 `ENABLE + FORCE ROW LEVEL SECURITY` across all `15` tables (including `users` and `login_attempts` under `NOBYPASSRLS`), append-only `audit_logs` triggers, TOTP 2FA, WebAuthn Passkeys with step-up re-authentication, and OIDC PKCE SSO (`(iss, sub)` binding + local MFA enforcement).
 
 ---
 
@@ -103,7 +103,7 @@ bugfinder check \
 | Anti-REA Shield SDK | `GET /sdk/bugfinder-shield.js` | CDP/WebDriver/tamper detection (`detect` / `defend` / `lockdown`) |
 | Error & Session Ingest | `POST /api/:id/envelope/`, `POST /api/:id/store/` | Supports `X-BugFinder-Check: dry-probe` and timestamp skew clamping |
 | Anti-AdBlock Tunnel | `POST /t/:slug` | Reverse-proxied via `/_obs/e` on the monitored app |
-| Logs & Distributed Traces | `POST /api/:id/otlp/v1/logs`, `POST /v1/logs`, `POST /api/v1/logs` | OTLP JSON/Protobuf and direct JSON |
+| Logs, Traces & Metrics | `POST /api/:id/otlp/v1/logs`, `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics`, `POST /api/v1/logs` | OTLP JSON/Protobuf and direct JSON |
 | CSP & Shield Telemetry | `POST /api/:id/security/`, `POST /api/:id/shield/` | Browser session quarantine or server `Bearer bf_...` IP quarantine |
 | Edge Blocklist Sync | `GET /api/0/projects/:org/:proj/shield/blocklist/` | Cached via `ETag` (`304 Not Modified`), exposes per-project HMAC key |
 | Private SourceMaps | `POST /api/0/projects/:org/:proj/releases/:version/sourcemaps/` | Zero public `.js.map` exposure |
@@ -120,13 +120,13 @@ bugfinder check \
 ./scripts/install.sh --docker   # Hardened Docker Compose deployment
 ```
 
-### 2. Hardened Docker Compose (`64 MB` RAM Cap, Read-Only Rootfs)
+### 2. Hardened Docker Compose (`128 MB` RAM Cap, Read-Only Rootfs)
 
 ```bash
 docker compose up -d --build
 ```
 
-`compose.yml` enforces `read_only: true`, `noexec,nosuid,nodev` on `/tmp`, `cap_drop: [ALL]`, `no-new-privileges:true`, and `pids_limit: 64`.
+`compose.yml` enforces `mem_limit: 128m` (covering `mmap` + SourceMap headroom), `read_only: true`, `noexec,nosuid,nodev` on `/tmp`, `cap_drop: [ALL]`, `no-new-privileges:true`, and `pids_limit: 64`.
 
 ### 3. Manual Release Build & Verification
 
@@ -147,7 +147,8 @@ Use `--app` instead of `--headless` to launch Bug-Finder as a local desktop wind
 | `BUGFINDER_DATA_DIR` | `./data` | Data directory (`0700`) for SQLite DB, `.app_key` (`0600`), and private SourceMaps. |
 | `DATABASE_URL` | *(SQLite)* | Optional `postgres://...` / `postgresql://...` or `sqlite://...` URI. |
 | `BUGFINDER_APP_KEY` | *(auto `.app_key`)* | 64-char hex master key (generate via `bugfinder keygen`). |
-| `BUGFINDER_ENV` | `dev` on loopback / `production` otherwise | Set `production` or `dev`/`development`. |
+| `BUGFINDER_PREVIOUS_APP_KEYS` | *(empty)* | Comma-separated retired 64-char hex keys for zero-downtime `enc:v2:` / `enc:v1:` secret decryption during rotation. |
+| `BUGFINDER_ENV` | `production` (`dev` only when explicitly set) | Set `production` (default fail-closed) or `dev`/`development` for local HTTP development. |
 | `BUGFINDER_PUBLIC_URL` | *(unset)* | Canonical public HTTPS origin for blueprints, Connect App, and OIDC callbacks. |
 | `BUGFINDER_ALLOWED_HOSTS` | *(empty)* | Comma-separated allowed `Host` headers (wildcard `*` rejected). |
 | `BUGFINDER_TRUSTED_PROXIES` | *(empty)* | Comma-separated CIDRs/IPs or presets `loopback`, `private`, `cloudflare` (no `*`). |
