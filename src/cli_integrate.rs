@@ -1883,7 +1883,7 @@ pub fn run_sourcemaps_upload_cli(
         .timeout(Duration::from_secs(30))
         .build();
     let endpoint_base = format!(
-        "{base}/api/0/organizations/{}/projects/{}/releases/{}/sourcemaps/",
+        "{base}/api/0/projects/{}/{}/releases/{}/sourcemaps/",
         encode_uri_component_strict(org.trim()),
         encode_uri_component_strict(project.trim()),
         encode_uri_component_strict(release.trim())
@@ -1985,6 +1985,9 @@ mod sourcemap_cli_tests {
         assert_eq!(count, 1);
         assert!(!map_path.exists());
         let raw_req = handle.join().unwrap();
+        assert!(
+            raw_req.starts_with("POST /api/0/projects/acme/web/releases/web%401.0.0/sourcemaps/?")
+        );
         assert!(raw_req.contains("filename=index-B8xK2pLm.js.map"));
         assert!(raw_req.contains("debug_id=did-123"));
         assert!(raw_req.contains("Authorization: Bearer tok_test_abc"));
