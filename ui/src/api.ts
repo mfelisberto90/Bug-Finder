@@ -22,6 +22,30 @@ export interface SdkMeta {
   public_url?: string | null;
 }
 
+export interface AiBlueprintResponse {
+  project_id: number;
+  org_slug: string;
+  project_slug: string;
+  stack: string;
+  dsn: string;
+  base_url: string;
+  check_command: string;
+  shell_command: string;
+  prompt: string;
+  endpoints: {
+    health: string;
+    llms_txt: string;
+    mini_sdk: string;
+    shield_sdk: string;
+    envelope: string;
+    tunnel: string | null;
+    otlp_logs: string;
+    shield: string;
+    blocklist: string;
+    sourcemaps: string;
+  };
+}
+
 export interface Organization {
   id: number;
   slug: string;
@@ -368,9 +392,11 @@ export interface LocalSelfError {
 }
 
 type TransportErrorHook = (info: { path: string; status: number; message: string }) => void;
+type UnauthorizedHook = () => void;
 
 let csrfToken = "";
 let transportErrorHook: TransportErrorHook | null = null;
+let unauthorizedHook: UnauthorizedHook | null = null;
 
 export function setCsrfToken(tok: string): void {
   csrfToken = tok;
@@ -378,6 +404,10 @@ export function setCsrfToken(tok: string): void {
 
 export function setTransportErrorHook(fn: TransportErrorHook): void {
   transportErrorHook = fn;
+}
+
+export function setUnauthorizedHook(fn: UnauthorizedHook): void {
+  unauthorizedHook = fn;
 }
 
 function notifyTransportError(path: string, status: number, message: string): void {
@@ -458,6 +488,15 @@ export async function apiFetch<T>(
 
   if (!resp.ok) {
     const errMsg = (parsed && parsed.error) || `HTTP ${resp.status}`;
+    if (
+      resp.status === 401 &&
+      !path.startsWith("/api/auth/") &&
+      unauthorizedHook
+    ) {
+      try {
+        unauthorizedHook();
+      } catch {}
+    }
     if (resp.status >= 500) {
       notifyTransportError(path, resp.status, `${method} ${path} -> ${errMsg}`);
     }

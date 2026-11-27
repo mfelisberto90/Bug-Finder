@@ -3096,9 +3096,28 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
         assert!(chk_ids.contains(&want), "missing self-check item {want}");
     }
 
-    // Tamper audit_logs metadata in SQLite -> verify_audit_chain returns valid == false
+    // Verify SQLite append-only DB triggers block direct UPDATE & DELETE on audit_logs
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE audit_logs SET metadata_json = '{\"tampered\":true}' WHERE id = (SELECT MIN(id) FROM audit_logs)",
+                [],
+            )
+            .is_err(),
+            "SQLite immutable trigger must reject UPDATE on audit_logs"
+        );
+        assert!(
+            conn.execute(
+                "DELETE FROM audit_logs WHERE id = (SELECT MIN(id) FROM audit_logs)",
+                [],
+            )
+            .is_err(),
+            "SQLite immutable trigger must reject DELETE on audit_logs"
+        );
+        // Simulate offline DB-file tamper (dropping trigger first) -> hash chain still catches it
+        conn.execute("DROP TRIGGER IF EXISTS trg_audit_logs_immutable_update", [])
+            .unwrap();
         conn.execute(
             "UPDATE audit_logs SET metadata_json = '{\"tampered\":true}' WHERE id = (SELECT MIN(id) FROM audit_logs)",
             [],
@@ -4881,4 +4900,174 @@ async fn regression_self_monitor_csv_formula_regression_reopen_sourcemap_and_che
         .find(|m| m["id"] == mon_id)
         .unwrap();
     assert_eq!(mon_row["status"], "down");
+}
+
+#[tokio::test]
+async fn v2_turbo_e2e_security_ai_blueprint_and_check_shell_test() {
+    use bugfinder::cli_check::{run_check_suite, CheckOptions, CheckState};
+    use bugfinder::config::CidrBlock;
+    use bugfinder::security::headers::resolve_client_ip;
+    use std::net::IpAddr;
+
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+    let (cookie, _csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+
+    // 1. /llms.txt is public, cookie-free, and enforces strict style-src-attr 'none' CSP
+    let llms_req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/llms.txt")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let llms_resp = tower::ServiceExt::oneshot(router.clone(), llms_req)
+        .await
+        .unwrap();
+    assert_eq!(llms_resp.status(), StatusCode::OK);
+    assert!(llms_resp.headers().get(header::SET_COOKIE).is_none());
+    let csp_val = llms_resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(csp_val.contains("style-src-attr 'none'"), "CSP={csp_val}");
+
+    // 2. RFC 9113 Multi-header Cookie extraction (bf_session in second Cookie header line)
+    let multi_cookie_req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/auth/me")
+        .header(header::COOKIE, "theme=dark")
+        .header(header::COOKIE, cookie.as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let multi_cookie_resp = tower::ServiceExt::oneshot(router.clone(), multi_cookie_req)
+        .await
+        .unwrap();
+    assert_eq!(multi_cookie_resp.status(), StatusCode::OK);
+
+    // 3. Multi-header X-Forwarded-For spoofing defense (rightmost untrusted IP wins)
+    let mut cfg = (*state.config).clone();
+    cfg.trusted_proxies = CidrBlock::expand_keyword_or_cidr("10.0.0.0/8").unwrap();
+    let mut xff_hdrs = axum::http::HeaderMap::new();
+    xff_hdrs.append("x-forwarded-for", "1.1.1.1".parse().unwrap());
+    xff_hdrs.append(
+        "x-forwarded-for",
+        "198.51.100.42, 10.0.0.5".parse().unwrap(),
+    );
+    let resolved = resolve_client_ip(&xff_hdrs, IpAddr::from([10, 0, 0, 2]), &cfg);
+    assert_eq!(resolved, IpAddr::from([198, 51, 100, 42]));
+
+    // 4. Authenticated /ai-blueprint/ returns full 1-prompt & Cache-Control: no-store, private
+    let bp_req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/0/projects/alpha/acme-web/ai-blueprint/?stack=node&app_url=https://app.example.com")
+        .header(header::COOKIE, cookie.as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let bp_resp = tower::ServiceExt::oneshot(router.clone(), bp_req)
+        .await
+        .unwrap();
+    assert_eq!(bp_resp.status(), StatusCode::OK);
+    assert_eq!(
+        bp_resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store, private")
+    );
+    let bp_bytes = axum::body::to_bytes(bp_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let bp_json: Value = serde_json::from_slice(&bp_bytes).unwrap();
+    let prompt = bp_json["prompt"].as_str().unwrap();
+    assert!(prompt.contains("/_obs/m.js"));
+    assert!(prompt.contains("/shield/blocklist/"));
+    assert!(prompt.contains("bugfinder check"));
+
+    // 5. Dry-probe envelope returns 200 dry_probe=true and creates zero persistent Issues
+    let dry_body = "{\"sdk\":{\"name\":\"test\",\"version\":\"2.0.0\"}}\n{\"type\":\"event\"}\n{\"message\":\"ephemeral\"}\n";
+    let (dry_st, _, dry_b) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/?sentry_key={dsn_key}"),
+        &[
+            (header::CONTENT_TYPE.as_str(), "text/plain"),
+            ("x-bugfinder-check", "dry-probe"),
+        ],
+        dry_body.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(dry_st, StatusCode::OK);
+    let dry_json: Value = serde_json::from_slice(&dry_b).unwrap();
+    assert_eq!(dry_json["dry_probe"], true);
+    state.batch_writer.flush_now().await;
+    let (_, _, issues_list) = send_json(
+        &router,
+        "GET",
+        "/api/0/organizations/alpha/issues/",
+        &[(header::COOKIE.as_str(), cookie.as_str())],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(issues_list.as_array().unwrap().len(), 0);
+
+    // 6. Live TCP listener E2E check with `bugfinder::cli_check::run_check_suite`
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app_srv = router.clone();
+    let srv_handle = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app_srv.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let dsn = format!("http://{dsn_key}@{addr}/{project_id}");
+    let report = tokio::task::spawn_blocking(move || {
+        run_check_suite(&CheckOptions {
+            url: Some(format!("http://{addr}")),
+            dsn: Some(dsn),
+            app_url: None,
+            org: None,
+            project: None,
+            token: None,
+            json: true,
+        })
+    })
+    .await
+    .unwrap();
+    srv_handle.abort();
+    assert!(report.ok, "Check suite failed: {report:?}");
+    for expected_id in [
+        "server_health",
+        "error_and_session_ingest",
+        "logs_and_trace_ingest",
+        "shield_and_blocklist",
+    ] {
+        let item = report.checks.iter().find(|c| c.id == expected_id).unwrap();
+        assert_eq!(item.status, CheckState::Pass, "item={item:?}");
+    }
+
+    // 7. SIMD Edge WAF blocks IPv6 AWS IMDSv2 & root dotfiles while exempting /.well-known/
+    let (wk_st, _, _) = send_json(
+        &router,
+        "GET",
+        "/.well-known/security.txt",
+        &[],
+        Value::Null,
+    )
+    .await;
+    assert_ne!(wk_st, StatusCode::TOO_MANY_REQUESTS);
+
+    let (ssrf_st, _, _) = send_json(
+        &router,
+        "GET",
+        "/proxy?url=http://[fd00:ec2::254]/latest/meta-data",
+        &[],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ssrf_st, StatusCode::NOT_FOUND);
+
+    let (repeat_st, _, _) = send_json(&router, "GET", "/robots.txt", &[], Value::Null).await;
+    assert_eq!(repeat_st, StatusCode::TOO_MANY_REQUESTS);
 }

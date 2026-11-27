@@ -53,6 +53,19 @@ async fn robots_txt() -> Response {
         .into_response()
 }
 
+async fn llms_txt(State(state): State<Arc<AppState>>) -> Response {
+    let body = crate::ai_blueprint::render_public_llms_txt(state.config.public_url.as_deref());
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 fn client_accepts_gzip(headers: &HeaderMap) -> bool {
     let Some(raw) = headers
         .get(header::ACCEPT_ENCODING)
@@ -373,6 +386,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let api_routes = Router::new()
         .route("/api/health", get(health))
         .route("/robots.txt", get(robots_txt))
+        .route("/llms.txt", get(llms_txt))
         .route("/metrics", get(prometheus_metrics))
         .route("/sdk/bugfinder-mini.js", get(mini_sdk_js))
         .route("/sdk/bugfinder-shield.js", get(shield_sdk_js))
@@ -594,6 +608,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/0/projects/:org/:proj/shield/blocklist/",
             get(api_v0::get_shield_blocklist),
+        )
+        .route(
+            "/api/0/projects/:org/:proj/ai-blueprint/",
+            get(api_v0::get_project_ai_blueprint),
         )
         .route(
             "/api/0/api-tokens/",

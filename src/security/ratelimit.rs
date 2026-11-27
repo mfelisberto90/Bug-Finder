@@ -1,12 +1,57 @@
 use crate::domain::models::{ProjectAuthInfo, TenantCtx};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Computes a stack-allocated 256-bit HMAC-SHA256 digest without heap hex formatting.
+pub fn hmac_digest_bytes(app_key: &[u8; 32], scope: &str, raw_id: &str) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(app_key).expect("HMAC accepts 32-byte key");
+    mac.update(scope.as_bytes());
+    mac.update(b":");
+    mac.update(raw_id.as_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// 16-shard bounded map reducing multi-core Mutex contention while capping peak RAM deterministically.
+pub struct ShardedBoundedMap<K, V, const S: usize = 16> {
+    hasher: RandomState,
+    shards: [Mutex<BoundedMap<K, V>>; S],
+}
+
+impl<K: Eq + Hash + Clone, V, const S: usize> ShardedBoundedMap<K, V, S> {
+    pub fn new(total_cap: usize) -> Self {
+        let per_shard = (total_cap / S.max(1)).max(16);
+        Self {
+            hasher: RandomState::new(),
+            shards: std::array::from_fn(|_| Mutex::new(BoundedMap::new(per_shard))),
+        }
+    }
+
+    #[inline]
+    fn shard_idx(&self, key: &K) -> usize {
+        (self.hasher.hash_one(key) as usize) % S
+    }
+
+    #[inline]
+    pub fn with_shard_mut<R>(&self, key: &K, f: impl FnOnce(&mut BoundedMap<K, V>) -> R) -> R {
+        let idx = self.shard_idx(key);
+        let mut guard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
+    }
+
+    pub fn retain_all(&self, mut keep: impl FnMut(&K, &V) -> bool) {
+        for shard in &self.shards {
+            let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|k, v| keep(k, v));
+        }
+    }
+}
 
 /// Fixed-capacity OOM-proof map with deterministic FIFO eviction on overflow.
 pub struct BoundedMap<K, V> {
@@ -98,24 +143,24 @@ pub struct RateLimitDecision {
     pub retry_after_sec: u64,
 }
 
-/// Multi-bucket HMAC-SHA256 rate limiter. Never stores raw emails or client IPs in memory keys.
+/// Sharded multi-bucket HMAC-SHA256 rate limiter. Uses 32-byte stack digests (zero heap key allocs).
 /// Separates auth/spray buckets from high-cardinality ingest buckets so floods cannot evict auth limits.
 pub struct HmacRateLimiter {
     app_key: [u8; 32],
-    auth_buckets: Mutex<BoundedMap<String, Bucket>>,
-    general_buckets: Mutex<BoundedMap<String, Bucket>>,
+    auth_buckets: ShardedBoundedMap<[u8; 32], Bucket, 16>,
+    general_buckets: ShardedBoundedMap<[u8; 32], Bucket, 16>,
 }
 
 impl HmacRateLimiter {
     pub fn new(app_key: [u8; 32], max_buckets: usize) -> Self {
         Self {
             app_key,
-            auth_buckets: Mutex::new(BoundedMap::new(max_buckets.clamp(256, 8_192))),
-            general_buckets: Mutex::new(BoundedMap::new(max_buckets)),
+            auth_buckets: ShardedBoundedMap::new(max_buckets.clamp(256, 8_192)),
+            general_buckets: ShardedBoundedMap::new(max_buckets),
         }
     }
 
-    fn target_mutex(&self, scope: &str) -> &Mutex<BoundedMap<String, Bucket>> {
+    fn target_map(&self, scope: &str) -> &ShardedBoundedMap<[u8; 32], Bucket, 16> {
         if scope.starts_with("auth_") {
             &self.auth_buckets
         } else {
@@ -124,11 +169,7 @@ impl HmacRateLimiter {
     }
 
     pub fn hash_key(&self, scope: &str, raw_id: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.app_key).expect("HMAC accepts 32-byte key");
-        mac.update(scope.as_bytes());
-        mac.update(b":");
-        mac.update(raw_id.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
+        hex::encode(hmac_digest_bytes(&self.app_key, scope, raw_id))
     }
 
     pub fn check_and_record(
@@ -138,70 +179,66 @@ impl HmacRateLimiter {
         max_per_window: u32,
         window: Duration,
     ) -> RateLimitDecision {
-        let key = self.hash_key(scope, raw_id);
+        let key = hmac_digest_bytes(&self.app_key, scope, raw_id);
         let now = Instant::now();
-        let mut guard = self
-            .target_mutex(scope)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(b) = guard.get_mut(&key) {
-            if now.duration_since(b.window_start) >= window {
-                b.count = 1;
-                b.window_start = now;
+        self.target_map(scope).with_shard_mut(&key, |guard| {
+            if let Some(b) = guard.get_mut(&key) {
+                if now.duration_since(b.window_start) >= window {
+                    b.count = 1;
+                    b.window_start = now;
+                    return RateLimitDecision {
+                        allowed: true,
+                        retry_after_sec: 0,
+                    };
+                }
+                if b.count >= max_per_window {
+                    let elapsed = now.duration_since(b.window_start);
+                    let rem = window.saturating_sub(elapsed).as_secs().max(1);
+                    return RateLimitDecision {
+                        allowed: false,
+                        retry_after_sec: rem,
+                    };
+                }
+                b.count += 1;
                 return RateLimitDecision {
                     allowed: true,
                     retry_after_sec: 0,
                 };
             }
-            if b.count >= max_per_window {
-                let elapsed = now.duration_since(b.window_start);
-                let rem = window.saturating_sub(elapsed).as_secs().max(1);
-                return RateLimitDecision {
-                    allowed: false,
-                    retry_after_sec: rem,
-                };
-            }
-            b.count += 1;
-            return RateLimitDecision {
+            guard.insert(
+                key,
+                Bucket {
+                    count: 1,
+                    window_start: now,
+                },
+            );
+            RateLimitDecision {
                 allowed: true,
                 retry_after_sec: 0,
-            };
-        }
-        guard.insert(
-            key,
-            Bucket {
-                count: 1,
-                window_start: now,
-            },
-        );
-        RateLimitDecision {
-            allowed: true,
-            retry_after_sec: 0,
-        }
+            }
+        })
     }
 
     /// Clear ONLY the principal bucket on login success — never clear the IP spray bucket.
     pub fn clear_bucket(&self, scope: &str, raw_id: &str) {
-        let key = self.hash_key(scope, raw_id);
-        let mut guard = self
-            .target_mutex(scope)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.remove(&key);
+        let key = hmac_digest_bytes(&self.app_key, scope, raw_id);
+        self.target_map(scope).with_shard_mut(&key, |guard| {
+            guard.remove(&key);
+        });
     }
 }
 
-/// Bounded LRU/TTL cache deduplicating repeated SDK retries with identical `(project_id, event_id)`.
+/// Sharded bounded LRU/TTL cache deduplicating repeated SDK retries with identical `(project_id, event_id)`.
 pub struct EventDedupeCache {
     ttl: Duration,
-    inner: Mutex<BoundedMap<(i64, String), Instant>>,
+    inner: ShardedBoundedMap<(i64, String), Instant, 16>,
 }
 
 impl EventDedupeCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Mutex::new(BoundedMap::new(capacity)),
+            inner: ShardedBoundedMap::new(capacity),
         }
     }
 
@@ -209,37 +246,37 @@ impl EventDedupeCache {
     pub fn contains(&self, project_id: i64, event_id: &str) -> bool {
         let key = (project_id, event_id.to_string());
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(seen_at) = guard.get_mut(&key) {
-            if now.duration_since(*seen_at) < self.ttl {
-                return true;
-            }
-        }
-        false
+        self.inner.with_shard_mut(&key, |guard| {
+            guard
+                .get_mut(&key)
+                .is_some_and(|seen_at| now.duration_since(*seen_at) < self.ttl)
+        })
     }
 
     /// Record `(project_id, event_id)` as ingested only after durable queue acceptance.
     pub fn mark(&self, project_id: i64, event_id: &str) {
         let key = (project_id, event_id.to_string());
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(key, now);
+        self.inner.with_shard_mut(&key, |guard| {
+            guard.insert(key.clone(), now);
+        });
     }
 
     /// Returns `true` if this `(project_id, event_id)` was already seen within `ttl`.
     pub fn check_and_mark(&self, project_id: i64, event_id: &str) -> bool {
         let key = (project_id, event_id.to_string());
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(seen_at) = guard.get_mut(&key) {
-            if now.duration_since(*seen_at) < self.ttl {
-                return true;
+        self.inner.with_shard_mut(&key, |guard| {
+            if let Some(seen_at) = guard.get_mut(&key) {
+                if now.duration_since(*seen_at) < self.ttl {
+                    return true;
+                }
+                *seen_at = now;
+                return false;
             }
-            *seen_at = now;
-            return false;
-        }
-        guard.insert(key, now);
-        false
+            guard.insert(key.clone(), now);
+            false
+        })
     }
 }
 
@@ -248,108 +285,111 @@ pub fn sentry_rate_limit_header(retry_after_sec: u64, category: &str) -> String 
     format!("{retry_after_sec}:{category}:project")
 }
 
-/// Negative cache for invalid DSN lookups (30s TTL) preventing flood amplification against SQLite/PG.
+/// Sharded negative cache for invalid DSN lookups (30s TTL) preventing flood amplification against SQLite/PG.
 pub struct InvalidDsnCache {
     ttl: Duration,
-    inner: Mutex<BoundedMap<(i64, String), Instant>>,
+    inner: ShardedBoundedMap<(i64, String), Instant, 16>,
 }
 
 impl InvalidDsnCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Mutex::new(BoundedMap::new(capacity)),
+            inner: ShardedBoundedMap::new(capacity),
         }
     }
 
     pub fn is_blocked(&self, project_id: i64, key_sha256: &str) -> bool {
         let key = (project_id, key_sha256.to_string());
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(exp) = guard.get_mut(&key) {
-            if now < *exp {
-                return true;
+        self.inner.with_shard_mut(&key, |guard| {
+            if let Some(exp) = guard.get_mut(&key) {
+                if now < *exp {
+                    return true;
+                }
+                guard.remove(&key);
             }
-            guard.remove(&key);
-        }
-        false
+            false
+        })
     }
 
     pub fn mark_invalid(&self, project_id: i64, key_sha256: &str) {
         let key = (project_id, key_sha256.to_string());
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(key, Instant::now() + self.ttl);
+        self.inner.with_shard_mut(&key, |guard| {
+            guard.insert(key.clone(), Instant::now() + self.ttl);
+        });
     }
 
     pub fn invalidate(&self, project_id: i64, key_sha256: &str) {
         let key = (project_id, key_sha256.to_string());
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(&key);
+        self.inner.with_shard_mut(&key, |guard| {
+            guard.remove(&key);
+        });
     }
 
     pub fn invalidate_project(&self, project_id: i64) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|(pid, _), _| *pid != project_id);
+        self.inner.retain_all(|(pid, _), _| *pid != project_id);
     }
 }
 
-/// Short-TTL positive cache for DSN authentication lookups with synchronous invalidation on mutations.
+/// Sharded short-TTL positive cache for DSN authentication lookups with synchronous invalidation on mutations.
 pub struct DsnAuthCache {
     ttl: Duration,
-    inner: Mutex<BoundedMap<(i64, String), (ProjectAuthInfo, Instant)>>,
+    inner: ShardedBoundedMap<(i64, String), (ProjectAuthInfo, Instant), 16>,
 }
 
 impl DsnAuthCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Mutex::new(BoundedMap::new(capacity)),
+            inner: ShardedBoundedMap::new(capacity),
         }
     }
 
     pub fn get(&self, project_id: i64, key_sha256: &str) -> Option<ProjectAuthInfo> {
         let key = (project_id, key_sha256.to_string());
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((info, exp)) = guard.get_mut(&key) {
-            if now < *exp {
-                return Some(info.clone());
+        self.inner.with_shard_mut(&key, |guard| {
+            if let Some((info, exp)) = guard.get_mut(&key) {
+                if now < *exp {
+                    return Some(info.clone());
+                }
+                guard.remove(&key);
             }
-            guard.remove(&key);
-        }
-        None
+            None
+        })
     }
 
     pub fn insert(&self, project_id: i64, key_sha256: &str, info: ProjectAuthInfo) {
         let key = (project_id, key_sha256.to_string());
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(key, (info, Instant::now() + self.ttl));
+        self.inner.with_shard_mut(&key, |guard| {
+            guard.insert(key.clone(), (info, Instant::now() + self.ttl));
+        });
     }
 
     pub fn invalidate_project(&self, project_id: i64) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|(pid, _), _| *pid != project_id);
+        self.inner.retain_all(|(pid, _), _| *pid != project_id);
     }
 
     pub fn invalidate_org(&self, org_id: i64) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, (info, _)| info.organization_id != org_id);
+        self.inner
+            .retain_all(|_, (info, _)| info.organization_id != org_id);
     }
 }
 
-type TokenCacheMap = BoundedMap<(String, Option<String>), (TenantCtx, Instant)>;
+type TokenCacheMap = ShardedBoundedMap<(String, Option<String>), (TenantCtx, Instant), 16>;
 
-/// Short-TTL positive cache for Bearer API token lookups with expiry revalidation & sync invalidation.
+/// Sharded short-TTL positive cache for Bearer API token lookups with expiry revalidation & sync invalidation.
 pub struct ApiTokenCache {
     ttl: Duration,
-    inner: Mutex<TokenCacheMap>,
+    inner: TokenCacheMap,
 }
 
 impl ApiTokenCache {
     pub fn new(capacity: usize, ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Mutex::new(BoundedMap::new(capacity)),
+            inner: ShardedBoundedMap::new(capacity),
         }
     }
 
@@ -364,15 +404,16 @@ impl ApiTokenCache {
             org_slug_opt.map(ToString::to_string),
         );
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((ctx, exp)) = guard.get_mut(&key) {
-            let token_still_valid = ctx.token_expires_at.is_none_or(|e| e > now_sec);
-            if now < *exp && token_still_valid {
-                return Some(ctx.clone());
+        self.inner.with_shard_mut(&key, |guard| {
+            if let Some((ctx, exp)) = guard.get_mut(&key) {
+                let token_still_valid = ctx.token_expires_at.is_none_or(|e| e > now_sec);
+                if now < *exp && token_still_valid {
+                    return Some(ctx.clone());
+                }
+                guard.remove(&key);
             }
-            guard.remove(&key);
-        }
-        None
+            None
+        })
     }
 
     pub fn insert(&self, token_sha256: &str, org_slug_opt: Option<&str>, ctx: TenantCtx) {
@@ -380,18 +421,19 @@ impl ApiTokenCache {
             token_sha256.to_string(),
             org_slug_opt.map(ToString::to_string),
         );
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(key, (ctx, Instant::now() + self.ttl));
+        self.inner.with_shard_mut(&key, |guard| {
+            guard.insert(key.clone(), (ctx, Instant::now() + self.ttl));
+        });
     }
 
     pub fn invalidate_org(&self, org_id: i64) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, (ctx, _)| ctx.organization_id != org_id);
+        self.inner
+            .retain_all(|_, (ctx, _)| ctx.organization_id != org_id);
     }
 
     pub fn invalidate_user(&self, user_id: i64) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, (ctx, _)| ctx.user_id != Some(user_id));
+        self.inner
+            .retain_all(|_, (ctx, _)| ctx.user_id != Some(user_id));
     }
 }
 

@@ -1,4 +1,4 @@
-.PHONY: build install install-service install-docker doctor test lint
+.PHONY: build install install-service install-docker doctor test lint check
 
 build:
 	./scripts/build-release.sh
@@ -15,9 +15,12 @@ install-docker:
 doctor:
 	cargo run -- doctor
 
+check:
+	./scripts/check.sh
+
 test:
-	python3 scripts/security-lint.py
-	cargo test --target-dir target/unit-tests
+	cargo run --quiet -- lint --dir .
+	cargo test --all-features --target-dir target/unit-tests
 
 lint:
-	python3 scripts/security-lint.py
+	cargo run --quiet -- lint --dir .

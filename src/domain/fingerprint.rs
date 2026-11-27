@@ -1,4 +1,5 @@
 use crate::domain::models::{IssueStatus, IssueType, ProjectFilters};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -382,15 +383,34 @@ const THIRD_PARTY_WIDGET_HOSTS: &[&str] = &[
     "crisp.chat",
 ];
 
+static CRAWLER_AC: OnceLock<AhoCorasick> = OnceLock::new();
+static THIRD_PARTY_WIDGET_AC: OnceLock<AhoCorasick> = OnceLock::new();
+
+fn crawler_ac() -> &'static AhoCorasick {
+    CRAWLER_AC.get_or_init(|| {
+        AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(CRAWLER_SUBSTRINGS)
+            .expect("Crawler AhoCorasick must compile")
+    })
+}
+
+fn third_party_widget_ac() -> &'static AhoCorasick {
+    THIRD_PARTY_WIDGET_AC.get_or_init(|| {
+        AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(THIRD_PARTY_WIDGET_HOSTS)
+            .expect("Third-party widget AhoCorasick must compile")
+    })
+}
+
 /// Returns true if a frame path/URL clearly belongs to a third-party widget/tracker.
 pub fn is_third_party_widget_url(raw: &str) -> bool {
-    let low = raw.trim().to_ascii_lowercase();
-    if low.is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return false;
     }
-    THIRD_PARTY_WIDGET_HOSTS
-        .iter()
-        .any(|host| low.contains(host))
+    third_party_widget_ac().is_match(trimmed)
 }
 
 /// Returns true if a stack frame belongs to the telemetry SDK, browser automation eval,
@@ -466,8 +486,7 @@ pub fn evaluate_inbound_filters(
 ) -> FilterDecision {
     if filters.ignore_crawlers {
         if let Some(ua) = user_agent {
-            let lower = ua.to_ascii_lowercase();
-            if CRAWLER_SUBSTRINGS.iter().any(|bot| lower.contains(bot)) {
+            if crawler_ac().is_match(ua) {
                 return FilterDecision::Drop("crawler");
             }
         }

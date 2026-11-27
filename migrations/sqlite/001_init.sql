@@ -314,6 +314,19 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_logs_org_id ON audit_logs(organization_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_org_ts ON log_events(organization_id, timestamp_ms DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_logs_immutable_update
+BEFORE UPDATE ON audit_logs
+BEGIN
+    SELECT RAISE(ABORT, 'audit_logs is append-only and cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_logs_immutable_delete
+BEFORE DELETE ON audit_logs
+BEGIN
+    SELECT RAISE(ABORT, 'audit_logs is append-only and cannot be deleted');
+END;
 
 CREATE TABLE IF NOT EXISTS user_mfa (
     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

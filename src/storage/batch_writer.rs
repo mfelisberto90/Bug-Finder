@@ -14,8 +14,9 @@ enum WriterMsg {
     Shutdown(oneshot::Sender<()>),
 }
 
-/// Micro-batching ingestion writer: decouples HTTP response latency (<0.3ms)
-/// from SQLite WAL / Postgres transaction overhead and survives error storms cleanly.
+/// Adaptive coalescing micro-batch writer:
+/// - On idle traffic, flushes immediately (`0 ms` artificial wait) so issues & alerts appear in `< 1 ms`.
+/// - During burst storms (`< 5 ms` since last flush), coalesces up to 128 items within `5 ms` per WAL/PG transaction.
 pub struct BatchWriter {
     tx: mpsc::Sender<WriterMsg>,
     metrics: Arc<AppMetrics>,
@@ -35,8 +36,10 @@ impl BatchWriter {
 
         tokio::spawn(async move {
             let mut buffer: Vec<IngestWriteItem> = Vec::with_capacity(128);
-            let mut ticker = tokio::time::interval(Duration::from_millis(50));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_flush_at: Option<tokio::time::Instant> = None;
+            let mut coalesce_armed = false;
+            let coalesce_sleep = tokio::time::sleep(Duration::from_millis(5));
+            tokio::pin!(coalesce_sleep);
 
             loop {
                 tokio::select! {
@@ -45,8 +48,41 @@ impl BatchWriter {
                         match maybe_msg {
                             Some(WriterMsg::Item(item)) => {
                                 buffer.push(*item);
-                                if buffer.len() >= 128 {
+                                let mut pending_acks = Vec::new();
+                                let mut should_shutdown = false;
+                                while buffer.len() < 128 {
+                                    match rx.try_recv() {
+                                        Ok(WriterMsg::Item(it)) => buffer.push(*it),
+                                        Ok(WriterMsg::Flush(a)) => pending_acks.push(a),
+                                        Ok(WriterMsg::Shutdown(a)) => {
+                                            pending_acks.push(a);
+                                            should_shutdown = true;
+                                            break;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                let recently_flushed = last_flush_at
+                                    .is_some_and(|t| t.elapsed() < Duration::from_millis(5));
+                                if buffer.len() >= 128
+                                    || !pending_acks.is_empty()
+                                    || should_shutdown
+                                    || !recently_flushed
+                                {
                                     flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
+                                    last_flush_at = Some(tokio::time::Instant::now());
+                                    coalesce_armed = false;
+                                    for a in pending_acks {
+                                        let _ = a.send(());
+                                    }
+                                    if should_shutdown {
+                                        break;
+                                    }
+                                } else if !coalesce_armed {
+                                    coalesce_sleep.as_mut().reset(
+                                        tokio::time::Instant::now() + Duration::from_millis(5),
+                                    );
+                                    coalesce_armed = true;
                                 }
                             }
                             Some(WriterMsg::Flush(ack)) => {
@@ -64,7 +100,9 @@ impl BatchWriter {
                                 }
                                 if !buffer.is_empty() {
                                     flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
+                                    last_flush_at = Some(tokio::time::Instant::now());
                                 }
+                                coalesce_armed = false;
                                 for a in acks {
                                     let _ = a.send(());
                                 }
@@ -96,9 +134,11 @@ impl BatchWriter {
                             }
                         }
                     }
-                    _ = ticker.tick() => {
+                    _ = &mut coalesce_sleep, if coalesce_armed => {
+                        coalesce_armed = false;
                         if !buffer.is_empty() {
                             flush_vec(&storage, &config, &metrics_bg, &monitor_bg, &mut buffer).await;
+                            last_flush_at = Some(tokio::time::Instant::now());
                         }
                     }
                 }

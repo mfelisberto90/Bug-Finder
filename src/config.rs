@@ -69,6 +69,27 @@ pub enum CliCommand {
         dir: PathBuf,
         delete_after_upload: bool,
     },
+    Check {
+        url: Option<String>,
+        dsn: Option<String>,
+        app_url: Option<String>,
+        org: Option<String>,
+        project: Option<String>,
+        token: Option<String>,
+        json: bool,
+    },
+    AiPrompt {
+        dsn: String,
+        app_url: Option<String>,
+        org: Option<String>,
+        project: Option<String>,
+        stack: String,
+        dir: PathBuf,
+    },
+    Lint {
+        dir: PathBuf,
+    },
+    Keygen,
     Version,
     Help,
 }
@@ -526,9 +547,10 @@ fn load_or_create_app_key(data_dir: &Path, is_dev: bool) -> Result<[u8; 32], Str
         return decode_key_bytes(content.trim());
     }
 
+    use rand::rngs::OsRng;
     use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     let hex_key = hex::encode(bytes);
 
     let tmp_path = data_dir.join(".app_key.tmp");
@@ -1046,6 +1068,148 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                         dir,
                         delete_after_upload,
                     },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "check" => {
+                let mut url = None;
+                let mut dsn = None;
+                let mut app_url = None;
+                let mut org = env::var("BUGFINDER_ORG").ok();
+                let mut project = env::var("BUGFINDER_PROJECT").ok();
+                let mut token = env::var("BUGFINDER_TOKEN")
+                    .or_else(|_| env::var("BUGFINDER_API_TOKEN"))
+                    .ok();
+                let mut json = false;
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--url" => {
+                            j += 1;
+                            url = Some(args.get(j).cloned().ok_or("--url requires a value")?);
+                        }
+                        "--dsn" => {
+                            j += 1;
+                            dsn = Some(args.get(j).cloned().ok_or("--dsn requires a value")?);
+                        }
+                        "--app-url" => {
+                            j += 1;
+                            app_url =
+                                Some(args.get(j).cloned().ok_or("--app-url requires a value")?);
+                        }
+                        "--org" => {
+                            j += 1;
+                            org = Some(args.get(j).cloned().ok_or("--org requires a value")?);
+                        }
+                        "--project" => {
+                            j += 1;
+                            project =
+                                Some(args.get(j).cloned().ok_or("--project requires a value")?);
+                        }
+                        "--token" => {
+                            j += 1;
+                            token = Some(args.get(j).cloned().ok_or("--token requires a value")?);
+                        }
+                        "--json" => json = true,
+                        other => return Err(format!("Unknown check option: {other}")),
+                    }
+                    j += 1;
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Check {
+                        url,
+                        dsn,
+                        app_url,
+                        org,
+                        project,
+                        token,
+                        json,
+                    },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "ai-prompt" => {
+                let mut dsn = env::var("BUGFINDER_DSN").unwrap_or_default();
+                let mut app_url = env::var("BUGFINDER_APP_URL").ok();
+                let mut org = env::var("BUGFINDER_ORG").ok();
+                let mut project = env::var("BUGFINDER_PROJECT").ok();
+                let mut stack = "auto".to_string();
+                let mut dir = PathBuf::from(".");
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--dsn" => {
+                            j += 1;
+                            dsn = args.get(j).cloned().ok_or("--dsn requires value")?;
+                        }
+                        "--app-url" => {
+                            j += 1;
+                            app_url = Some(args.get(j).cloned().ok_or("--app-url requires value")?);
+                        }
+                        "--org" => {
+                            j += 1;
+                            org = Some(args.get(j).cloned().ok_or("--org requires value")?);
+                        }
+                        "--project" => {
+                            j += 1;
+                            project = Some(args.get(j).cloned().ok_or("--project requires value")?);
+                        }
+                        "--stack" => {
+                            j += 1;
+                            stack = args.get(j).cloned().ok_or("--stack requires value")?;
+                        }
+                        "--dir" => {
+                            j += 1;
+                            dir = PathBuf::from(args.get(j).ok_or("--dir requires path")?);
+                        }
+                        other => return Err(format!("Unknown ai-prompt option: {other}")),
+                    }
+                    j += 1;
+                }
+                if dsn.trim().is_empty() {
+                    return Err("ai-prompt requires --dsn <url> (or BUGFINDER_DSN env var)".into());
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::AiPrompt {
+                        dsn,
+                        app_url,
+                        org,
+                        project,
+                        stack,
+                        dir,
+                    },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "lint" => {
+                let mut dir = PathBuf::from(".");
+                let mut j = 2;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--dir" => {
+                            j += 1;
+                            dir = PathBuf::from(args.get(j).ok_or("--dir requires path")?);
+                        }
+                        other => return Err(format!("Unknown lint option: {other}")),
+                    }
+                    j += 1;
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::Lint { dir },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "keygen" => {
+                return Ok(ParsedArgs {
+                    command: CliCommand::Keygen,
                     bind_override: None,
                     data_override: None,
                     db_override: None,

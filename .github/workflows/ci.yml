@@ -14,14 +14,14 @@ env:
 
 jobs:
   lint-ui-and-test:
-    name: Build UI, Clippy, Security Lint & Test Suite
+    name: Build UI, Clippy, Rust Security Lint & Test Suite
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -34,25 +34,26 @@ jobs:
           npm audit --audit-level=moderate
           npm run build
 
-      - name: Validate browser SDK syntax
+      - name: Validate browser SDK and shell script syntax
         run: |
           node --check sdks/browser/bugfinder-mini.js
           node --check sdks/browser/bugfinder-shield.js
-
-      - name: Run security invariant linter
-        run: python3 scripts/security-lint.py
+          bash -n scripts/check.sh scripts/install.sh scripts/build-release.sh
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.89
         with:
           toolchain: "1.89"
           components: rustfmt, clippy
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Verify rustfmt
         run: cargo fmt --all -- --check
+
+      - name: Run native Rust security invariant linter
+        run: cargo run --locked -- lint --dir .
 
       - name: Run clippy with -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -79,10 +80,10 @@ jobs:
           --health-retries=10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Build UI bundle for build.rs
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -91,11 +92,11 @@ jobs:
         run: npm ci --no-audit --no-fund && npm run build
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.89
         with:
           toolchain: "1.89"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Provision NOBYPASSRLS runtime role and execute PG17 RLS test suite
         env:

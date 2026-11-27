@@ -75,6 +75,35 @@ pub fn sign_webhook_body(secret: &str, timestamp: i64, body: &[u8]) -> String {
     format!("t={timestamp},v1={sig}")
 }
 
+/// Computes both legacy `v1` (`ts.body`) and replay-protected `v2` (`ts.delivery_id.body`) HMAC signatures.
+pub fn sign_webhook_body_v2(
+    secret: &str,
+    timestamp: i64,
+    delivery_id: &str,
+    body: &[u8],
+) -> String {
+    let mut mac_v1 = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac_v1.update(timestamp.to_string().as_bytes());
+    mac_v1.update(b".");
+    mac_v1.update(body);
+    let v1 = hex::encode(mac_v1.finalize().into_bytes());
+
+    let mut mac_v2 = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac_v2.update(timestamp.to_string().as_bytes());
+    mac_v2.update(b".");
+    mac_v2.update(delivery_id.as_bytes());
+    mac_v2.update(b".");
+    mac_v2.update(body);
+    let v2 = hex::encode(mac_v2.finalize().into_bytes());
+    format!("t={timestamp},v1={v1},v2={v2}")
+}
+
+fn sanitize_http_header_val(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+        .collect()
+}
+
 pub fn format_alert_payload(job: &AlertDispatchJob) -> Value {
     match job.channel_type.as_str() {
         "slack" => json!({
@@ -163,13 +192,19 @@ fn send_http_payload(agent: &ureq::Agent, url: &str, job: &AlertDispatchJob) -> 
     let payload = format_alert_payload(job);
     let body_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
     let ts = chrono::Utc::now().timestamp();
+    let delivery_id = uuid::Uuid::new_v4().to_string();
     let mut req = agent
         .post(url)
         .set("Content-Type", "application/json")
-        .set("User-Agent", "BugFinder-Alerts/1.0");
+        .set("User-Agent", "BugFinder-Alerts/2.0")
+        .set(
+            "X-BugFinder-Delivery",
+            &sanitize_http_header_val(&delivery_id),
+        )
+        .set("X-BugFinder-Timestamp", &ts.to_string());
     if job.channel_type != "telegram" && !job.webhook_secret.is_empty() {
-        let sig = sign_webhook_body(&job.webhook_secret, ts, &body_bytes);
-        req = req.set("X-BugFinder-Signature", &sig);
+        let sig = sign_webhook_body_v2(&job.webhook_secret, ts, &delivery_id, &body_bytes);
+        req = req.set("X-BugFinder-Signature", &sanitize_http_header_val(&sig));
     }
     let resp = req
         .send_bytes(&body_bytes)
@@ -286,6 +321,10 @@ mod tests {
         let sig = sign_webhook_body("my-secret", 1700000000, br#"{"ok":true}"#);
         assert!(sig.starts_with("t=1700000000,v1="));
         assert_eq!(sig.len(), "t=1700000000,v1=".len() + 64);
+
+        let sig_v2 = sign_webhook_body_v2("my-secret", 1700000000, "deliv-1", br#"{"ok":true}"#);
+        assert!(sig_v2.starts_with("t=1700000000,v1="));
+        assert!(sig_v2.contains(",v2="));
     }
 
     #[test]
@@ -398,9 +437,11 @@ mod tests {
 
         let captured = handle.join().unwrap();
         let hdrs_and_body_0 = &captured[0];
-        assert!(hdrs_and_body_0
-            .to_ascii_lowercase()
-            .contains("x-bugfinder-signature:"));
+        let lower_0 = hdrs_and_body_0.to_ascii_lowercase();
+        assert!(lower_0.contains("x-bugfinder-signature:"));
+        assert!(lower_0.contains("x-bugfinder-delivery:"));
+        assert!(lower_0.contains("x-bugfinder-timestamp:"));
+        assert!(lower_0.contains(",v2="));
         assert!(hdrs_and_body_0.contains("\"embeds\""));
 
         let hdrs_and_body_1 = &captured[1];

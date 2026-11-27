@@ -1,5 +1,6 @@
 use crate::security::auth::{constant_time_eq, sha256_hex};
 use hmac::{Hmac, Mac};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use sha1::Sha1;
 use std::fmt::Write as _;
@@ -57,7 +58,7 @@ pub fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
 
 pub fn generate_totp_secret_b32() -> String {
     let mut raw = [0u8; 20];
-    rand::thread_rng().fill_bytes(&mut raw);
+    OsRng.fill_bytes(&mut raw);
     encode_base32(&raw)
 }
 
@@ -128,11 +129,10 @@ pub fn build_otpauth_uri(issuer: &str, email: &str, secret_b32: &str) -> String 
 
 /// Generate 10 high-entropy single-use recovery codes and their salted SHA-256 hashes.
 pub fn generate_recovery_codes() -> Vec<(String, String)> {
-    let mut rng = rand::thread_rng();
     let mut out = Vec::with_capacity(10);
     for _ in 0..10 {
         let mut raw = [0u8; 10];
-        rng.fill_bytes(&mut raw);
+        OsRng.fill_bytes(&mut raw);
         let mut chars = String::with_capacity(11);
         for (idx, b) in raw.iter().enumerate() {
             if idx == 5 {
@@ -142,7 +142,7 @@ pub fn generate_recovery_codes() -> Vec<(String, String)> {
         }
         let norm: String = chars.chars().filter(|&c| c != '-').collect();
         let mut salt = [0u8; 8];
-        rng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut salt);
         let salt_hex = hex::encode(salt);
         let digest = sha256_hex(format!("{salt_hex}:{norm}").as_bytes());
         out.push((chars, format!("v1:{salt_hex}:{digest}")));

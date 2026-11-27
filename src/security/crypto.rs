@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::hkdf;
@@ -40,7 +41,7 @@ pub fn seal_secret(app_key: &[u8; 32], aad: &[u8], plaintext: &str) -> Result<St
     let key = LessSafeKey::new(unbound);
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     let mut in_out = plaintext.as_bytes().to_vec();

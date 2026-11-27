@@ -107,15 +107,15 @@ fail_missing() {
 }
 
 generate_app_key() {
-  if command -v openssl >/dev/null 2>&1; then
+  if [[ -x "${PREFIX}/bugfinder" ]]; then
+    "${PREFIX}/bugfinder" keygen
+  elif command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 32
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import secrets; print(secrets.token_hex(32))'
   elif [[ -r /dev/urandom ]]; then
     od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
     printf '\n'
   else
-    fail_missing "openssl or python3" "Install openssl or python3 to generate cryptographic BUGFINDER_APP_KEY."
+    fail_missing "openssl" "Install openssl or make /dev/urandom readable to generate BUGFINDER_APP_KEY."
   fi
 }
 

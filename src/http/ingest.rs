@@ -50,7 +50,7 @@ pub fn attach_ingest_cors(headers: &mut HeaderMap) {
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static(
-            "Content-Type, Content-Encoding, Authorization, X-Sentry-Auth, X-Requested-With",
+            "Content-Type, Content-Encoding, Authorization, X-Sentry-Auth, X-Requested-With, X-BugFinder-Check",
         ),
     );
     headers.insert(
@@ -76,6 +76,61 @@ pub fn attach_ingest_cors_for_request(
                 if let Ok(val) = HeaderValue::from_str(trimmed) {
                     resp_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, val);
                 }
+            }
+        }
+    }
+}
+
+fn is_dry_probe(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-bugfinder-check")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("dry-probe"))
+}
+
+fn json_exceeds_max_depth(val: &Value, max_depth: usize) -> bool {
+    fn visit(v: &Value, depth: usize, max_depth: usize) -> bool {
+        if depth > max_depth {
+            return true;
+        }
+        match v {
+            Value::Array(arr) => arr.iter().any(|item| visit(item, depth + 1, max_depth)),
+            Value::Object(map) => map.values().any(|item| visit(item, depth + 1, max_depth)),
+            _ => false,
+        }
+    }
+    visit(val, 0, max_depth)
+}
+
+fn clamp_event_timestamp(ev: &mut Value) {
+    const MAX_SKEW_SECS: f64 = 86_400.0;
+    let now_sec = chrono::Utc::now().timestamp() as f64;
+    let Some(obj) = ev.as_object_mut() else {
+        return;
+    };
+    let parsed_ts = match obj.get("timestamp") {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s.trim())
+            .ok()
+            .map(|dt| dt.timestamp() as f64),
+        _ => None,
+    };
+    if let Some(ts) = parsed_ts {
+        if !ts.is_finite() || (ts - now_sec).abs() > MAX_SKEW_SECS {
+            let clamped = ts.clamp(now_sec - MAX_SKEW_SECS, now_sec + MAX_SKEW_SECS);
+            if let Some(num) = serde_json::Number::from_f64(clamped) {
+                obj.insert("timestamp".to_string(), Value::Number(num));
+            } else {
+                obj.remove("timestamp");
+            }
+            let tags_entry = obj
+                .entry("tags".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(tags_obj) = tags_entry.as_object_mut() {
+                tags_obj.insert(
+                    "clock_skew_clamped".to_string(),
+                    Value::String("true".to_string()),
+                );
             }
         }
     }
@@ -349,7 +404,10 @@ fn is_event_throttled(auth: &ProjectAuthInfo) -> bool {
     if eff == 0 {
         return false;
     }
-    rand::random::<u8>() % 100 < eff
+    use rand::RngCore;
+    let mut b = [0u8; 1];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    (b[0] % 100) < eff
 }
 
 async fn process_single_event(
@@ -359,6 +417,13 @@ async fn process_single_event(
     client_ip: &str,
     mut ev: Value,
 ) -> Result<Option<String>, Box<Response>> {
+    if json_exceeds_max_depth(&ev, 32) {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "JSON nesting depth exceeded",
+        )));
+    }
+    clamp_event_timestamp(&mut ev);
     let origin = headers
         .get(header::ORIGIN)
         .or_else(|| headers.get(header::REFERER))
@@ -400,6 +465,10 @@ async fn process_single_event(
     let payload_json = serde_json::to_vec(&ev).unwrap_or_else(|_| b"{}".to_vec());
     let received_ms = now_ms();
     let event_id = meta.event_id.clone();
+
+    if is_dry_probe(headers) {
+        return Ok(Some(event_id));
+    }
 
     if auth.filters.shield.enabled
         && auth.filters.shield.secret_leak_alerts
@@ -486,6 +555,7 @@ async fn process_logs_batch(
     state: &AppState,
     auth: &ProjectAuthInfo,
     client_ip: &str,
+    dry_probe: bool,
     mut logs: Vec<NormalizedLog>,
 ) -> Result<(), Box<Response>> {
     if logs.is_empty() {
@@ -498,7 +568,7 @@ async fn process_logs_batch(
 
     for l in logs.iter_mut() {
         let rep = scrubber.scrub_log_with_report(&mut l.body, &mut l.attributes);
-        if auth.filters.shield.enabled && auth.filters.shield.secret_leak_alerts {
+        if !dry_probe && auth.filters.shield.enabled && auth.filters.shield.secret_leak_alerts {
             for c in rep.categories {
                 if !leaked_cats.contains(&c) {
                     leaked_cats.push(c);
@@ -511,27 +581,33 @@ async fn process_logs_batch(
         if l.service.is_empty() {
             l.service = auth.project_slug.clone();
         }
-        if let Some(threat) = state.shield_engine.inspect_log_for_threats(
-            auth.project_id,
-            &auth.filters.shield,
-            l.timestamp_ms,
-            |actor| shield_ip_hmac(&state.config.app_key, auth.project_id, actor),
-            l,
-        ) {
-            detected_threats.push(threat);
+        if !dry_probe {
+            if let Some(threat) = state.shield_engine.inspect_log_for_threats(
+                auth.project_id,
+                &auth.filters.shield,
+                l.timestamp_ms,
+                |actor| shield_ip_hmac(&state.config.app_key, auth.project_id, actor),
+                l,
+            ) {
+                detected_threats.push(threat);
+            }
+            live_items.push(LiveStreamEvent {
+                organization_id: auth.organization_id,
+                project_id: auth.project_id,
+                kind: "log".into(),
+                level: l.level.as_str().to_string(),
+                title_or_body: l.body.clone(),
+                service: l.service.clone(),
+                environment: l.environment.clone(),
+                trace_id: l.trace_id.clone(),
+                timestamp_ms: l.timestamp_ms,
+                payload: l.attributes.clone(),
+            });
         }
-        live_items.push(LiveStreamEvent {
-            organization_id: auth.organization_id,
-            project_id: auth.project_id,
-            kind: "log".into(),
-            level: l.level.as_str().to_string(),
-            title_or_body: l.body.clone(),
-            service: l.service.clone(),
-            environment: l.environment.clone(),
-            trace_id: l.trace_id.clone(),
-            timestamp_ms: l.timestamp_ms,
-            payload: l.attributes.clone(),
-        });
+    }
+
+    if dry_probe {
+        return Ok(());
     }
 
     let now = now_ms();
@@ -653,6 +729,7 @@ async fn handle_parsed_envelope(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
+    let dry_probe = is_dry_probe(headers);
     let received_ms = now_ms();
     let tx_scrubber = Scrubber::from_filters_with_org(&auth.filters, auth.org_scrub_ip_addresses);
     for item in parsed.items {
@@ -664,10 +741,13 @@ async fn handle_parsed_envelope(
                 }
             }
             EnvelopeItem::Logs(logs) => {
-                process_logs_batch(state, auth, client_ip, logs).await?;
+                process_logs_batch(state, auth, client_ip, dry_probe, logs).await?;
             }
             EnvelopeItem::Transaction(mut tr) => {
                 tx_scrubber.scrub_log_in_place(&mut tr.name, &mut tr.spans);
+                if dry_probe {
+                    continue;
+                }
                 if state
                     .batch_writer
                     .try_enqueue(IngestWriteItem::Transaction {
@@ -685,26 +765,34 @@ async fn handle_parsed_envelope(
                     .fetch_add(1, Ordering::Relaxed);
             }
             EnvelopeItem::Session(sess) => {
-                let _ = state.batch_writer.try_enqueue(IngestWriteItem::Session {
-                    organization_id: auth.organization_id,
-                    project_id: auth.project_id,
-                    session: sess,
-                    received_ms,
-                });
+                if !dry_probe {
+                    let _ = state.batch_writer.try_enqueue(IngestWriteItem::Session {
+                        organization_id: auth.organization_id,
+                        project_id: auth.project_id,
+                        session: sess,
+                        received_ms,
+                    });
+                }
             }
             EnvelopeItem::CheckIn(ci) => {
-                let _ = state.batch_writer.try_enqueue(IngestWriteItem::CheckIn {
-                    organization_id: auth.organization_id,
-                    project_id: auth.project_id,
-                    check_in: ci,
-                    received_ms,
-                });
+                if !dry_probe {
+                    let _ = state.batch_writer.try_enqueue(IngestWriteItem::CheckIn {
+                        organization_id: auth.organization_id,
+                        project_id: auth.project_id,
+                        check_in: ci,
+                        received_ms,
+                    });
+                }
             }
             EnvelopeItem::Attachment { .. } | EnvelopeItem::Ignored => {}
         }
     }
 
-    Ok(json!({ "id": primary_event_id }))
+    if dry_probe {
+        Ok(json!({ "id": primary_event_id, "dry_probe": true, "project_slug": auth.project_slug }))
+    } else {
+        Ok(json!({ "id": primary_event_id }))
+    }
 }
 
 async fn handle_envelope_bytes(
@@ -863,8 +951,12 @@ pub async fn ingest_store(
     };
     match process_single_event(&state, &auth, &headers, &client_ip, ev).await {
         Ok(Some(eid)) => {
-            let mut r =
-                (StatusCode::OK, Json(json!({ "id": eid, "event_id": eid }))).into_response();
+            let body = if is_dry_probe(&headers) {
+                json!({ "id": eid, "event_id": eid, "dry_probe": true, "project_slug": auth.project_slug })
+            } else {
+                json!({ "id": eid, "event_id": eid })
+            };
+            let mut r = (StatusCode::OK, Json(body)).into_response();
             attach_ingest_cors_for_request(
                 r.headers_mut(),
                 &headers,
@@ -1048,13 +1140,19 @@ pub async fn ingest_otlp_logs(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/x-protobuf");
+    let dry_probe = is_dry_probe(&headers);
     let logs = match decode_otlp_logs(&decompressed, ct) {
         Ok(l) => l,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.0),
     };
-    match process_logs_batch(&state, &auth, &client_ip, logs).await {
+    match process_logs_batch(&state, &auth, &client_ip, dry_probe, logs).await {
         Ok(()) => {
-            let mut r = (StatusCode::OK, Json(json!({ "partialSuccess": {} }))).into_response();
+            let body = if dry_probe {
+                json!({ "partialSuccess": {}, "dry_probe": true, "project_slug": auth.project_slug })
+            } else {
+                json!({ "partialSuccess": {} })
+            };
+            let mut r = (StatusCode::OK, Json(body)).into_response();
             attach_ingest_cors_for_request(
                 r.headers_mut(),
                 &headers,
@@ -1150,9 +1248,15 @@ pub async fn ingest_direct_logs(
             attributes: item.get("attributes").cloned().unwrap_or_else(|| json!({})),
         });
     }
-    match process_logs_batch(&state, &auth, &client_ip, normalized).await {
+    let dry_probe = is_dry_probe(&headers);
+    match process_logs_batch(&state, &auth, &client_ip, dry_probe, normalized).await {
         Ok(()) => {
-            let mut r = (StatusCode::ACCEPTED, Json(json!({ "accepted": true }))).into_response();
+            let body = if dry_probe {
+                json!({ "accepted": true, "dry_probe": true, "project_slug": auth.project_slug })
+            } else {
+                json!({ "accepted": true })
+            };
+            let mut r = (StatusCode::ACCEPTED, Json(body)).into_response();
             attach_ingest_cors_for_request(
                 r.headers_mut(),
                 &headers,
@@ -1390,6 +1494,22 @@ pub async fn ingest_shield(
         .chars()
         .take(64)
         .collect();
+
+    if is_dry_probe(&headers) {
+        let mut r = (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "ok": true,
+                "dry_probe": true,
+                "risk_score": scored.risk_score,
+                "severity": scored.severity,
+                "action": "dry_probe",
+            })),
+        )
+            .into_response();
+        attach_ingest_cors_for_request(r.headers_mut(), &headers, &auth.filters.allowed_domains);
+        return r;
+    }
 
     emit_shield_security_event(
         &state,

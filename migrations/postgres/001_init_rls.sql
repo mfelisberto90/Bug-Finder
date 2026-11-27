@@ -726,3 +726,21 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO bu
 REVOKE INSERT, UPDATE, DELETE ON bugfinder_schema_meta FROM bugfinder_app;
 GRANT SELECT ON bugfinder_schema_meta TO bugfinder_app;
 REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs FROM bugfinder_app;
+
+CREATE INDEX IF NOT EXISTS idx_pg_logs_org_ts ON log_events(organization_id, timestamp_ms DESC);
+
+CREATE OR REPLACE FUNCTION prevent_audit_logs_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_logs is append-only and cannot be modified or deleted';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_audit_logs_immutable_update ON audit_logs;
+CREATE TRIGGER trg_audit_logs_immutable_update
+    BEFORE UPDATE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_logs_mutation();
+
+DROP TRIGGER IF EXISTS trg_audit_logs_immutable_delete ON audit_logs;
+CREATE TRIGGER trg_audit_logs_immutable_delete
+    BEFORE DELETE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_logs_mutation();

@@ -1,15 +1,22 @@
 #![recursion_limit = "256"]
 
+use bugfinder::ai_blueprint::{
+    detect_stack_from_dir, render_project_ai_blueprint, ProjectBlueprintParams,
+};
+use bugfinder::cli_check::{run_check_cli, CheckOptions};
 use bugfinder::cli_integrate::{
     run_init_cli, run_pipe_cli, run_sourcemaps_upload_cli, run_wrap_cli,
 };
 use bugfinder::config::{parse_cli_args, AppConfig, CliCommand};
+use bugfinder::domain::envelope::parse_dsn_url;
 use bugfinder::http::router::build_router;
+use bugfinder::lint::run_lint_cli;
 use bugfinder::mcp::{run_mcp_stdio, run_synthetic_test, run_tail_cli};
 use bugfinder::runtime::{
     build_compact_tokio_runtime, init_low_ram_allocator, probe_existing_instance, run_healthcheck,
     spawn_desktop_window, wait_for_desktop_browser,
 };
+use bugfinder::security::auth::generate_app_key_hex;
 use bugfinder::selfcheck::{install_panic_hook, run_doctor_cli};
 use bugfinder::storage::batch_writer::spawn_alert_jobs;
 use bugfinder::storage::postgres::PostgresStorage;
@@ -41,6 +48,10 @@ fn main() -> ExitCode {
                 "Bug-Finder v{}\n\n\
                  USAGE:\n  \
                    bugfinder [--headless | --app] [--bind ADDR] [--data DIR] [--db URL]\n  \
+                   bugfinder ai-prompt --dsn DSN [--app-url URL] [--stack auto|web|node|rust|python|laravel|go] [--dir PATH]\n  \
+                   bugfinder check [--url URL] [--dsn DSN] [--app-url APP_URL] [--org SLUG] [--project SLUG] [--token TOK] [--json]\n  \
+                   bugfinder lint [--dir PATH]\n  \
+                   bugfinder keygen\n  \
                    bugfinder init --dsn DSN [--dir PATH] [--stack auto|web|node|next|vite|python|laravel|go|rust] [--sdk zero-dep|sentry]\n  \
                    bugfinder wrap --dsn DSN [--service NAME] [--heartbeat-url URL] -- CMD...\n  \
                    bugfinder pipe --dsn DSN [--service NAME]\n  \
@@ -274,6 +285,74 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        CliCommand::Check {
+            url,
+            dsn,
+            app_url,
+            org,
+            project,
+            token,
+            json,
+        } => ExitCode::from(run_check_cli(&CheckOptions {
+            url,
+            dsn,
+            app_url,
+            org,
+            project,
+            token,
+            json,
+        })),
+        CliCommand::AiPrompt {
+            dsn,
+            app_url,
+            org,
+            project,
+            stack,
+            dir,
+        } => {
+            let Some((_, pid)) = parse_dsn_url(&dsn) else {
+                eprintln!("Invalid --dsn URL: {dsn}");
+                return ExitCode::from(2);
+            };
+            let base_url = dsn
+                .split('/')
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("/")
+                .replace(|_| false, "");
+            let clean_base = if let Some(scheme_end) = base_url.find("://") {
+                let after = &base_url[scheme_end + 3..];
+                let host = after.rsplit_once('@').map(|(_, h)| h).unwrap_or(after);
+                format!("{}://{host}", &base_url[..scheme_end])
+            } else {
+                "https://bugs.example.com".to_string()
+            };
+            let eff_stack = if stack.eq_ignore_ascii_case("auto") {
+                detect_stack_from_dir(&dir)
+            } else {
+                stack.as_str()
+            };
+            let (mini_sri, shield_sri) = bugfinder::http::router::sdk_sri_hashes();
+            let prompt = render_project_ai_blueprint(&ProjectBlueprintParams {
+                base_url: &clean_base,
+                org_slug: org.as_deref().unwrap_or("default"),
+                project_slug: project.as_deref().unwrap_or("app"),
+                project_id: pid,
+                dsn: &dsn,
+                tunnel_slug: None,
+                app_url: app_url.as_deref(),
+                stack: eff_stack,
+                mini_sdk_sri: mini_sri,
+                shield_sdk_sri: shield_sri,
+            });
+            println!("{prompt}");
+            ExitCode::SUCCESS
+        }
+        CliCommand::Lint { dir } => ExitCode::from(run_lint_cli(&dir)),
+        CliCommand::Keygen => {
+            println!("{}", generate_app_key_hex());
+            ExitCode::SUCCESS
+        }
         CliCommand::Mcp { org, token } => {
             let cfg = match AppConfig::from_env_and_overrides(
                 None,

@@ -15,10 +15,7 @@ if [[ ! -f "$ROOT_DIR/ui/dist/index.html" ]]; then
   exit 1
 fi
 
-echo "[2/3] Running security invariant linter..."
-python3 "$ROOT_DIR/scripts/security-lint.py"
-
-echo "[3/3] Building hardened single-binary Rust release with cargo-auditable..."
+echo "[2/3] Building hardened single-binary Rust release..."
 CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
 [[ -d "${CARGO_HOME_DIR}/bin" ]] && export PATH="${CARGO_HOME_DIR}/bin:${PATH}"
@@ -39,6 +36,9 @@ if command -v cargo-auditable >/dev/null 2>&1; then
 else
   cargo build --release "$@"
 fi
+
+echo "[3/3] Running native Rust security invariant linter (<5 ms)..."
+"$ROOT_DIR/target/release/bugfinder" lint --dir "$ROOT_DIR"
 
 echo "Release binary built at: $ROOT_DIR/target/release/bugfinder"
 ls -lh "$ROOT_DIR/target/release/bugfinder"
