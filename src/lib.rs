@@ -31,7 +31,7 @@ use crate::storage::sqlite::SqliteStorage;
 use crate::storage::StorageBackend;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 pub struct AppState {
     pub config: Arc<AppConfig>,
@@ -50,6 +50,7 @@ pub struct AppState {
     pub oidc_client: Option<Arc<OidcClient>>,
     pub live_tx: broadcast::Sender<LiveStreamEvent>,
     pub sse_sem: Arc<tokio::sync::Semaphore>,
+    pub shutdown_tx: watch::Sender<bool>,
 }
 
 pub async fn build_storage(config: &AppConfig) -> Result<Arc<dyn StorageBackend>, String> {
@@ -86,6 +87,7 @@ pub fn build_app_state(config: Arc<AppConfig>, storage: Arc<dyn StorageBackend>)
         .clone()
         .map(|cfg| Arc::new(OidcClient::new(cfg, config.is_dev)));
     let (live_tx, _) = broadcast::channel::<LiveStreamEvent>(512);
+    let (shutdown_tx, _) = watch::channel(false);
 
     Arc::new(AppState {
         config,
@@ -104,5 +106,6 @@ pub fn build_app_state(config: Arc<AppConfig>, storage: Arc<dyn StorageBackend>)
         oidc_client,
         live_tx,
         sse_sem: Arc::new(tokio::sync::Semaphore::new(64)),
+        shutdown_tx,
     })
 }

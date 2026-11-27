@@ -65,16 +65,43 @@ pub fn format_logentry(ev: &Value) -> Option<String> {
         }
         if let Some(tmpl) = le.get("message").and_then(|v| v.as_str()) {
             if let Some(params) = le.get("params").and_then(|v| v.as_array()) {
-                let mut out = tmpl.to_string();
-                for p in params {
-                    let rep = match p {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
+                // Single-pass bounded interpolation preventing quadratic `%s`/`{}` expansion.
+                let mut out = String::with_capacity(tmpl.len().min(1024));
+                let mut rest = tmpl;
+                let mut param_iter = params.iter().take(16);
+                while !rest.is_empty() && out.len() < 1024 {
+                    let next_pct = rest.find("%s");
+                    let next_brace = rest.find("{}");
+                    let next_pos = match (next_pct, next_brace) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
                     };
-                    if let Some(idx) = out.find("%s") {
-                        out.replace_range(idx..idx + 2, &rep);
-                    } else if let Some(idx) = out.find("{}") {
-                        out.replace_range(idx..idx + 2, &rep);
+                    match (next_pos, param_iter.next()) {
+                        (Some(idx), Some(p)) => {
+                            out.push_str(&rest[..idx]);
+                            let rep = match p {
+                                Value::String(s) => s.as_str().to_string(),
+                                other => other.to_string(),
+                            };
+                            let remaining = 1024usize.saturating_sub(out.len());
+                            if rep.len() <= remaining {
+                                out.push_str(&rep);
+                            } else {
+                                out.push_str(&rep.chars().take(remaining).collect::<String>());
+                            }
+                            rest = &rest[idx + 2..];
+                        }
+                        _ => {
+                            let remaining = 1024usize.saturating_sub(out.len());
+                            if rest.len() <= remaining {
+                                out.push_str(rest);
+                            } else {
+                                out.push_str(&rest.chars().take(remaining).collect::<String>());
+                            }
+                            break;
+                        }
                     }
                 }
                 return Some(out);
@@ -436,36 +463,39 @@ pub fn is_internal_or_non_app_frame(raw: &str) -> bool {
         || low.contains("node_modules")
 }
 
+fn extract_host_no_port(raw: &str) -> String {
+    let authority = raw
+        .trim()
+        .split("://")
+        .last()
+        .unwrap_or(raw)
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or("");
+    if authority.starts_with('[') {
+        authority
+            .find(']')
+            .map(|end| authority[..=end].to_ascii_lowercase())
+            .unwrap_or_default()
+    } else {
+        authority
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+}
+
 pub fn is_origin_allowed(origin_or_referer: &str, allowed_domains: &[String]) -> bool {
     if allowed_domains.is_empty() {
         return true;
     }
-    let host = origin_or_referer
-        .split("://")
-        .nth(1)
-        .unwrap_or(origin_or_referer)
-        .split(&['/', '?', '#'][..])
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let host = extract_host_no_port(origin_or_referer);
     if host.is_empty() {
         return false;
     }
     allowed_domains.iter().any(|d| {
-        let d_raw = d.trim().to_ascii_lowercase();
-        let d_low = d_raw
-            .split("://")
-            .last()
-            .unwrap_or(&d_raw)
-            .split(&['/', '?', '#'][..])
-            .next()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("");
+        let d_low = extract_host_no_port(d);
         if d_low.is_empty() {
             return false;
         }

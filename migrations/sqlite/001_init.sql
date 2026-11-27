@@ -18,8 +18,13 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1,
+    oidc_issuer TEXT,
+    oidc_sub TEXT,
     created_at INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_sub
+    ON users(oidc_issuer, oidc_sub)
+    WHERE oidc_issuer IS NOT NULL AND oidc_sub IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS organization_members (
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,

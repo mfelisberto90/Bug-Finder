@@ -113,12 +113,10 @@ impl<K: Eq + Hash + Clone, V> BoundedMap<K, V> {
         removed
     }
 
+    #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 
     pub fn retain<F>(&mut self, mut keep: F)
@@ -144,25 +142,31 @@ pub struct RateLimitDecision {
 }
 
 /// Sharded multi-bucket HMAC-SHA256 rate limiter. Uses 32-byte stack digests (zero heap key allocs).
-/// Separates auth/spray buckets from high-cardinality ingest buckets so floods cannot evict auth limits.
+/// Isolates `auth_ip`, `auth_principal`, and general ingest buckets so fake-email or ingest floods
+/// cannot FIFO-evict active IP spray counters.
 pub struct HmacRateLimiter {
     app_key: [u8; 32],
-    auth_buckets: ShardedBoundedMap<[u8; 32], Bucket, 16>,
+    auth_ip_buckets: ShardedBoundedMap<[u8; 32], Bucket, 16>,
+    auth_principal_buckets: ShardedBoundedMap<[u8; 32], Bucket, 16>,
     general_buckets: ShardedBoundedMap<[u8; 32], Bucket, 16>,
 }
 
 impl HmacRateLimiter {
     pub fn new(app_key: [u8; 32], max_buckets: usize) -> Self {
+        let auth_cap = max_buckets.clamp(256, 8_192);
         Self {
             app_key,
-            auth_buckets: ShardedBoundedMap::new(max_buckets.clamp(256, 8_192)),
+            auth_ip_buckets: ShardedBoundedMap::new(auth_cap),
+            auth_principal_buckets: ShardedBoundedMap::new(auth_cap),
             general_buckets: ShardedBoundedMap::new(max_buckets),
         }
     }
 
     fn target_map(&self, scope: &str) -> &ShardedBoundedMap<[u8; 32], Bucket, 16> {
-        if scope.starts_with("auth_") {
-            &self.auth_buckets
+        if scope == "auth_ip" {
+            &self.auth_ip_buckets
+        } else if scope.starts_with("auth_") {
+            &self.auth_principal_buckets
         } else {
             &self.general_buckets
         }
@@ -262,7 +266,7 @@ impl EventDedupeCache {
         });
     }
 
-    /// Returns `true` if this `(project_id, event_id)` was already seen within `ttl`.
+    #[cfg(test)]
     pub fn check_and_mark(&self, project_id: i64, event_id: &str) -> bool {
         let key = (project_id, event_id.to_string());
         let now = Instant::now();

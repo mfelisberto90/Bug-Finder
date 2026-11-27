@@ -155,6 +155,17 @@ fn smtp_transaction<S: Read + Write>(
         return Err("Invalid SMTP recipient address".into());
     }
     let safe_subj = sanitize_header_val(subject);
+    let encoded_subj = if safe_subj.is_ascii() {
+        safe_subj
+    } else {
+        format!("=?UTF-8?B?{}?=", STANDARD.encode(safe_subj.as_bytes()))
+    };
+    let bounded_body: String = body_text
+        .chars()
+        .filter(|&c| c != '\r' && c != '\0')
+        .take(8192)
+        .collect();
+    let body_b64 = STANDARD.encode(bounded_body.as_bytes());
 
     let mail_from = format!("MAIL FROM:<{safe_from_addr}>\r\n");
     reader
@@ -180,15 +191,14 @@ fn smtp_transaction<S: Read + Write>(
     expect_code(read_smtp_response(&mut reader)?, 3)?;
 
     let mut msg = format!(
-        "From: {safe_from}\r\nTo: <{safe_to}>\r\nSubject: {safe_subj}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        "From: {safe_from}\r\nTo: <{safe_to}>\r\nSubject: {encoded_subj}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
     );
-    // Dot-stuff lines beginning with '.' per RFC 5321
-    for line in body_text.lines() {
-        if line.starts_with('.') {
-            msg.push('.');
+    // RFC 2045 / RFC 5321 compliant 76-char wrapped Base64 lines (never exceeds 998-byte MTA limit)
+    for chunk in body_b64.as_bytes().chunks(76) {
+        if let Ok(s) = std::str::from_utf8(chunk) {
+            msg.push_str(s);
+            msg.push_str("\r\n");
         }
-        msg.push_str(line);
-        msg.push_str("\r\n");
     }
     msg.push_str(".\r\n");
 

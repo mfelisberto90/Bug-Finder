@@ -29,7 +29,10 @@ EXTRA_FLAGS=(
   "--remap-path-prefix=${ROOT_DIR}=/src"
   "--remap-path-prefix=${HOME}=/build"
 )
-export RUSTFLAGS="${RUSTFLAGS:-} ${EXTRA_FLAGS[*]}"
+IFS=$'\x1f'
+export CARGO_ENCODED_RUSTFLAGS="${EXTRA_FLAGS[*]}"
+unset IFS
+unset RUSTFLAGS
 
 if command -v cargo-auditable >/dev/null 2>&1; then
   cargo auditable build --release "$@"

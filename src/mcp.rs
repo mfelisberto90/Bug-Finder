@@ -43,6 +43,23 @@ pub async fn run_mcp_stdio(
             break;
         }
         if line.len() > MAX_MCP_LINE_BYTES {
+            // Drain remainder of oversized line up to '\n' to prevent stdio JSON-RPC framing desync.
+            if !line.ends_with('\n') {
+                let mut discard = [0u8; 4096];
+                loop {
+                    let buf = reader.fill_buf().map_err(|e| e.to_string())?;
+                    if buf.is_empty() {
+                        break;
+                    }
+                    if let Some(pos) = memchr::memchr(b'\n', buf) {
+                        reader.consume(pos + 1);
+                        break;
+                    }
+                    let take_n = buf.len().min(discard.len());
+                    discard[..take_n].copy_from_slice(&buf[..take_n]);
+                    reader.consume(take_n);
+                }
+            }
             let err_resp = json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -104,6 +121,7 @@ pub async fn handle_mcp_request(
             "serverInfo": { "name": "bugfinder-mcp", "version": "1.0.0" }
         })),
         "notifications/initialized" => Ok(json!({})),
+        "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
             "tools": [
                 {
@@ -317,19 +335,46 @@ pub async fn handle_mcp_request(
 }
 
 pub fn percent_encode_query_component(raw: &str) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char);
-            }
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
+    crate::domain::models::encode_uri_component(raw)
+}
+
+/// Reads a single `\n`-terminated line up to `max_bytes`, discarding any excess tail up to `\n`
+/// so unbounded output never OOMs `tail`, `wrap`, or `pipe`.
+pub fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let mut total = 0usize;
+    let mut raw = Vec::new();
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            break;
         }
+        if let Some(nl) = memchr::memchr(b'\n', avail) {
+            let slice = &avail[..=nl];
+            let rem = max_bytes.saturating_sub(raw.len());
+            if rem > 0 {
+                raw.extend_from_slice(&slice[..slice.len().min(rem)]);
+            }
+            total = total.saturating_add(slice.len());
+            reader.consume(nl + 1);
+            break;
+        }
+        let rem = max_bytes.saturating_sub(raw.len());
+        if rem > 0 {
+            raw.extend_from_slice(&avail[..avail.len().min(rem)]);
+        }
+        let n = avail.len();
+        total = total.saturating_add(n);
+        reader.consume(n);
     }
-    out
+    if !raw.is_empty() {
+        buf.push_str(&String::from_utf8_lossy(&raw));
+    }
+    Ok(total)
 }
 
 pub fn run_tail_cli(
@@ -368,11 +413,14 @@ pub fn run_tail_cli(
         {
             Ok(resp) => {
                 backoff_sec = 1;
-                let reader = BufReader::new(resp.into_reader());
-                for line_res in reader.lines() {
-                    match line_res {
-                        Ok(line) => {
-                            if let Some(data) = line.strip_prefix("data:") {
+                let mut reader = BufReader::new(resp.into_reader());
+                let mut line = String::new();
+                loop {
+                    match read_bounded_line(&mut reader, &mut line, 64 * 1024) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let clean_line = line.trim_end_matches(&['\r', '\n'][..]);
+                            if let Some(data) = clean_line.strip_prefix("data:") {
                                 if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
                                     let strip = crate::domain::scrubber::strip_ansi_and_bidi;
                                     let lvl = strip(

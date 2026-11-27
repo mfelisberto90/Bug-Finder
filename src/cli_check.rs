@@ -196,7 +196,12 @@ fn extract_first_script_src(html: &str) -> Option<String> {
             break;
         };
         let tag = &after[..gt];
-        if let Some(src_pos) = tag.to_ascii_lowercase().find("src=") {
+        let tag_low = tag.to_ascii_lowercase();
+        let src_pos_opt = tag_low
+            .match_indices("src=")
+            .find(|&(idx, _)| idx > 0 && tag_low.as_bytes()[idx - 1].is_ascii_whitespace())
+            .map(|(idx, _)| idx);
+        if let Some(src_pos) = src_pos_opt {
             let val_start = &tag[src_pos + 4..];
             let quote = val_start.chars().next();
             if let Some(q @ ('"' | '\'')) = quote {
@@ -649,27 +654,37 @@ pub fn run_check_suite(opts: &CheckOptions) -> ShellCheckReport {
                 .call(),
         );
         let env_res = http_status_and_body(agent.get(&format!("{target_app}/.env")).call());
+        let exploit_res = http_status_and_body(
+            agent
+                .get(&format!("{target_app}/?__bf_waf_test=../etc/passwd"))
+                .call(),
+        );
         let waf_ms = t2.elapsed().as_millis() as u64;
-        let wk_ok = matches!(wk_res, Ok((st, _, _)) if st != 429);
+        let wk_ok = matches!(wk_res, Ok((st, _, _)) if st != 403 && st != 429 && st < 500);
         let env_blocked =
             matches!(env_res, Ok((403 | 404 | 429, _, body)) if !body.contains("APP_KEY="));
-        if wk_ok && env_blocked {
+        let exploit_blocked = matches!(exploit_res, Ok((403 | 404 | 429, _, _)));
+        if wk_ok && env_blocked && exploit_blocked {
             checks.push(ShellCheckItem {
                 id: "app_edge_waf",
-                title: "App Edge WAF (/.env Blocked, /.well-known Safe)",
+                title: "App Edge WAF (/.env & Traversal Blocked, /.well-known Safe)",
                 status: CheckState::Pass,
                 latency_ms: waf_ms,
-                detail: format!("GET /.env blocked cleanly, /.well-known/ unblocked ({waf_ms} ms)"),
+                detail: format!(
+                    "GET /.env and traversal probe blocked cleanly, /.well-known/ unblocked ({waf_ms} ms)"
+                ),
                 fix: None,
             });
         } else {
             checks.push(ShellCheckItem {
                 id: "app_edge_waf",
-                title: "App Edge WAF (/.env Blocked, /.well-known Safe)",
+                title: "App Edge WAF (/.env & Traversal Blocked, /.well-known Safe)",
                 status: CheckState::Fail,
                 latency_ms: waf_ms,
-                detail: format!("Edge WAF check failed: well_known_ok={wk_ok}, env_blocked={env_blocked}"),
-                fix: Some("Add Edge WAF middleware blocking /.env* and root dotfiles while exempting /.well-known/*".into()),
+                detail: format!(
+                    "Edge WAF check failed: well_known_ok={wk_ok}, env_blocked={env_blocked}, exploit_blocked={exploit_blocked}"
+                ),
+                fix: Some("Add Edge WAF middleware blocking /.env*, traversal probes, and root dotfiles while exempting /.well-known/*".into()),
             });
         }
     } else {

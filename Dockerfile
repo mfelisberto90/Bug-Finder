@@ -7,7 +7,7 @@ RUN npm run build
 
 FROM rust:1.89-bookworm AS rust-builder
 WORKDIR /build
-RUN cargo install cargo-auditable --locked
+RUN cargo install cargo-auditable --version 0.7.8 --locked
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY migrations ./migrations
 COPY sdks ./sdks

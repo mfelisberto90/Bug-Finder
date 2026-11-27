@@ -39,10 +39,10 @@ fn dummy_scrypt_hash() -> String {
     DUMMY_HASH
         .get_or_init(|| {
             use scrypt::{
-                password_hash::{PasswordHasher, SaltString},
+                password_hash::{rand_core::OsRng as ScryptOsRng, PasswordHasher, SaltString},
                 Params, Scrypt,
             };
-            let salt = SaltString::generate(&mut rand::rngs::OsRng);
+            let salt = SaltString::generate(&mut ScryptOsRng);
             let params = Params::new(14, 8, 1, 32).expect("valid scrypt params");
             Scrypt
                 .hash_password_customized(b"dummy-timing-guard", None, None, params, &salt)
@@ -102,8 +102,13 @@ pub fn build_session_cookie(
     } else {
         "Lax"
     };
+    let cookie_name = if secure {
+        "__Host-bf_session"
+    } else {
+        "bf_session"
+    };
     let mut cookie = format!(
-        "bf_session={token}; Path=/; HttpOnly; SameSite={same_site}; Max-Age={max_age_sec}"
+        "{cookie_name}={token}; Path=/; HttpOnly; SameSite={same_site}; Max-Age={max_age_sec}"
     );
     if secure {
         cookie.push_str("; Secure");
@@ -115,7 +120,8 @@ pub async fn resolve_request_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Option<AuthenticatedSession> {
-    let raw = extract_cookie(headers, "bf_session")?;
+    let raw = extract_cookie(headers, "__Host-bf_session")
+        .or_else(|| extract_cookie(headers, "bf_session"))?;
     let sha = sha256_hex(raw.as_bytes());
     let now_sec = chrono::Utc::now().timestamp();
     state
@@ -617,10 +623,23 @@ pub async fn oidc_callback(
         }
     };
 
-    // Fail-closed: only pre-provisioned active Bug-Finder users may sign in via OIDC SSO
-    let user = match state.storage.find_user_for_login(&claims.email).await {
-        Ok(Some(u)) if u.is_active => u,
-        Ok(_) => {
+    // Fail-closed: bind immutable (oidc_issuer, oidc_sub) to pre-provisioned active users
+    let user = match state
+        .storage
+        .find_or_bind_oidc_user(&claims.iss, &claims.sub, &claims.email)
+        .await
+    {
+        Ok(Ok(Some(u))) if u.is_active => u,
+        Ok(Err(conflict_msg)) => {
+            return oidc_error_clearing_tx(
+                StatusCode::CONFLICT,
+                &conflict_msg,
+                &state,
+                &headers,
+                peer_ip,
+            );
+        }
+        Ok(Ok(_)) => {
             return oidc_error_clearing_tx(
                 StatusCode::FORBIDDEN,
                 "No active Bug-Finder account exists for this SSO email; ask an administrator to invite you first",
@@ -639,6 +658,60 @@ pub async fn oidc_callback(
             );
         }
     };
+
+    // Enforce local MFA (TOTP or Passkeys) on OIDC logins so SSO cannot bypass enrolled 2FA
+    let totp_on = state
+        .storage
+        .get_user_mfa_record(user.user_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.is_enabled);
+    let passkeys_on = !state
+        .storage
+        .list_webauthn_credentials(user.user_id)
+        .await
+        .unwrap_or_default()
+        .is_empty();
+    if totp_on || passkeys_on {
+        let chall_raw = random_token_b64(32);
+        let chall_sha = sha256_hex(chall_raw.as_bytes());
+        let mfa_ip_hmac = state.rate_limiter.hash_key("mfa_ip", &client_ip);
+        if state
+            .storage
+            .create_mfa_challenge(
+                &chall_sha,
+                user.user_id,
+                user.organization_id,
+                &mfa_ip_hmac,
+                now_sec + 300,
+            )
+            .await
+            .is_err()
+        {
+            return oidc_error_clearing_tx(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed creating MFA challenge",
+                &state,
+                &headers,
+                peer_ip,
+            );
+        }
+        let clear_tx = build_oidc_tx_cookie("", 0, &state, &headers, peer_ip);
+        let loc = format!("/?mfa_challenge={chall_raw}");
+        let mut resp = StatusCode::FOUND.into_response();
+        if let Ok(lv) = HeaderValue::from_str(&loc) {
+            resp.headers_mut().insert(header::LOCATION, lv);
+        }
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private"),
+        );
+        if let Ok(cv) = HeaderValue::from_str(&clear_tx) {
+            resp.headers_mut().append(header::SET_COOKIE, cv);
+        }
+        return resp;
+    }
 
     let ttl_sec = state.config.session_ttl_sec;
     let sess_raw = random_token_b64(32);
@@ -1246,6 +1319,17 @@ pub async fn mfa_verify(
             .into_response();
     };
 
+    let caller_ip_hmac = state.rate_limiter.hash_key("mfa_ip", &client_ip);
+    if !chal.ip_hmac.is_empty()
+        && !constant_time_eq(chal.ip_hmac.as_bytes(), caller_ip_hmac.as_bytes())
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "MFA challenge IP binding mismatch" })),
+        )
+            .into_response();
+    }
+
     let Some(mfa_rec) = state
         .storage
         .get_user_mfa_record(chal.user_id)
@@ -1285,8 +1369,9 @@ pub async fn mfa_verify(
 
     if let Some(code_raw) = req.code.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let aad = format!("mfa:totp:user:{}", chal.user_id);
-        let Ok(b32) = open_secret(
+        let Ok(b32) = crate::security::crypto::open_secret_with_keyring(
             &state.config.app_key,
+            &state.config.previous_app_keys,
             aad.as_bytes(),
             &mfa_rec.totp_secret_enc,
             false,
@@ -1709,38 +1794,42 @@ pub async fn mfa_totp_disable(
         .map(|t| now_sec.saturating_sub(t) <= 600)
         .unwrap_or(false);
     if !step_up_ok {
-        let lock_hmac = state
-            .rate_limiter
-            .hash_key("login_lock", &sess.email.to_ascii_lowercase());
-        if let Ok(Some(wait_sec)) = state.storage.check_login_lockout(&lock_hmac, now_sec).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({ "error": "Account temporarily locked", "retry_after": wait_sec })),
-            )
-                .into_response();
-        }
-        if let Some(Json(req)) = body {
-            if let Some(pw) = req.password.filter(|s| !s.is_empty()) {
-                if let Some((_, _, pw_hash)) = state
-                    .storage
-                    .find_user_password_hash(sess.user_id)
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    if verify_password(pw, pw_hash).await {
-                        let _ = state.storage.clear_login_failures(&lock_hmac).await;
-                        step_up_ok = true;
-                    } else if let Ok(Some(secs)) = state
+        // When TOTP is already enrolled, disallow bypassing it with password alone; require fresh step-up.
+        if !sess.totp_enabled && sess.passkey_count == 0 {
+            let lock_hmac = state
+                .rate_limiter
+                .hash_key("login_lock", &sess.email.to_ascii_lowercase());
+            if let Ok(Some(wait_sec)) = state.storage.check_login_lockout(&lock_hmac, now_sec).await
+            {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "Account temporarily locked", "retry_after": wait_sec })),
+                )
+                    .into_response();
+            }
+            if let Some(Json(req)) = body {
+                if let Some(pw) = req.password.filter(|s| !s.is_empty()) {
+                    if let Some((_, _, pw_hash)) = state
                         .storage
-                        .record_login_failure(&lock_hmac, now_sec)
+                        .find_user_password_hash(sess.user_id)
                         .await
+                        .ok()
+                        .flatten()
                     {
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(json!({ "error": "Account locked due to failed attempts", "retry_after": secs })),
-                        )
-                            .into_response();
+                        if verify_password(pw, pw_hash).await {
+                            let _ = state.storage.clear_login_failures(&lock_hmac).await;
+                            step_up_ok = true;
+                        } else if let Ok(Some(secs)) = state
+                            .storage
+                            .record_login_failure(&lock_hmac, now_sec)
+                            .await
+                        {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(json!({ "error": "Account locked due to failed attempts", "retry_after": secs })),
+                            )
+                                .into_response();
+                        }
                     }
                 }
             }
@@ -1749,28 +1838,26 @@ pub async fn mfa_totp_disable(
     if !step_up_ok {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Step-up re-authentication or current password required", "reauth_required": true })),
+            Json(json!({
+                "error": "Recent MFA step-up verification required before disabling TOTP",
+                "reauth_required": true,
+                "code": "mfa_step_up_required"
+            })),
         )
             .into_response();
     }
-    if sess.role.can_manage_org() && sess.passkey_count == 0 {
-        let tenant_ctx = crate::domain::models::TenantCtx::from_session(
-            sess.organization_id,
-            sess.organization_slug.clone(),
-            sess.user_id,
-            sess.role,
-            sess.reauth_at,
-            Some(sess.session_id),
-        );
-        if let Ok(org_sec) = state.storage.get_org_security_settings(&tenant_ctx).await {
-            if org_sec.require_mfa_for_admins {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "Organization policy requires MFA for administrators (register a Passkey first)" })),
-                )
-                    .into_response();
-            }
-        }
+    if sess.passkey_count == 0
+        && state
+            .storage
+            .has_any_privileged_org_requiring_mfa(sess.user_id)
+            .await
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "Organization policy requires MFA for administrators (register a Passkey first)" })),
+        )
+            .into_response();
     }
     if let Err(e) = state.storage.disable_mfa(sess.user_id, now_sec).await {
         return (
@@ -2010,37 +2097,6 @@ pub async fn passkey_register_finish(
     }
 }
 
-pub async fn list_passkeys(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    ext: axum::http::Extensions,
-) -> Response {
-    let peer_ip = request_peer_ip(&ext);
-    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, false).await {
-        Ok(v) => v,
-        Err(r) => return *r,
-    };
-    let creds = state
-        .storage
-        .list_webauthn_credentials(sess.user_id)
-        .await
-        .unwrap_or_default();
-    let dtos: Vec<crate::domain::models::PasskeyDto> = creds
-        .into_iter()
-        .map(|c| crate::domain::models::PasskeyDto {
-            id: c.id,
-            name: c.name,
-            cose_alg: c.cose_alg,
-            sign_count: c.sign_count,
-            last_used_at: c
-                .last_used_at
-                .map(|s| crate::domain::models::iso_from_ms(s * 1000)),
-            created_at: crate::domain::models::iso_from_ms(c.created_at),
-        })
-        .collect();
-    Json(dtos).into_response()
-}
-
 pub async fn delete_passkey(
     State(state): State<Arc<AppState>>,
     Path(cred_id): Path<i64>,
@@ -2048,10 +2104,11 @@ pub async fn delete_passkey(
     ext: axum::http::Extensions,
 ) -> Response {
     let peer_ip = request_peer_ip(&ext);
-    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
-        Ok(v) => v,
-        Err(r) => return *r,
-    };
+    let (sess, sess_sha) =
+        match require_authenticated_session(&state, &headers, peer_ip, true).await {
+            Ok(v) => v,
+            Err(r) => return *r,
+        };
     let client_ip = request_client_ip(&ext);
     let now_sec = chrono::Utc::now().timestamp();
     if !sess
@@ -2065,24 +2122,19 @@ pub async fn delete_passkey(
         )
             .into_response();
     }
-    if sess.role.can_manage_org() && !sess.totp_enabled && sess.passkey_count <= 1 {
-        let tenant_ctx = crate::domain::models::TenantCtx::from_session(
-            sess.organization_id,
-            sess.organization_slug.clone(),
-            sess.user_id,
-            sess.role,
-            sess.reauth_at,
-            Some(sess.session_id),
-        );
-        if let Ok(org_sec) = state.storage.get_org_security_settings(&tenant_ctx).await {
-            if org_sec.require_mfa_for_admins {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "Organization policy requires MFA for administrators" })),
-                )
-                    .into_response();
-            }
-        }
+    if !sess.totp_enabled
+        && sess.passkey_count <= 1
+        && state
+            .storage
+            .has_any_privileged_org_requiring_mfa(sess.user_id)
+            .await
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "Organization policy requires MFA for administrators" })),
+        )
+            .into_response();
     }
     match state
         .storage
@@ -2090,6 +2142,15 @@ pub async fn delete_passkey(
         .await
     {
         Ok(true) => {
+            if let Ok(revoked_shas) = state
+                .storage
+                .revoke_other_sessions(sess.user_id, sess.organization_id, &sess_sha)
+                .await
+            {
+                for sha in revoked_shas {
+                    state.scanner_guard.untrack_session(&sha);
+                }
+            }
             let _ = state
                 .storage
                 .append_audit_log(&NewAuditLog {
@@ -2146,11 +2207,44 @@ pub async fn passkey_login_begin(
     }
     let now_sec = chrono::Utc::now().timestamp();
     let req = body.map(|Json(v)| v).unwrap_or_default();
-    let _ = (&req.email, &req.challenge_token);
+    let mut target_uid: Option<i64> = None;
+    let mut allow_creds: Vec<serde_json::Value> = Vec::new();
+    if let Some(mfa_tok) = req
+        .challenge_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let sha = sha256_hex(mfa_tok.as_bytes());
+        if let Ok(Some(mc)) = state.storage.get_mfa_challenge_user(&sha, now_sec).await {
+            target_uid = Some(mc.user_id);
+        }
+    } else if let Some(email_raw) = req
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(Some(u)) = state.storage.find_user_for_login(email_raw).await {
+            if u.is_active {
+                target_uid = Some(u.user_id);
+            }
+        }
+    }
+    if let Some(uid) = target_uid {
+        if let Ok(creds) = state.storage.list_webauthn_credentials(uid).await {
+            for c in creds {
+                allow_creds.push(json!({
+                    "type": "public-key",
+                    "id": c.credential_id_b64,
+                }));
+            }
+        }
+    }
     let challenge = random_token_b64(32);
     if let Err(e) = state
         .storage
-        .save_webauthn_challenge(&challenge, None, "login", now_sec + 300)
+        .save_webauthn_challenge(&challenge, target_uid, "login", now_sec + 300)
         .await
     {
         return (
@@ -2165,7 +2259,7 @@ pub async fn passkey_login_begin(
         "rpId": rp_id,
         "timeout": 120000,
         "userVerification": "required",
-        "allowCredentials": [],
+        "allowCredentials": allow_creds,
     }))
     .into_response()
 }
@@ -2262,10 +2356,20 @@ pub async fn passkey_login_finish(
         }
     };
 
-    let _ = state
+    match state
         .storage
         .update_webauthn_sign_count(cred.id, new_sign_count, now_sec)
-        .await;
+        .await
+    {
+        Ok(true) => {}
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Passkey sign_count replay or clone detected" })),
+            )
+                .into_response();
+        }
+    }
 
     let mut preferred_org_id: Option<i64> = None;
     if let Some(mfa_tok) = req
@@ -2275,8 +2379,13 @@ pub async fn passkey_login_finish(
         .filter(|s| !s.is_empty())
     {
         let sha = sha256_hex(mfa_tok.as_bytes());
+        let caller_ip_hmac = state.rate_limiter.hash_key("mfa_ip", &client_ip);
         if let Ok(Some(mc)) = state.storage.consume_mfa_challenge(&sha, now_sec).await {
-            preferred_org_id = Some(mc.target_org_id);
+            let ip_ok = mc.ip_hmac.is_empty()
+                || constant_time_eq(mc.ip_hmac.as_bytes(), caller_ip_hmac.as_bytes());
+            if mc.user_id == cred.user_id && ip_ok {
+                preferred_org_id = Some(mc.target_org_id);
+            }
         }
     }
 
@@ -2364,8 +2473,75 @@ pub async fn auth_reauth(
     }
     let now_sec = chrono::Utc::now().timestamp();
     let mut ok = false;
+    let has_mfa = sess.totp_enabled || sess.passkey_count > 0;
+    let totp_opt = req
+        .totp_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
-    if let Some(pw) = req.password.filter(|s| !s.is_empty()) {
+    if has_mfa && totp_opt.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Second-factor verification required (TOTP code or Passkey)",
+                "code": "mfa_step_up_required"
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(code) = totp_opt {
+        if let Ok(Some(mfa_rec)) = state.storage.get_user_mfa_record(sess.user_id).await {
+            if let Some(until) = mfa_rec.locked_until {
+                if until > now_sec {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({
+                            "error": "MFA temporarily locked due to failed attempts",
+                            "retry_after": until - now_sec
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            if mfa_rec.is_enabled {
+                let aad = format!("mfa:totp:user:{}", sess.user_id);
+                if let Ok(b32) = crate::security::crypto::open_secret_with_keyring(
+                    &state.config.app_key,
+                    &state.config.previous_app_keys,
+                    aad.as_bytes(),
+                    &mfa_rec.totp_secret_enc,
+                    false,
+                ) {
+                    if let Ok(sec) = decode_base32(&b32) {
+                        if let Some(step) =
+                            verify_totp_window(&sec, code, now_sec, mfa_rec.last_used_step)
+                        {
+                            if state
+                                .storage
+                                .record_mfa_attempt(sess.user_id, Some(step), now_sec)
+                                .await
+                                .is_ok()
+                            {
+                                ok = true;
+                            }
+                        } else if let Ok(Some(secs)) = state
+                            .storage
+                            .record_mfa_attempt(sess.user_id, None, now_sec)
+                            .await
+                        {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(json!({ "error": "MFA locked due to repeated failures", "retry_after": secs })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(pw) = req.password.filter(|s| !s.is_empty()) {
         let lock_hmac = state
             .rate_limiter
             .hash_key("login_lock", &sess.email.to_ascii_lowercase());
@@ -2396,60 +2572,6 @@ pub async fn auth_reauth(
                     Json(json!({ "error": "Account locked due to failed attempts", "retry_after": secs })),
                 )
                     .into_response();
-            }
-        }
-    } else if let Some(code) = req
-        .totp_code
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if let Ok(Some(mfa_rec)) = state.storage.get_user_mfa_record(sess.user_id).await {
-            if let Some(until) = mfa_rec.locked_until {
-                if until > now_sec {
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(json!({
-                            "error": "MFA temporarily locked due to failed attempts",
-                            "retry_after": until - now_sec
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-            if mfa_rec.is_enabled {
-                let aad = format!("mfa:totp:user:{}", sess.user_id);
-                if let Ok(b32) = open_secret(
-                    &state.config.app_key,
-                    aad.as_bytes(),
-                    &mfa_rec.totp_secret_enc,
-                    false,
-                ) {
-                    if let Ok(sec) = decode_base32(&b32) {
-                        if let Some(step) =
-                            verify_totp_window(&sec, code, now_sec, mfa_rec.last_used_step)
-                        {
-                            if state
-                                .storage
-                                .record_mfa_attempt(sess.user_id, Some(step), now_sec)
-                                .await
-                                .is_ok()
-                            {
-                                ok = true;
-                            }
-                        } else if let Ok(Some(secs)) = state
-                            .storage
-                            .record_mfa_attempt(sess.user_id, None, now_sec)
-                            .await
-                        {
-                            return (
-                                StatusCode::TOO_MANY_REQUESTS,
-                                Json(json!({ "error": "MFA locked due to repeated failures", "retry_after": secs })),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
             }
         }
     } else {
@@ -2494,6 +2616,175 @@ pub async fn auth_reauth(
         })
         .await;
 
+    Json(json!({ "ok": true, "reauth_ttl_sec": 600 })).into_response()
+}
+
+pub async fn reauth_passkey_begin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+) -> Response {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, _) = match require_authenticated_session(&state, &headers, peer_ip, true).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let creds = state
+        .storage
+        .list_webauthn_credentials(sess.user_id)
+        .await
+        .unwrap_or_default();
+    if creds.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "No Passkeys registered for this account" })),
+        )
+            .into_response();
+    }
+    let now_sec = chrono::Utc::now().timestamp();
+    let challenge = random_token_b64(32);
+    if let Err(e) = state
+        .storage
+        .save_webauthn_challenge(&challenge, Some(sess.user_id), "reauth", now_sec + 300)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
+    }
+    let (rp_id, _) = webauthn_rp_and_origins(&state, &headers, peer_ip);
+    let allow_creds: Vec<serde_json::Value> = creds
+        .into_iter()
+        .map(|c| json!({ "type": "public-key", "id": c.credential_id_b64 }))
+        .collect();
+    Json(json!({
+        "challenge": challenge,
+        "rpId": rp_id,
+        "timeout": 120000,
+        "userVerification": "required",
+        "allowCredentials": allow_creds,
+    }))
+    .into_response()
+}
+
+pub async fn reauth_passkey_finish(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+    Json(req): Json<PasskeyLoginFinishReq>,
+) -> Response {
+    let peer_ip = request_peer_ip(&ext);
+    let (sess, sess_sha) =
+        match require_authenticated_session(&state, &headers, peer_ip, true).await {
+            Ok(v) => v,
+            Err(r) => return *r,
+        };
+    let client_ip = request_client_ip(&ext);
+    let now_sec = chrono::Utc::now().timestamp();
+    let Ok(chall_b64) = extract_client_data_challenge(&req.client_data_json) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid clientDataJSON" })),
+        )
+            .into_response();
+    };
+    let Some(chal_rec) = state
+        .storage
+        .consume_webauthn_challenge(&chall_b64, "reauth", now_sec)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Step-up Passkey challenge expired or already used" })),
+        )
+            .into_response();
+    };
+    if chal_rec.user_id != Some(sess.user_id) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Challenge does not match active user" })),
+        )
+            .into_response();
+    }
+    let Some(cred) = state
+        .storage
+        .find_webauthn_credential(req.credential_id.trim())
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unrecognized Passkey credential" })),
+        )
+            .into_response();
+    };
+    if cred.user_id != sess.user_id {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Passkey does not belong to active user" })),
+        )
+            .into_response();
+    }
+    let (rp_id, origins) = webauthn_rp_and_origins(&state, &headers, peer_ip);
+    let new_sign_count = match verify_assertion(&WebAuthnAssertionInput {
+        expected_challenge_b64: &chall_b64,
+        expected_origins: &origins,
+        expected_rp_id: &rp_id,
+        cose_alg: cred.cose_alg,
+        public_key_b64: &cred.public_key_b64,
+        stored_sign_count: cred.sign_count,
+        client_data_b64: &req.client_data_json,
+        auth_data_b64: &req.authenticator_data,
+        signature_b64: &req.signature,
+        require_uv: true,
+    }) {
+        Ok(cnt) => cnt,
+        Err(msg) => {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
+        }
+    };
+    if !matches!(
+        state
+            .storage
+            .update_webauthn_sign_count(cred.id, new_sign_count, now_sec)
+            .await,
+        Ok(true)
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Passkey sign_count replay or clone detected" })),
+        )
+            .into_response();
+    }
+    if let Err(e) = state
+        .storage
+        .mark_session_reauth(&sess_sha, sess.organization_id, now_sec)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response();
+    }
+    let _ = state
+        .storage
+        .append_audit_log(&NewAuditLog {
+            organization_id: sess.organization_id,
+            actor_user_id: Some(sess.user_id),
+            actor_email: sess.email,
+            action: "auth.reauth_passkey".into(),
+            target_type: "session".into(),
+            target_id: sess.session_id.to_string(),
+            ip_hmac: state.rate_limiter.hash_key("session_ip", &client_ip),
+            metadata: json!({ "cred_id": cred.id }),
+        })
+        .await;
     Json(json!({ "ok": true, "reauth_ttl_sec": 600 })).into_response()
 }
 
@@ -2690,7 +2981,8 @@ pub async fn revoke_session(
         .revoke_session_by_id(sess.user_id, sess.organization_id, target_id)
         .await
     {
-        Ok(true) => {
+        Ok(Some(revoked_sha)) => {
+            state.scanner_guard.untrack_session(&revoked_sha);
             let _ = state
                 .storage
                 .append_audit_log(&NewAuditLog {
@@ -2706,7 +2998,7 @@ pub async fn revoke_session(
                 .await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Session not found" })),
         )
@@ -2736,7 +3028,11 @@ pub async fn revoke_other_sessions(
         .revoke_other_sessions(sess.user_id, sess.organization_id, &sess_sha)
         .await
     {
-        Ok(revoked) => {
+        Ok(revoked_shas) => {
+            let revoked = revoked_shas.len();
+            for sha in revoked_shas {
+                state.scanner_guard.untrack_session(&sha);
+            }
             let _ = state
                 .storage
                 .append_audit_log(&NewAuditLog {
@@ -2763,7 +3059,20 @@ pub async fn revoke_other_sessions(
 pub async fn get_public_invitation(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
+    ext: axum::http::Extensions,
 ) -> Response {
+    let client_ip = request_client_ip(&ext);
+    let ip_dec =
+        state
+            .rate_limiter
+            .check_and_record("auth_ip", &client_ip, 30, Duration::from_secs(60));
+    if !ip_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many invitation lookup requests" })),
+        )
+            .into_response();
+    }
     let sha = sha256_hex(token.trim().as_bytes());
     let now_sec = chrono::Utc::now().timestamp();
     let Some(info) = state.storage.lookup_invitation(&sha).await.ok().flatten() else {

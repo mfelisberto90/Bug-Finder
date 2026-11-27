@@ -443,6 +443,7 @@ export async function apiFetch<T>(
   status: number;
   data: T | null;
   error?: string;
+  code?: string;
   reauth_required?: boolean;
   retry_after?: number;
   hits?: number;
@@ -505,6 +506,7 @@ export async function apiFetch<T>(
       status: resp.status,
       data: null,
       error: errMsg,
+      code: parsed && typeof parsed.code === "string" ? parsed.code : undefined,
       reauth_required: Boolean(parsed && parsed.reauth_required),
       retry_after: parsed && typeof parsed.retry_after === "number" ? parsed.retry_after : undefined,
       hits

@@ -48,6 +48,10 @@ html, body {
   font-variant-numeric: tabular-nums;
 }
 
+.muted {
+  color: var(--muted);
+}
+
 .mono {
   font-family: var(--mono);
   font-size: 13px;
@@ -146,7 +150,6 @@ html, body {
 }
 
 /* Interactive ergonomics (Fitts >=48x48px, gap >=8px, Doherty <16ms tactile feedback) */
-.ui-interactive,
 button,
 a.nav-link,
 summary,
@@ -412,7 +415,7 @@ textarea {
   letter-spacing: 0.03em;
 }
 
-.badge-error, .badge-fatal, .badge-down {
+.badge-error, .badge-fatal, .badge-down, .badge-unresolved {
   background: var(--danger-bg);
   color: var(--danger);
 }
@@ -681,11 +684,6 @@ dialog.bf-dialog::backdrop {
 .selfcheck-strip-warn {
   background: var(--warn-bg);
   border-color: var(--warn);
-}
-
-.selfcheck-strip-ok {
-  background: var(--ok-bg);
-  border-color: var(--ok);
 }
 
 .selfcheck-strip-copy {

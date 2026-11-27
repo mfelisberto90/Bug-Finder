@@ -23,8 +23,15 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    oidc_issuer TEXT,
+    oidc_sub TEXT,
     created_at BIGINT NOT NULL
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_issuer TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_sub TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pg_users_oidc_sub
+    ON users(oidc_issuer, oidc_sub)
+    WHERE oidc_issuer IS NOT NULL AND oidc_sub IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS organization_members (
     organization_id BIGINT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -712,6 +719,45 @@ CREATE POLICY cap_webauthn_challenge ON webauthn_challenges
         challenge_b64 = NULLIF(current_setting('app.webauthn_challenge_b64', true), '')
     );
 
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS users_isolation ON users;
+CREATE POLICY users_isolation ON users
+    USING (
+        NULLIF(current_setting('app.setup_bootstrap', true), '') = '1'
+        OR email = NULLIF(current_setting('app.login_email', true), '')
+        OR id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        OR (
+            oidc_issuer IS NOT NULL
+            AND oidc_sub IS NOT NULL
+            AND oidc_issuer = NULLIF(current_setting('app.oidc_issuer', true), '')
+            AND oidc_sub = NULLIF(current_setting('app.oidc_sub', true), '')
+        )
+        OR EXISTS (
+            SELECT 1 FROM organization_members om
+            WHERE om.user_id = users.id
+              AND om.organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')::bigint
+        )
+    )
+    WITH CHECK (
+        NULLIF(current_setting('app.setup_bootstrap', true), '') = '1'
+        OR NULLIF(current_setting('app.invite_token_sha256', true), '') IS NOT NULL
+        OR id = NULLIF(current_setting('app.current_user_id', true), '')::bigint
+        OR NULLIF(current_setting('app.current_tenant_id', true), '') IS NOT NULL
+    );
+
+ALTER TABLE login_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE login_attempts FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS login_attempts_isolation ON login_attempts;
+CREATE POLICY login_attempts_isolation ON login_attempts
+    USING (
+        key_hmac = NULLIF(current_setting('app.login_lock_hmac', true), '')
+        OR NULLIF(current_setting('app.maintenance_scan', true), '') = '1'
+    )
+    WITH CHECK (
+        key_hmac = NULLIF(current_setting('app.login_lock_hmac', true), '')
+    );
+
 CREATE TABLE IF NOT EXISTS bugfinder_schema_meta (
     id SMALLINT PRIMARY KEY CHECK (id = 1),
     schema_sha256 TEXT NOT NULL,
@@ -726,6 +772,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO bu
 REVOKE INSERT, UPDATE, DELETE ON bugfinder_schema_meta FROM bugfinder_app;
 GRANT SELECT ON bugfinder_schema_meta TO bugfinder_app;
 REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs FROM bugfinder_app;
+REVOKE DELETE, TRUNCATE ON users FROM bugfinder_app;
 
 CREATE INDEX IF NOT EXISTS idx_pg_logs_org_ts ON log_events(organization_id, timestamp_ms DESC);
 

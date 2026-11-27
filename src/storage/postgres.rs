@@ -4,38 +4,32 @@ use crate::domain::models::*;
 use crate::security::auth::{
     compute_audit_entry_hash, compute_lockout_seconds, sha256_hex, AuditEntryHashInput,
 };
-use crate::security::crypto::{open_secret, seal_secret};
 use crate::storage::*;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx_core::row::Row;
+use sqlx_core::transaction::Transaction;
+use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
+
+mod sqlx {
+    pub use sqlx_core::query::query;
+    pub use sqlx_core::query_as::query_as;
+    pub use sqlx_core::query_scalar::query_scalar;
+}
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use uuid::Uuid;
 
 const PG_SCHEMA: &str = include_str!("../../migrations/postgres/001_init_rls.sql");
 
-fn webhook_aad(org_id: i64) -> Vec<u8> {
-    format!("alert_rules:webhook_secret:{org_id}").into_bytes()
-}
-
-fn open_webhook_secret(app_key: &[u8; 32], org_id: i64, stored: &str) -> String {
-    open_secret(app_key, &webhook_aad(org_id), stored, true).unwrap_or_default()
-}
-
-struct PgStormWindow {
-    window_start_ms: i64,
-    count: u32,
-}
-
 pub struct PostgresStorage {
     pool: PgPool,
     app_key: [u8; 32],
-    storm_counters: Mutex<HashMap<(i64, String), PgStormWindow>>,
+    storm_sampler: StormSampler,
 }
 
 impl PostgresStorage {
+    #[cfg(any(test, debug_assertions))]
     pub async fn connect(database_url: &str, run_migrations: bool) -> Result<Arc<Self>, String> {
         Self::connect_with_key(database_url, run_migrations, [0u8; 32]).await
     }
@@ -89,7 +83,7 @@ impl PostgresStorage {
         Ok(Arc::new(Self {
             pool,
             app_key,
-            storm_counters: Mutex::new(HashMap::new()),
+            storm_sampler: StormSampler::default(),
         }))
     }
 
@@ -108,41 +102,6 @@ impl PostgresStorage {
             .await
             .map_err(|e| e.to_string())?;
         Ok(tx)
-    }
-
-    fn should_sample_storm(
-        &self,
-        project_id: i64,
-        fingerprint: &str,
-        filters: &ProjectFilters,
-        now_ms: i64,
-    ) -> bool {
-        if filters.storm_sample_threshold == 0 {
-            return true;
-        }
-        let mut guard = self
-            .storm_counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if guard.len() > 8192 {
-            guard.clear();
-        }
-        let key = (project_id, fingerprint.to_string());
-        let entry = guard.entry(key).or_insert(PgStormWindow {
-            window_start_ms: now_ms,
-            count: 0,
-        });
-        if now_ms - entry.window_start_ms >= 60_000 {
-            entry.window_start_ms = now_ms;
-            entry.count = 1;
-            return true;
-        }
-        entry.count = entry.count.saturating_add(1);
-        if entry.count <= filters.storm_sample_threshold {
-            return true;
-        }
-        let every = filters.storm_sample_every.max(2);
-        entry.count.is_multiple_of(every)
     }
 }
 
@@ -249,7 +208,16 @@ async fn pg_build_alert_jobs_for_event(
         let channel_type: String = r.get("channel_type");
         let target_url: String = r.get("target_url");
         let stored_secret: String = r.get("webhook_secret");
-        let webhook_secret = open_webhook_secret(app_key, organization_id, &stored_secret);
+        let Ok(webhook_secret) = open_webhook_secret_checked(
+            app_key,
+            &[],
+            organization_id,
+            project_id,
+            &channel_type,
+            &stored_secret,
+        ) else {
+            continue;
+        };
         let email_to: String = r.get("email_to");
         let last_triggered_at: Option<i64> = r.get("last_triggered_at");
 
@@ -323,6 +291,14 @@ async fn pg_insert_event_in_tx(
         if auth.first_event_at.is_none() {
             sqlx::query(
                 "UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL",
+            )
+            .bind(received_ms)
+            .bind(auth.project_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_pg_err)?;
+            sqlx::query(
+                "UPDATE dsn_key_lookup SET first_event_at = $1 WHERE project_id = $2 AND first_event_at IS NULL",
             )
             .bind(received_ms)
             .bind(auth.project_id)
@@ -513,10 +489,16 @@ async fn pg_insert_event_in_tx(
 #[async_trait]
 impl StorageBackend for PostgresStorage {
     async fn needs_setup(&self) -> Result<bool, String> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&self.pool)
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.setup_bootstrap', '1', true)")
+            .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(count == 0)
     }
 
@@ -641,11 +623,17 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn find_user_for_login(&self, email: &str) -> Result<Option<LoginUserRecord>, String> {
+        let email_norm = email.trim().to_ascii_lowercase();
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.login_email', $1, true)")
+            .bind(&email_norm)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let user_row: Option<(i64, String, String, String, bool)> = sqlx::query_as(
             "SELECT id, email, name, password_hash, is_active FROM users WHERE email = $1",
         )
-        .bind(email.trim().to_ascii_lowercase())
+        .bind(&email_norm)
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
@@ -682,17 +670,130 @@ impl StorageBackend for PostgresStorage {
         }))
     }
 
+    async fn find_or_bind_oidc_user(
+        &self,
+        issuer: &str,
+        sub: &str,
+        email: &str,
+    ) -> Result<Result<Option<LoginUserRecord>, String>, String> {
+        let issuer = issuer.trim();
+        let sub = sub.trim();
+        let email_norm = email.trim().to_ascii_lowercase();
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+
+        sqlx::query("SELECT set_config('app.oidc_issuer', $1, true)")
+            .bind(issuer)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.oidc_sub', $1, true)")
+            .bind(sub)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+
+        let by_sub: Option<(i64, String, String, String, bool)> = sqlx::query_as(
+            "SELECT id, email, name, password_hash, is_active
+             FROM users
+             WHERE oidc_issuer = $1 AND oidc_sub = $2",
+        )
+        .bind(issuer)
+        .bind(sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let (uid, uemail, uname, uhash, active) = if let Some(u) = by_sub {
+            u
+        } else {
+            sqlx::query("SELECT set_config('app.login_email', $1, true)")
+                .bind(&email_norm)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            let by_email: Option<(i64, String, String, String, bool, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT id, email, name, password_hash, is_active, oidc_sub
+                     FROM users
+                     WHERE LOWER(email) = LOWER($1)",
+                )
+                .bind(&email_norm)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            let Some((uid, uemail, uname, uhash, active, existing_sub)) = by_email else {
+                tx.commit().await.map_err(map_pg_err)?;
+                return Ok(Ok(None));
+            };
+            if existing_sub.is_some() {
+                tx.commit().await.map_err(map_pg_err)?;
+                return Ok(Err(
+                    "Account is already bound to a different SSO identity".into()
+                ));
+            }
+            sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+                .bind(uid.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            sqlx::query("UPDATE users SET oidc_issuer = $1, oidc_sub = $2 WHERE id = $3")
+                .bind(issuer)
+                .bind(sub)
+                .bind(uid)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            (uid, uemail, uname, uhash, active)
+        };
+
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(uid.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let org_row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT o.id, o.slug, m.role
+             FROM organization_members m
+             JOIN organizations o ON o.id = m.organization_id
+             WHERE m.user_id = $1
+             ORDER BY o.id ASC LIMIT 1",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+
+        Ok(Ok(org_row.map(|(oid, oslug, role_s)| LoginUserRecord {
+            user_id: uid,
+            email: uemail,
+            name: uname,
+            password_hash: uhash,
+            is_active: active,
+            organization_id: oid,
+            organization_slug: oslug,
+            role: UserRole::from_db(&role_s).unwrap_or(UserRole::Viewer),
+        })))
+    }
+
     async fn check_login_lockout(
         &self,
         key_hmac: &str,
         now_sec: i64,
     ) -> Result<Option<i64>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.login_lock_hmac', $1, true)")
+            .bind(key_hmac)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let locked: Option<Option<i64>> =
             sqlx::query_scalar("SELECT locked_until FROM login_attempts WHERE key_hmac = $1")
                 .bind(key_hmac)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         if let Some(Some(until)) = locked {
             if until > now_sec {
                 return Ok(Some(until - now_sec));
@@ -707,6 +808,11 @@ impl StorageBackend for PostgresStorage {
         now_sec: i64,
     ) -> Result<Option<i64>, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.login_lock_hmac', $1, true)")
+            .bind(key_hmac)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let next: i64 = sqlx::query_scalar(
             "INSERT INTO login_attempts (key_hmac, failed_count, locked_until, updated_at)
              VALUES ($1, 1, NULL, $2)
@@ -733,11 +839,18 @@ impl StorageBackend for PostgresStorage {
     }
 
     async fn clear_login_failures(&self, key_hmac: &str) -> Result<(), String> {
-        sqlx::query("DELETE FROM login_attempts WHERE key_hmac = $1")
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.login_lock_hmac', $1, true)")
             .bind(key_hmac)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+        sqlx::query("DELETE FROM login_attempts WHERE key_hmac = $1")
+            .bind(key_hmac)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(())
     }
 
@@ -1852,114 +1965,14 @@ impl StorageBackend for PostgresStorage {
             .collect())
     }
 
-    async fn list_log_resources(&self, ctx: &TenantCtx) -> Result<Vec<LogResourceDto>, String> {
-        let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let rows = sqlx::query(
-            "SELECT name, resource_type, last_seen FROM log_resources ORDER BY last_seen DESC LIMIT 200",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
-        tx.commit().await.map_err(map_pg_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| LogResourceDto {
-                name: r.get("name"),
-                resource_type: r.get("resource_type"),
-                last_seen: iso_from_ms(r.get("last_seen")),
-            })
-            .collect())
-    }
-
-    async fn get_log_stats(
-        &self,
-        ctx: &TenantCtx,
-        since_ms: i64,
-        until_ms: i64,
-    ) -> Result<Value, String> {
-        let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let rows: Vec<(i64, i32, i64)> = sqlx::query_as(
-            "SELECT (timestamp_ms / 3600000) * 3600000 AS b, level_num, COUNT(*)
-             FROM log_events WHERE timestamp_ms >= $1 AND timestamp_ms <= $2
-             GROUP BY b, level_num ORDER BY b ASC",
-        )
-        .bind(since_ms)
-        .bind(until_ms)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
-        tx.commit().await.map_err(map_pg_err)?;
-        let mut buckets: std::collections::BTreeMap<i64, [i64; 6]> =
-            std::collections::BTreeMap::new();
-        for (b, lvl, cnt) in rows {
-            let slot = match LogLevel::from_num(lvl) {
-                LogLevel::Trace => 0,
-                LogLevel::Debug => 1,
-                LogLevel::Info => 2,
-                LogLevel::Warn => 3,
-                LogLevel::Error => 4,
-                LogLevel::Fatal => 5,
-            };
-            buckets.entry(b).or_insert([0; 6])[slot] += cnt;
-        }
-        let intervals: Vec<String> = buckets.keys().map(|b| iso_from_ms(*b)).collect();
-        let names = ["trace", "debug", "info", "warn", "error", "fatal"];
-        let series: Vec<Value> = names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| json!({ "name": n, "data": buckets.values().map(|a| a[i]).collect::<Vec<_>>() }))
-            .collect();
-        Ok(json!({ "intervals": intervals, "series": series }))
-    }
-
-    async fn get_stats_v2(
-        &self,
-        ctx: &TenantCtx,
-        category: &str,
-        since_ms: i64,
-        until_ms: i64,
-    ) -> Result<Value, String> {
-        let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT bucket_hour, CAST(SUM(quantity) AS BIGINT)
-             FROM hourly_stats WHERE category = $1 AND bucket_hour >= $2 AND bucket_hour <= $3
-             GROUP BY bucket_hour ORDER BY bucket_hour ASC",
-        )
-        .bind(category)
-        .bind(since_ms)
-        .bind(until_ms)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(map_pg_err)?;
-        tx.commit().await.map_err(map_pg_err)?;
-        let mut intervals = Vec::new();
-        let mut series = Vec::new();
-        let mut total = 0i64;
-        for (b, q) in rows {
-            intervals.push(iso_from_ms(b));
-            series.push(q);
-            total += q;
-        }
-        Ok(json!({
-            "start": iso_from_ms(since_ms),
-            "end": iso_from_ms(until_ms),
-            "intervals": intervals,
-            "groups": [{
-                "by": { "category": category },
-                "totals": { "sum(quantity)": total },
-                "series": { "sum(quantity)": series }
-            }]
-        }))
-    }
-
     async fn list_transactions(
         &self,
         ctx: &TenantCtx,
         since_ms: i64,
     ) -> Result<Vec<TransactionSummaryDto>, String> {
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
-        let rows: Vec<(String, String, String, f64, i64)> = sqlx::query_as(
-            "SELECT name, op, status, duration_ms, timestamp_ms
+        let rows: Vec<(String, String, f64, i64)> = sqlx::query_as(
+            "SELECT name, op, duration_ms, timestamp_ms
              FROM transaction_events WHERE timestamp_ms >= $1 ORDER BY timestamp_ms DESC LIMIT 2000",
         )
         .bind(since_ms)
@@ -1967,55 +1980,7 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        struct Acc {
-            op: String,
-            durations: Vec<f64>,
-            err: i64,
-            last: i64,
-        }
-        let mut map: HashMap<String, Acc> = HashMap::new();
-        for (name, op, status, dur, ts) in rows {
-            let e = map.entry(name).or_insert(Acc {
-                op,
-                durations: Vec::new(),
-                err: 0,
-                last: ts,
-            });
-            e.durations.push(dur);
-            if status != "ok" && status != "unset" {
-                e.err += 1;
-            }
-            if ts > e.last {
-                e.last = ts;
-            }
-        }
-        let mut out: Vec<TransactionSummaryDto> = map
-            .into_iter()
-            .map(|(name, mut a)| {
-                a.durations
-                    .sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-                let n = a.durations.len();
-                let p50 = a.durations.get(n / 2).copied().unwrap_or(0.0);
-                let p95 = a.durations.get((n * 95) / 100).copied().unwrap_or(p50);
-                let avg = if n == 0 {
-                    0.0
-                } else {
-                    a.durations.iter().sum::<f64>() / n as f64
-                };
-                TransactionSummaryDto {
-                    name,
-                    op: a.op,
-                    count: n as i64,
-                    error_count: a.err,
-                    p50_ms: (p50 * 100.0).round() / 100.0,
-                    p95_ms: (p95 * 100.0).round() / 100.0,
-                    avg_ms: (avg * 100.0).round() / 100.0,
-                    last_seen: iso_from_ms(a.last),
-                }
-            })
-            .collect();
-        out.sort_by_key(|t| std::cmp::Reverse(t.count));
-        Ok(out)
+        Ok(compute_transaction_summaries(rows))
     }
 
     async fn get_trace_context(&self, ctx: &TenantCtx, trace_id: &str) -> Result<Value, String> {
@@ -2117,32 +2082,23 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(rows
+        let raw = rows
             .into_iter()
             .map(|r| {
-                let healthy: i64 = r.get("hc");
-                let errored: i64 = r.get("ec");
-                let crashed: i64 = r.get("cc");
-                let abnormal: i64 = r.get("ac");
-                let total = healthy + errored + crashed + abnormal;
-                let cf = if total > 0 {
-                    (((total - crashed) as f64) / (total as f64)) * 100.0
-                } else {
-                    100.0
-                };
-                ReleaseHealthDto {
-                    version: r.get("version"),
-                    first_seen: iso_from_ms(r.get("fs")),
-                    last_seen: iso_from_ms(r.get("ls")),
-                    issue_count: r.get("ic"),
-                    healthy_sessions: healthy,
-                    errored_sessions: errored,
-                    crashed_sessions: crashed,
-                    abnormal_sessions: abnormal,
-                    crash_free_rate: (cf * 100.0).round() / 100.0,
-                }
+                (
+                    r.get::<String, _>("version"),
+                    String::new(),
+                    r.get::<i64, _>("fs"),
+                    r.get::<i64, _>("ls"),
+                    r.get::<i64, _>("hc"),
+                    r.get::<i64, _>("ec"),
+                    r.get::<i64, _>("cc"),
+                    r.get::<i64, _>("ac"),
+                    r.get::<i64, _>("ic"),
+                )
             })
-            .collect())
+            .collect();
+        Ok(compute_release_health_list(raw))
     }
 
     async fn save_source_map(
@@ -2180,6 +2136,18 @@ impl StorageBackend for PostgresStorage {
             blob_sha256: input.blob_sha256.to_string(),
             size_bytes: input.size_bytes,
         })
+    }
+
+    async fn get_sourcemap_total_bytes(&self, organization_id: i64) -> Result<i64, String> {
+        let mut tx = self.begin_tenant(organization_id).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(CAST(SUM(size_bytes) AS BIGINT), 0) FROM source_maps",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+        Ok(total)
     }
 
     async fn find_source_map(
@@ -2515,9 +2483,11 @@ impl StorageBackend for PostgresStorage {
         if owns.is_none() {
             return Err("Project not found in organization".into());
         }
-        let enc_secret = seal_secret(
+        let enc_secret = seal_webhook_secret(
             &self.app_key,
-            &webhook_aad(ctx.organization_id),
+            ctx.organization_id,
+            rule.project_id,
+            &rule.channel_type,
             &rule.webhook_secret,
         )?;
         let now = now_ms();
@@ -2570,17 +2540,6 @@ impl StorageBackend for PostgresStorage {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn get_alert_rule(
-        &self,
-        ctx: &TenantCtx,
-        rule_id: i64,
-    ) -> Result<Option<AlertRuleDto>, String> {
-        Ok(self
-            .get_alert_rule_for_dispatch(ctx, rule_id)
-            .await?
-            .map(|(dto, _)| dto))
-    }
-
     async fn get_alert_rule_for_dispatch(
         &self,
         ctx: &TenantCtx,
@@ -2597,27 +2556,39 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(row.map(|r| {
-            let stored: String = r.get("webhook_secret");
-            let sec = open_webhook_secret(&self.app_key, ctx.organization_id, &stored);
-            let dto = AlertRuleDto {
-                id: r.get("id"),
-                project_id: r.get("project_id"),
-                name: r.get("name"),
-                trigger_type: r.get("trigger_type"),
-                threshold_count: r.get("threshold_count"),
-                window_sec: r.get("window_sec"),
-                cooldown_sec: r.get("cooldown_sec"),
-                channel_type: r.get("channel_type"),
-                target_url: r.get("target_url"),
-                has_secret: !stored.is_empty(),
-                email_to: r.get("email_to"),
-                last_triggered_at: r.get("last_triggered_at"),
-                is_active: r.get("is_active"),
-                created_at: iso_from_ms(r.get("created_at")),
-            };
-            (dto, sec)
-        }))
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let stored: String = r.get("webhook_secret");
+                let project_id: i64 = r.get("project_id");
+                let channel_type: String = r.get("channel_type");
+                let sec = open_webhook_secret_checked(
+                    &self.app_key,
+                    &[],
+                    ctx.organization_id,
+                    project_id,
+                    &channel_type,
+                    &stored,
+                )?;
+                let dto = AlertRuleDto {
+                    id: r.get("id"),
+                    project_id,
+                    name: r.get("name"),
+                    trigger_type: r.get("trigger_type"),
+                    threshold_count: r.get("threshold_count"),
+                    window_sec: r.get("window_sec"),
+                    cooldown_sec: r.get("cooldown_sec"),
+                    channel_type,
+                    target_url: r.get("target_url"),
+                    has_secret: !stored.is_empty(),
+                    email_to: r.get("email_to"),
+                    last_triggered_at: r.get("last_triggered_at"),
+                    is_active: r.get("is_active"),
+                    created_at: iso_from_ms(r.get("created_at")),
+                };
+                Ok(Some((dto, sec)))
+            }
+        }
     }
 
     async fn list_api_tokens(&self, ctx: &TenantCtx) -> Result<Vec<ApiTokenDto>, String> {
@@ -2768,6 +2739,11 @@ impl StorageBackend for PostgresStorage {
     ) -> Result<MemberDto, String> {
         let email_norm = email.trim().to_ascii_lowercase();
         let mut tx = self.begin_tenant(ctx.organization_id).await?;
+        sqlx::query("SELECT set_config('app.login_email', $1, true)")
+            .bind(&email_norm)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let existing_uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
             .bind(&email_norm)
             .fetch_optional(&mut *tx)
@@ -3088,11 +3064,11 @@ impl StorageBackend for PostgresStorage {
                         payload_json,
                         received_ms,
                     } => {
-                        let store_blob = self.should_sample_storm(
+                        let store_blob = self.storm_sampler.should_sample(
                             auth.project_id,
                             &meta.fingerprint,
-                            &auth.filters,
                             received_ms,
+                            auth.filters.storm_sample_threshold,
                         );
                         let (issue_id, short_id, is_new, is_reg) = pg_insert_event_in_tx(
                             &mut tx,
@@ -3396,18 +3372,26 @@ impl StorageBackend for PostgresStorage {
                                     let cd: i64 = rr.get("cooldown_sec");
                                     let lt: Option<i64> = rr.get("last_triggered_at");
                                     if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                                        let ch_type: String = rr.get("channel_type");
+                                        let stored_sec: String = rr.get("webhook_secret");
+                                        let Ok(webhook_secret) = open_webhook_secret_checked(
+                                            &self.app_key,
+                                            &[],
+                                            organization_id,
+                                            project_id,
+                                            &ch_type,
+                                            &stored_sec,
+                                        ) else {
+                                            continue;
+                                        };
                                         fired.push(rid);
                                         alerts.push(AlertDispatchJob {
                                             organization_id,
                                             rule_id: rid,
                                             rule_name: rr.get("name"),
-                                            channel_type: rr.get("channel_type"),
+                                            channel_type: ch_type,
                                             target_url: rr.get("target_url"),
-                                            webhook_secret: open_webhook_secret(
-                                                &self.app_key,
-                                                organization_id,
-                                                &rr.get::<String, _>("webhook_secret"),
-                                            ),
+                                            webhook_secret,
                                             email_to: rr.get("email_to"),
                                             title: format!("Uptime check-in failed: {mname}"),
                                             message: format!(
@@ -3435,6 +3419,12 @@ impl StorageBackend for PostgresStorage {
 
             for (proj_id, first_ms) in first_event_proj {
                 sqlx::query("UPDATE projects SET first_event_at = $1 WHERE id = $2 AND first_event_at IS NULL")
+                    .bind(first_ms)
+                    .bind(proj_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_pg_err)?;
+                sqlx::query("UPDATE dsn_key_lookup SET first_event_at = $1 WHERE project_id = $2 AND first_event_at IS NULL")
                     .bind(first_ms)
                     .bind(proj_id)
                     .execute(&mut *tx)
@@ -3657,18 +3647,26 @@ impl StorageBackend for PostgresStorage {
                     let cd: i64 = rr.get("cooldown_sec");
                     let lt: Option<i64> = rr.get("last_triggered_at");
                     if lt.map(|t| now_sec - t >= cd).unwrap_or(true) {
+                        let ch_type: String = rr.get("channel_type");
+                        let stored_sec: String = rr.get("webhook_secret");
+                        let Ok(webhook_secret) = open_webhook_secret_checked(
+                            &self.app_key,
+                            &[],
+                            org_id,
+                            proj_id,
+                            &ch_type,
+                            &stored_sec,
+                        ) else {
+                            continue;
+                        };
                         fired.push(rid);
                         alerts.push(AlertDispatchJob {
                             organization_id: org_id,
                             rule_id: rid,
                             rule_name: rr.get("name"),
-                            channel_type: rr.get("channel_type"),
+                            channel_type: ch_type,
                             target_url: rr.get("target_url"),
-                            webhook_secret: open_webhook_secret(
-                                &self.app_key,
-                                org_id,
-                                &rr.get::<String, _>("webhook_secret"),
-                            ),
+                            webhook_secret,
                             email_to: rr.get("email_to"),
                             title: format!("Uptime monitor down: {mname}"),
                             message: format!("Heartbeat missed for monitor {muuid}"),
@@ -3729,7 +3727,7 @@ impl StorageBackend for PostgresStorage {
              FROM pg_class c
              WHERE c.relnamespace = current_schema()::regnamespace
                AND c.relkind = 'r'
-               AND c.relname NOT IN ('users', 'login_attempts', 'bugfinder_schema_meta')
+               AND c.relname NOT IN ('bugfinder_schema_meta')
                AND NOT (c.relrowsecurity AND c.relforcerowsecurity)",
         )
         .fetch_one(&self.pool)
@@ -3824,18 +3822,26 @@ impl StorageBackend for PostgresStorage {
             let last: Option<i64> = r.get("last_triggered_at");
             if last.map(|t| now_sec - t >= cd).unwrap_or(true) {
                 let trig: String = r.get("trigger_type");
+                let ch_type: String = r.get("channel_type");
+                let stored_sec: String = r.get("webhook_secret");
+                let Ok(webhook_secret) = open_webhook_secret_checked(
+                    &self.app_key,
+                    &[],
+                    ev.organization_id,
+                    ev.project_id,
+                    &ch_type,
+                    &stored_sec,
+                ) else {
+                    continue;
+                };
                 fired.push(rid);
                 alerts.push(AlertDispatchJob {
                     organization_id: ev.organization_id,
                     rule_id: rid,
                     rule_name: r.get("name"),
-                    channel_type: r.get("channel_type"),
+                    channel_type: ch_type,
                     target_url: r.get("target_url"),
-                    webhook_secret: open_webhook_secret(
-                        &self.app_key,
-                        ev.organization_id,
-                        &r.get::<String, _>("webhook_secret"),
-                    ),
+                    webhook_secret,
                     email_to: r.get("email_to"),
                     title: format!(
                         "[{}:{}] {} (score {})",
@@ -4675,15 +4681,17 @@ impl StorageBackend for PostgresStorage {
         cred_id: i64,
         sign_count: u32,
         now_sec: i64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
         sqlx::query("SELECT set_config('app.webauthn_cred_pk', $1, true)")
             .bind(cred_id.to_string())
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-        sqlx::query(
-            "UPDATE webauthn_credentials SET sign_count = $1, last_used_at = $2 WHERE id = $3",
+        let res = sqlx::query(
+            "UPDATE webauthn_credentials
+             SET sign_count = $1, last_used_at = $2
+             WHERE id = $3 AND (($1 = 0 AND sign_count = 0) OR $1 > sign_count)",
         )
         .bind(sign_count as i64)
         .bind(now_sec)
@@ -4692,7 +4700,7 @@ impl StorageBackend for PostgresStorage {
         .await
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     async fn delete_webauthn_credential(&self, user_id: i64, cred_id: i64) -> Result<bool, String> {
@@ -4719,34 +4727,55 @@ impl StorageBackend for PostgresStorage {
         current_token_sha256: &str,
         now_sec: i64,
     ) -> Result<Vec<ActiveSessionDto>, String> {
-        let mut tx = self.begin_tenant(org_id).await?;
-        let rows = sqlx::query(
-            "SELECT id, token_sha256, user_agent, ip_hmac, last_seen_at, created_at
-             FROM sessions WHERE user_id = $1 AND expires_at > $2 ORDER BY id DESC",
+        let _ = org_id;
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let org_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT organization_id FROM organization_members WHERE user_id = $1",
         )
         .bind(user_id)
-        .bind(now_sec)
         .fetch_all(&mut *tx)
         .await
         .map_err(map_pg_err)?;
-        tx.commit().await.map_err(map_pg_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
+
+        let mut out = Vec::new();
+        for oid in org_ids {
+            sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+                .bind(oid.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            let rows = sqlx::query(
+                "SELECT id, token_sha256, user_agent, ip_hmac, last_seen_at, created_at
+                 FROM sessions WHERE user_id = $1 AND expires_at > $2 ORDER BY id DESC",
+            )
+            .bind(user_id)
+            .bind(now_sec)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            for r in rows {
                 let sha: String = r.get("token_sha256");
                 let iph: String = r.get("ip_hmac");
                 let lseen: i64 = r.get("last_seen_at");
                 let crt: i64 = r.get("created_at");
-                ActiveSessionDto {
+                out.push(ActiveSessionDto {
                     id: r.get("id"),
                     user_agent: r.get("user_agent"),
                     ip_hmac_short: iph.chars().take(12).collect(),
                     last_seen_at: iso_from_ms(if lseen > 0 { lseen * 1000 } else { crt }),
                     created_at: iso_from_ms(crt),
                     is_current: sha == current_token_sha256,
-                }
-            })
-            .collect())
+                });
+            }
+        }
+        tx.commit().await.map_err(map_pg_err)?;
+        out.sort_by_key(|a| std::cmp::Reverse(a.id));
+        Ok(out)
     }
 
     async fn revoke_session_by_id(
@@ -4754,25 +4783,49 @@ impl StorageBackend for PostgresStorage {
         user_id: i64,
         org_id: i64,
         session_id: i64,
-    ) -> Result<bool, String> {
-        let mut tx = self.begin_tenant(org_id).await?;
-        let sha: Option<String> = sqlx::query_scalar(
-            "DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING token_sha256",
+    ) -> Result<Option<String>, String> {
+        let _ = org_id;
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let org_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT organization_id FROM organization_members WHERE user_id = $1",
         )
-        .bind(session_id)
         .bind(user_id)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(map_pg_err)?;
-        if let Some(ref s) = sha {
-            sqlx::query("DELETE FROM session_lookup WHERE token_sha256 = $1")
-                .bind(s)
+
+        let mut revoked: Option<String> = None;
+        for oid in org_ids {
+            sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+                .bind(oid.to_string())
                 .execute(&mut *tx)
                 .await
                 .map_err(map_pg_err)?;
+            let sha: Option<String> = sqlx::query_scalar(
+                "DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING token_sha256",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            if let Some(s) = sha {
+                sqlx::query("DELETE FROM session_lookup WHERE token_sha256 = $1")
+                    .bind(&s)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_pg_err)?;
+                revoked = Some(s);
+                break;
+            }
         }
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(sha.is_some())
+        Ok(revoked)
     }
 
     async fn revoke_other_sessions(
@@ -4780,22 +4833,47 @@ impl StorageBackend for PostgresStorage {
         user_id: i64,
         org_id: i64,
         keep_token_sha256: &str,
-    ) -> Result<usize, String> {
-        let mut tx = self.begin_tenant(org_id).await?;
-        let res = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token_sha256 != $2")
-            .bind(user_id)
-            .bind(keep_token_sha256)
+    ) -> Result<Vec<String>, String> {
+        let _ = org_id;
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-        sqlx::query("DELETE FROM session_lookup WHERE user_id = $1 AND token_sha256 != $2")
+        let org_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT organization_id FROM organization_members WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+
+        let mut revoked = Vec::new();
+        for oid in org_ids {
+            sqlx::query("SELECT set_config('app.current_tenant_id', $1, true)")
+                .bind(oid.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+            let shas: Vec<String> = sqlx::query_scalar(
+                "DELETE FROM sessions WHERE user_id = $1 AND token_sha256 != $2 RETURNING token_sha256",
+            )
             .bind(user_id)
             .bind(keep_token_sha256)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+            revoked.extend(shas);
+            sqlx::query("DELETE FROM session_lookup WHERE user_id = $1 AND token_sha256 != $2")
+                .bind(user_id)
+                .bind(keep_token_sha256)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_pg_err)?;
+        }
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(res.rows_affected() as usize)
+        Ok(revoked)
     }
 
     async fn mark_session_reauth(
@@ -4829,13 +4907,20 @@ impl StorageBackend for PostgresStorage {
         &self,
         user_id: i64,
     ) -> Result<Option<(String, String, String)>, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let row: Option<(String, String, String)> = sqlx::query_as(
             "SELECT email, name, password_hash FROM users WHERE id = $1 AND is_active = TRUE",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
         Ok(row)
     }
 
@@ -4843,18 +4928,23 @@ impl StorageBackend for PostgresStorage {
         let user_id = input.user_id;
         let org_id = input.org_id;
         let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(input.new_password_hash)
             .bind(user_id)
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
-
-        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
-            .bind(user_id.to_string())
+        sqlx::query("DELETE FROM mfa_challenges WHERE user_id = $1")
+            .bind(user_id)
             .execute(&mut *tx)
             .await
             .map_err(map_pg_err)?;
+
         let org_ids: Vec<i64> = sqlx::query_scalar(
             "SELECT organization_id FROM organization_members WHERE user_id = $1",
         )
@@ -5122,6 +5212,11 @@ impl StorageBackend for PostgresStorage {
             ));
         }
 
+        sqlx::query("SELECT set_config('app.login_email', $1, true)")
+            .bind(&email)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
         let existing_uid: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
             .bind(&email)
             .fetch_optional(&mut *tx)
@@ -5450,7 +5545,7 @@ impl StorageBackend for PostgresStorage {
             "SELECT COUNT(*)::bigint
              FROM organization_members m
              JOIN users u ON u.id = m.user_id
-             WHERE m.role = 'owner'
+             WHERE m.role IN ('owner', 'manager', 'admin')
                AND u.is_active = TRUE
                AND NOT EXISTS (SELECT 1 FROM user_mfa f WHERE f.user_id = u.id AND f.is_enabled = TRUE)
                AND NOT EXISTS (SELECT 1 FROM webauthn_credentials w WHERE w.user_id = u.id)",
@@ -5460,5 +5555,33 @@ impl StorageBackend for PostgresStorage {
         .map_err(map_pg_err)?;
         tx.commit().await.map_err(map_pg_err)?;
         Ok(cnt)
+    }
+
+    async fn has_any_privileged_org_requiring_mfa(&self, user_id: i64) -> Result<bool, String> {
+        let mut tx = self.pool.begin().await.map_err(map_pg_err)?;
+        sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+        let vals: Vec<Value> = sqlx::query_scalar(
+            "SELECT o.settings_json
+             FROM organization_members m
+             JOIN organizations o ON o.id = m.organization_id
+             WHERE m.user_id = $1
+               AND m.role IN ('owner', 'manager', 'admin')",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_pg_err)?;
+        tx.commit().await.map_err(map_pg_err)?;
+        for val in vals {
+            let settings: OrgSecuritySettings = serde_json::from_value(val).unwrap_or_default();
+            if settings.require_mfa_for_admins {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }

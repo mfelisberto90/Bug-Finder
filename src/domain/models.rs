@@ -131,10 +131,6 @@ impl UserRole {
             Self::Owner | Self::Manager | Self::Admin | Self::Member
         )
     }
-
-    pub fn can_read(&self) -> bool {
-        true
-    }
 }
 
 pub fn intersect_scopes(role: UserRole, raw_scopes: &str) -> Vec<String> {
@@ -344,15 +340,6 @@ impl IssueType {
             Self::Log => "log",
         }
     }
-
-    pub fn from_str_loose(s: &str) -> Self {
-        match s {
-            "error" => Self::Error,
-            "csp" => Self::Csp,
-            "log" => Self::Log,
-            _ => Self::Default,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +439,7 @@ pub fn format_short_id(project_slug: &str, short_num: u64) -> String {
     format!("{prefix}-{}", base32_encode(short_num))
 }
 
+#[cfg(test)]
 pub fn parse_short_id(raw: &str) -> Option<(String, u64)> {
     let trimmed = raw.trim();
     let (slug, code) = trimmed.rsplit_once('-')?;
@@ -480,6 +468,45 @@ pub fn new_uuid_v7_from_ms(ms: i64) -> String {
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Clamps ingested timestamps to `now_ms +/- 24h` so malformed/adversarial clients cannot
+/// insert `i64::MAX` rows that evade retention pruning or distort time-series buckets.
+pub fn clamp_ingest_ts_ms(ts_ms: i64) -> i64 {
+    let now = now_ms();
+    let max_skew = 86_400_000i64;
+    ts_ms.clamp(now.saturating_sub(max_skew), now.saturating_add(max_skew))
+}
+
+/// Strips PostgreSQL-illegal `\u0000` NUL bytes from a mutable string in place.
+pub fn strip_nul_in_place(s: &mut String) {
+    if s.contains('\0') {
+        *s = s.replace('\0', "");
+    }
+}
+
+/// Shared RFC 3986 percent-encoder for query parameters and OAuth/OTP URIs.
+pub fn encode_uri_component(raw: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Shared FNV-1a 64-bit fast non-cryptographic hash for ETags and watermarks.
+pub fn fnv1a_u64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// Compress JSON blobs > 2 KiB with deflate to reduce SQLite/Postgres disk footprint 5x-8x.
@@ -647,14 +674,6 @@ pub struct LogEventDto {
     pub data: Value,
     #[serde(rename = "projectId")]
     pub project_id: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogResourceDto {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub resource_type: String,
-    pub last_seen: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

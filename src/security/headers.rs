@@ -4,7 +4,7 @@ use crate::security::auth::{random_token_b64, sha256_hex};
 use crate::security::ratelimit::ShardedBoundedMap;
 use crate::security::waf::{
     detect_http_exploit_probe, is_anomalous_http_method, is_canary_or_dotfile_probe,
-    is_scanner_user_agent,
+    is_scanner_user_agent, is_sourcemap_probe,
 };
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -168,16 +168,24 @@ impl ScannerGuard {
     }
 }
 
+fn parse_ip_or_socket_addr(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    trimmed.parse::<SocketAddr>().ok().map(|sa| sa.ip())
+}
+
 pub fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfig) -> IpAddr {
     if !config.is_trusted_proxy(peer_ip) {
         return peer_ip;
     }
-    if config.trust_cf_header {
+    if config.trust_cf_header && config.is_cloudflare_peer(peer_ip) {
         if let Some(cf) = headers
             .get("cf-connecting-ip")
             .and_then(|v| v.to_str().ok())
         {
-            if let Ok(ip) = cf.trim().parse::<IpAddr>() {
+            if let Some(ip) = parse_ip_or_socket_addr(cf) {
                 return ip;
             }
         }
@@ -195,10 +203,12 @@ pub fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfi
                 return peer_ip;
             }
             hops_checked += 1;
-            if let Ok(ip) = raw.trim().parse::<IpAddr>() {
-                if !config.is_trusted_proxy(ip) {
-                    return ip;
-                }
+            let Some(ip) = parse_ip_or_socket_addr(raw) else {
+                // Fail closed on unparseable hop instead of continuing leftward into untrusted entries
+                return peer_ip;
+            };
+            if !config.is_trusted_proxy(ip) {
+                return ip;
             }
         }
     }
@@ -240,20 +250,33 @@ pub fn is_allowed_host(host_header: &str, config: &AppConfig) -> bool {
     config.allowed_hosts.iter().any(|h| h == &host)
 }
 
+fn rightmost_header_csv<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let vals: Vec<&'a str> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    for v in vals.into_iter().rev() {
+        for part in v.rsplit(',') {
+            let t = part.trim();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
 pub fn is_https_request(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfig) -> bool {
     if config.force_secure_cookies {
         return true;
     }
     if config.is_trusted_proxy(peer_ip) {
-        if let Some(proto) = headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|p| p.split(',').next())
-        {
-            if proto.trim().eq_ignore_ascii_case("https") {
+        if let Some(proto) = rightmost_header_csv(headers, "x-forwarded-proto") {
+            if proto.eq_ignore_ascii_case("https") {
                 return true;
             }
-            if proto.trim().eq_ignore_ascii_case("http") {
+            if proto.eq_ignore_ascii_case("http") {
                 return false;
             }
         }
@@ -320,16 +343,16 @@ pub fn validate_same_origin(headers: &HeaderMap, peer_ip: IpAddr, config: &AppCo
                 if orig_scheme == ps && orig_host == ph && orig_port == pp {
                     return true;
                 }
+                if !config.is_dev {
+                    return false;
+                }
             }
         }
         let req_is_https = is_https_request(headers, peer_ip, config);
         let req_scheme = if req_is_https { "https" } else { "http" };
         let req_default_port = if req_is_https { 443u16 } else { 80u16 };
         let req_host_hdr = if config.is_trusted_proxy(peer_ip) {
-            headers
-                .get("x-forwarded-host")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
+            rightmost_header_csv(headers, "x-forwarded-host")
                 .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
         } else {
             headers.get(header::HOST).and_then(|v| v.to_str().ok())
@@ -360,7 +383,12 @@ pub fn validate_same_origin(headers: &HeaderMap, peer_ip: IpAddr, config: &AppCo
 pub fn is_cross_origin_public_path(path: &str) -> bool {
     if matches!(
         path,
-        "/sdk/bugfinder-mini.js" | "/sdk/bugfinder-shield.js" | "/v1/logs" | "/api/v1/logs"
+        "/sdk/bugfinder-mini.js"
+            | "/sdk/bugfinder-shield.js"
+            | "/v1/logs"
+            | "/v1/traces"
+            | "/v1/metrics"
+            | "/api/v1/logs"
     ) {
         return true;
     }
@@ -552,12 +580,14 @@ pub async fn security_headers_middleware(
         return resp;
     }
 
-    let raw_session_cookie = extract_cookie(&headers, "bf_session").filter(|val| {
-        val.len() >= 32
-            && val
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    });
+    let raw_session_cookie = extract_cookie(&headers, "__Host-bf_session")
+        .or_else(|| extract_cookie(&headers, "bf_session"))
+        .filter(|val| {
+            val.len() >= 32
+                && val
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
     let session_sha = raw_session_cookie
         .as_deref()
         .map(|s| sha256_hex(s.as_bytes()));
@@ -565,16 +595,40 @@ pub async fn security_headers_middleware(
         .as_deref()
         .is_some_and(|s| state.scanner_guard.is_active_session(s));
 
-    let has_ingest_auth = is_cross_origin_public_path(&path)
-        && (headers.contains_key("x-sentry-auth")
-            || headers.contains_key(header::AUTHORIZATION)
-            || req
-                .uri()
-                .query()
-                .is_some_and(|q| q.contains("sentry_key=") || q.contains("glitchtip_key=")));
+    let bearer_api_token_sha = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.trim()
+                .strip_prefix("Bearer ")
+                .or_else(|| raw.trim().strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|tok| tok.starts_with("bf_") && tok.len() >= 32)
+        .map(|tok| sha256_hex(tok.as_bytes()));
+
+    let is_public_ingest = is_cross_origin_public_path(&path);
+    let is_tunnel_post = method_str == "POST" && path.starts_with("/t/") && path.len() > 3;
+    let is_public_preflight = method_str == "OPTIONS" && is_public_ingest;
+    let has_ingest_auth = is_public_preflight
+        || is_tunnel_post
+        || (is_public_ingest
+            && (headers.contains_key("x-sentry-auth")
+                || headers.contains_key(header::AUTHORIZATION)
+                || req
+                    .uri()
+                    .query()
+                    .is_some_and(|q| q.contains("sentry_key=") || q.contains("glitchtip_key="))));
+
+    // Browser DevTools `.js.map` / `.css.map` requests return 404 without banning shared CGNAT IPs.
+    if !has_active_session && is_sourcemap_probe(&path) {
+        let mut resp = (StatusCode::NOT_FOUND, "Not found").into_response();
+        apply_security_headers(&mut resp, &path, &nonce, is_https);
+        return resp;
+    }
 
     // CGNAT-safe deterministic SIMD Edge WAF & honeypot guard (< 1 µs, zero OOM):
-    // Only verified active sessions and public-ingest DSN auth skip checks.
+    // Only verified active sessions, verified API tokens, and public-ingest DSN auth skip checks.
     let unauth_ip_hmac = if !has_active_session && !has_ingest_auth {
         let ip_hmac = state
             .rate_limiter
@@ -590,7 +644,7 @@ pub async fn security_headers_middleware(
         let exploit_probe = detect_http_exploit_probe(&full_uri);
 
         if (already_banned || is_canary || is_scanner || is_bad_method || exploit_probe.is_some())
-            && session_sha.is_some()
+            && (session_sha.is_some() || bearer_api_token_sha.is_some())
         {
             if let Some(ref sha) = session_sha {
                 if let Ok(Some(_sess)) = state
@@ -602,6 +656,17 @@ pub async fn security_headers_middleware(
                         .scanner_guard
                         .track_session(sha, now_unix_secs() + 900);
                     has_active_session = true;
+                }
+            }
+            if !has_active_session {
+                if let Some(ref tok_sha) = bearer_api_token_sha {
+                    if let Ok(Some(_tok)) = state
+                        .storage
+                        .resolve_api_token(tok_sha, None, now_unix_secs())
+                        .await
+                    {
+                        has_active_session = true;
+                    }
                 }
             }
         }

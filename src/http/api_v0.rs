@@ -23,7 +23,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures_util::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -32,8 +31,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
+use tokio_stream::Stream;
 
 fn require_scope(ctx: &TenantCtx, scope: &str) -> Result<(), Box<Response>> {
     if ctx.has_scope(scope) {
@@ -294,7 +292,8 @@ async fn authenticate_api_tenant(
             }
         }
 
-        if let Some(want_slug) = org_slug_opt {
+        let has_mfa = sess.totp_enabled || sess.passkey_count > 0;
+        let tenant_ctx = if let Some(want_slug) = org_slug_opt {
             if sess.organization_slug == want_slug {
                 TenantCtx::from_session(
                     sess.organization_id,
@@ -334,7 +333,24 @@ async fn authenticate_api_tenant(
                 sess.reauth_at,
                 Some(sess.session_id),
             )
+        };
+        if !has_mfa && tenant_ctx.role.can_manage_org() {
+            if let Ok(org_sec) = state.storage.get_org_security_settings(&tenant_ctx).await {
+                if org_sec.require_mfa_for_admins {
+                    return Err(Box::new(
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({
+                                "error": "Organization policy requires MFA for administrators. Enroll TOTP or a Passkey first.",
+                                "code": "org_mfa_enrollment_required"
+                            })),
+                        )
+                            .into_response(),
+                    ));
+                }
+            }
         }
+        tenant_ctx
     };
 
     if is_mutation {
@@ -1263,39 +1279,6 @@ pub async fn export_issues_csv(
         .into_response()
 }
 
-pub async fn get_stats_v2(
-    State(state): State<Arc<AppState>>,
-    Path(org): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    ext: axum::http::Extensions,
-    method: Method,
-) -> Response {
-    let ctx = match authenticate_api_tenant(&state, &headers, &ext, &method, Some(&org)).await {
-        Ok(c) => c,
-        Err(r) => return *r,
-    };
-    if let Err(r) = require_scope(&ctx, "event:read") {
-        return *r;
-    }
-    let category = query.get("category").map(String::as_str).unwrap_or("error");
-    let until_ms = now_ms();
-    let since_ms = parse_stats_period_ms(query.get("statsPeriod").map(String::as_str))
-        .unwrap_or(until_ms - 86_400_000);
-    match state
-        .storage
-        .get_stats_v2(&ctx, category, since_ms, until_ms)
-        .await
-    {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
-    }
-}
-
 // ----------------------------------------------------------------------------
 // Structured Logs & Live Tail SSE
 // ----------------------------------------------------------------------------
@@ -1391,7 +1374,8 @@ pub async fn stream_logs_sse(
         )
             .into_response();
     };
-    let rx = state.live_tx.subscribe();
+    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    let mut bcast_rx = state.live_tx.subscribe();
     let org_id = ctx.organization_id;
     let project_filter = query.get("project").and_then(|s| s.parse::<i64>().ok());
     let level_filter = query.get("level").cloned().filter(|s| !s.is_empty());
@@ -1400,33 +1384,63 @@ pub async fn stream_logs_sse(
         .map(|s| s.to_ascii_lowercase())
         .filter(|s| !s.is_empty());
 
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
+    tokio::spawn(async move {
+        let _sse_permit = permit;
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                msg = bcast_rx.recv() => {
+                    match msg {
+                        Ok(ev) => {
+                            if ev.organization_id != org_id {
+                                continue;
+                            }
+                            if let Some(pid) = project_filter {
+                                if ev.project_id != pid {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref lf) = level_filter {
+                                if !ev.level.eq_ignore_ascii_case(lf) {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref qf) = q_filter {
+                                if !ev.title_or_body.to_ascii_lowercase().contains(qf)
+                                    && !ev.service.to_ascii_lowercase().contains(qf)
+                                {
+                                    continue;
+                                }
+                            }
+                            if let Ok(json_str) = serde_json::to_string(&ev) {
+                                if sse_tx
+                                    .send(Ok(SseEvent::default().event(ev.kind).data(json_str)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    });
+
     let stream: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
-        Box::pin(BroadcastStream::new(rx).filter_map(move |msg| {
-            let _sse_permit = &permit;
-            let ev = msg.ok()?;
-            if ev.organization_id != org_id {
-                return None;
-            }
-            if let Some(pid) = project_filter {
-                if ev.project_id != pid {
-                    return None;
-                }
-            }
-            if let Some(ref lf) = level_filter {
-                if !ev.level.eq_ignore_ascii_case(lf) {
-                    return None;
-                }
-            }
-            if let Some(ref qf) = q_filter {
-                if !ev.title_or_body.to_ascii_lowercase().contains(qf)
-                    && !ev.service.to_ascii_lowercase().contains(qf)
-                {
-                    return None;
-                }
-            }
-            let json_str = serde_json::to_string(&ev).ok()?;
-            Some(Ok(SseEvent::default().event(ev.kind).data(json_str)))
-        }));
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(sse_rx));
 
     Sse::new(stream)
         .keep_alive(
@@ -1435,58 +1449,6 @@ pub async fn stream_logs_sse(
                 .text("ping"),
         )
         .into_response()
-}
-
-pub async fn list_log_resources(
-    State(state): State<Arc<AppState>>,
-    Path(org): Path<String>,
-    headers: HeaderMap,
-    ext: axum::http::Extensions,
-    method: Method,
-) -> Response {
-    let ctx = match authenticate_api_tenant(&state, &headers, &ext, &method, Some(&org)).await {
-        Ok(c) => c,
-        Err(r) => return *r,
-    };
-    if let Err(r) = require_scope(&ctx, "event:read") {
-        return *r;
-    }
-    match state.storage.list_log_resources(&ctx).await {
-        Ok(res) => Json(res).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
-    }
-}
-
-pub async fn get_log_stats(
-    State(state): State<Arc<AppState>>,
-    Path(org): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    ext: axum::http::Extensions,
-    method: Method,
-) -> Response {
-    let ctx = match authenticate_api_tenant(&state, &headers, &ext, &method, Some(&org)).await {
-        Ok(c) => c,
-        Err(r) => return *r,
-    };
-    if let Err(r) = require_scope(&ctx, "event:read") {
-        return *r;
-    }
-    let until = now_ms();
-    let since = parse_stats_period_ms(query.get("statsPeriod").map(String::as_str))
-        .unwrap_or(until - 86_400_000);
-    match state.storage.get_log_stats(&ctx, since, until).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1616,25 +1578,42 @@ pub async fn upload_sourcemap(
         .unwrap_or_else(|| "bundle.js.map".into());
     let q_debug_id = query.get("debug_id").cloned();
 
+    let size_bytes = body.len() as i64;
+    let org_quota_bytes = ((state.config.max_db_mb / 2).max(64) * 1024 * 1024) as i64;
+    if let Ok(used) = state
+        .storage
+        .get_sourcemap_total_bytes(ctx.organization_id)
+        .await
+    {
+        if used.saturating_add(size_bytes) > org_quota_bytes {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "error": "Organization sourcemap storage quota exceeded" })),
+            )
+                .into_response();
+        }
+    }
+
     let blob_sha = sha256_hex(&body);
     let dir = state.config.sourcemaps_dir();
     let target_path = dir.join(&blob_sha);
     let tmp_name = format!(".{blob_sha}.{}.tmp", random_token_b64(6));
     let tmp_path = dir.join(tmp_name);
-    let bytes_vec = body.to_vec();
     let prep_res = tokio::task::spawn_blocking(
         move || -> Result<Option<String>, (StatusCode, &'static str)> {
-            let val = serde_json::from_slice::<Value>(&bytes_vec)
+            #[derive(Deserialize)]
+            struct SmHeaderProbe {
+                version: u32,
+                #[serde(rename = "debugId")]
+                debug_id: Option<String>,
+                #[serde(rename = "mappings")]
+                _mappings: serde::de::IgnoredAny,
+            }
+            let probe = serde_json::from_slice::<SmHeaderProbe>(&body)
                 .ok()
-                .filter(|v| {
-                    v.get("version").and_then(|x| x.as_u64()) == Some(3)
-                        && v.get("mappings").is_some()
-                })
+                .filter(|v| v.version == 3)
                 .ok_or((StatusCode::BAD_REQUEST, "Invalid SourceMap v3 JSON"))?;
-            let parsed_did = val
-                .get("debugId")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
+            let parsed_did = probe.debug_id;
             std::fs::create_dir_all(&dir).map_err(|_| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1655,7 +1634,7 @@ pub async fn upload_sourcemap(
                         "Failed creating temporary sourcemap file",
                     )
                 })?;
-                f.write_all(&bytes_vec).map_err(|_| {
+                f.write_all(&body).map_err(|_| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed writing sourcemap file",
@@ -1701,7 +1680,7 @@ pub async fn upload_sourcemap(
                 debug_id: &debug_id,
                 filename: &filename,
                 blob_sha256: &blob_sha,
-                size_bytes: body.len() as i64,
+                size_bytes,
             },
         )
         .await
@@ -2197,6 +2176,20 @@ pub async fn test_alert(
     if !ctx.role.can_write_project() {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "Forbidden" }))).into_response();
     }
+    let test_dec = state.rate_limiter.check_and_record(
+        "alert_test_actor",
+        &format!("u:{}:o:{}", ctx.user_id.unwrap_or(0), ctx.organization_id),
+        5,
+        Duration::from_secs(60),
+    );
+    if !test_dec.allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, test_dec.retry_after_sec.to_string())],
+            Json(json!({ "error": "Too many alert test requests" })),
+        )
+            .into_response();
+    }
     let (rule, webhook_secret) = match state
         .storage
         .get_alert_rule_for_dispatch(&ctx, rule_id)
@@ -2234,7 +2227,17 @@ pub async fn test_alert(
     };
     match dispatch_alert(state.config.clone(), job).await {
         Ok(()) => Json(json!({ "sent": true })).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+        Err(e) => {
+            let safe_msg = if e.contains("SSRF")
+                || e.contains("SMTP is not configured")
+                || e.contains("missing")
+            {
+                e
+            } else {
+                "Alert endpoint delivery failed; check target URL and credentials".to_string()
+            };
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": safe_msg }))).into_response()
+        }
     }
 }
 

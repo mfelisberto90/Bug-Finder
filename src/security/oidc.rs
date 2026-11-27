@@ -127,15 +127,44 @@ pub fn pkce_s256_challenge(verifier: &str) -> String {
 }
 
 pub fn url_encode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+    crate::domain::models::encode_uri_component(raw)
+}
+
+fn extract_origin_pair(raw_url: &str) -> Option<(String, String, u16)> {
+    let trimmed = raw_url.trim().to_ascii_lowercase();
+    let (scheme, default_port, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        ("https".to_string(), 443u16, r)
+    } else {
+        let r = trimmed.strip_prefix("http://")?;
+        ("http".to_string(), 80u16, r)
+    };
+    let authority = rest.split(&['/', '?', '#'][..]).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
     }
-    out
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let h = &authority[..=end];
+        let after = &authority[end + 1..];
+        let p = if let Some(ps) = after.strip_prefix(':') {
+            ps.parse::<u16>().ok()?
+        } else {
+            default_port
+        };
+        (h.to_string(), p)
+    } else if let Some((h, ps)) = authority.rsplit_once(':') {
+        (h.to_string(), ps.parse::<u16>().ok()?)
+    } else {
+        (authority.to_string(), default_port)
+    };
+    Some((scheme, host, port))
+}
+
+fn same_origin(url_a: &str, url_b: &str) -> bool {
+    match (extract_origin_pair(url_a), extract_origin_pair(url_b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 pub fn seal_oidc_tx_cookie(app_key: &[u8; 32], st: &OidcTxState) -> Result<String, String> {
@@ -371,6 +400,7 @@ impl OidcClient {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn new_with_loopback_for_test(config: OidcConfig) -> Self {
         Self {
             config,
@@ -463,6 +493,9 @@ impl OidcClient {
         if doc.issuer.trim_end_matches('/') != self.config.issuer.trim_end_matches('/') {
             return Err("OIDC discovery issuer mismatch".into());
         }
+        if !same_origin(&doc.token_endpoint, &self.config.issuer) {
+            return Err("OIDC discovery token_endpoint origin does not match issuer".into());
+        }
         let jwks: JwkSet = self.fetch_json(&doc.jwks_uri)?;
 
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -542,7 +575,7 @@ impl OidcClient {
             now_sec,
         ) {
             Ok(claims) => Ok(claims),
-            Err(err) if err.contains("JWKS") => {
+            Err(err) if err.contains("JWKS") || err.contains("signature") => {
                 // Key rotation recovery: force refresh JWKS once before failing
                 let (_, fresh_jwks) = self.load_metadata_blocking(true)?;
                 verify_id_token_jwt(

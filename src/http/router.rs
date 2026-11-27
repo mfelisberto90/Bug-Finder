@@ -345,6 +345,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(ingest::ingest_otlp_logs).options(ingest::options_ingest),
         )
         .route(
+            "/v1/traces",
+            post(ingest::ingest_otlp_noop).options(ingest::options_ingest),
+        )
+        .route(
+            "/v1/metrics",
+            post(ingest::ingest_otlp_noop).options(ingest::options_ingest),
+        )
+        .route(
             "/api/v1/logs",
             post(ingest::ingest_direct_logs).options(ingest::options_ingest),
         )
@@ -423,7 +431,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/auth/passkey/register/finish",
             post(auth_routes::passkey_register_finish),
         )
-        .route("/api/auth/passkeys", get(auth_routes::list_passkeys))
         .route(
             "/api/auth/passkeys/:id",
             delete(auth_routes::delete_passkey),
@@ -437,6 +444,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(auth_routes::passkey_login_finish),
         )
         .route("/api/auth/reauth", post(auth_routes::auth_reauth))
+        .route(
+            "/api/auth/reauth/passkey/begin",
+            post(auth_routes::reauth_passkey_begin),
+        )
+        .route(
+            "/api/auth/reauth/passkey/finish",
+            post(auth_routes::reauth_passkey_finish),
+        )
         .route(
             "/api/auth/password/change",
             post(auth_routes::change_password),
@@ -536,22 +551,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/0/organizations/:org/issues/:issue_id/events/:ev_id/",
             get(api_v0::get_issue_event),
         )
-        .route(
-            "/api/0/organizations/:org/stats_v2/",
-            get(api_v0::get_stats_v2),
-        )
         .route("/api/0/organizations/:org/logs/", get(api_v0::list_logs))
         .route(
             "/api/0/organizations/:org/logs/stream",
             get(api_v0::stream_logs_sse),
-        )
-        .route(
-            "/api/0/organizations/:org/logs/resources/",
-            get(api_v0::list_log_resources),
-        )
-        .route(
-            "/api/0/organizations/:org/logs/stats/",
-            get(api_v0::get_log_stats),
         )
         .route(
             "/api/0/organizations/:org/transactions/",

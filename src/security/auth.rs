@@ -1,17 +1,27 @@
 use crate::runtime::trim_heap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use ring::rand::{SecureRandom, SystemRandom};
 use scrypt::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{
+        rand_core::OsRng as ScryptOsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
     Params, Scrypt,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 static SCRYPT_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SYS_RNG: OnceLock<SystemRandom> = OnceLock::new();
+
+pub fn fill_os_random(buf: &mut [u8]) {
+    SYS_RNG
+        .get_or_init(SystemRandom::new)
+        .fill(buf)
+        .expect("OS CSPRNG unavailable");
+}
 
 fn scrypt_semaphore() -> Arc<Semaphore> {
     SCRYPT_SEMAPHORE
@@ -20,14 +30,14 @@ fn scrypt_semaphore() -> Arc<Semaphore> {
 }
 
 pub async fn hash_password(password: String) -> Result<String, String> {
-    let permit = scrypt_semaphore()
-        .acquire_owned()
+    let permit = tokio::time::timeout(Duration::from_secs(3), scrypt_semaphore().acquire_owned())
         .await
+        .map_err(|_| "Password hashing capacity temporarily saturated".to_string())?
         .map_err(|e| format!("scrypt semaphore error: {e}"))?;
 
     tokio::task::spawn_blocking(move || {
         let _guard = permit;
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = SaltString::generate(&mut ScryptOsRng);
         // N = 2^14 (16384), r = 8, p = 1 => 16 MiB transient work factor, ~35-50ms
         let params = Params::new(14, 8, 1, 32).map_err(|e| format!("scrypt params: {e}"))?;
         let hash = Scrypt
@@ -42,7 +52,9 @@ pub async fn hash_password(password: String) -> Result<String, String> {
 }
 
 pub async fn verify_password(password: String, encoded_hash: String) -> bool {
-    let Ok(permit) = scrypt_semaphore().acquire_owned().await else {
+    let Ok(Ok(permit)) =
+        tokio::time::timeout(Duration::from_secs(3), scrypt_semaphore().acquire_owned()).await
+    else {
         return false;
     };
     tokio::task::spawn_blocking(move || {
@@ -73,13 +85,13 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 pub fn random_token_b64(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    OsRng.fill_bytes(&mut buf);
+    fill_os_random(&mut buf);
     URL_SAFE_NO_PAD.encode(&buf)
 }
 
 pub fn generate_api_token() -> (String, String, String) {
     let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    fill_os_random(&mut raw);
     let plaintext = format!("bf_{}", hex::encode(raw));
     let prefix = plaintext[..11].to_string();
     let hash = sha256_hex(plaintext.as_bytes());
@@ -88,14 +100,14 @@ pub fn generate_api_token() -> (String, String, String) {
 
 pub fn generate_dsn_public_key() -> String {
     let mut raw = [0u8; 16];
-    OsRng.fill_bytes(&mut raw);
+    fill_os_random(&mut raw);
     hex::encode(raw)
 }
 
 /// Generate a cryptographic 256-bit (64 hex chars) BUGFINDER_APP_KEY from OS CSPRNG.
 pub fn generate_app_key_hex() -> String {
     let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    fill_os_random(&mut raw);
     hex::encode(raw)
 }
 
