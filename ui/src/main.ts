@@ -2337,6 +2337,58 @@ function render(): void {
   renderMainPane();
 }
 
+function isExternalFrame(fr: any): boolean {
+  if (fr && fr.in_app === false) return true;
+  const path = String(fr?.filename || fr?.abs_path || "").toLowerCase();
+  if (!path) return true;
+  return (
+    path.includes("node_modules") ||
+    path.includes("bugfinder-mini.js") ||
+    path.includes("bugfinder-shield.js") ||
+    path.includes("/_obs/m.js") ||
+    path.includes("/_obs/s.js") ||
+    path.startsWith("pptr:") ||
+    path.includes("puppeteer") ||
+    path.includes("playwright") ||
+    path.includes("chrome-extension://") ||
+    path.includes("moz-extension://") ||
+    path.includes("translate.googleapis.com") ||
+    path.includes("googletagmanager.com")
+  );
+}
+
+function renderFrameCard(fr: any, isApp: boolean): string {
+  const pre = Array.isArray(fr.pre_context) ? fr.pre_context.join("\n") : "";
+  const ctx = fr.context_line ? `<span class="code-line-active">${esc(fr.context_line)}</span>` : "";
+  const post = Array.isArray(fr.post_context) ? fr.post_context.join("\n") : "";
+  return `
+    <div class="stack-frame ${isApp ? "stack-frame-app" : ""}">
+      <div class="stack-frame-head">
+        <span>${esc(fr.filename || fr.abs_path || "?")} : ${esc(fr.lineno ?? "?")} (${esc(fr.function || "anon")})</span>
+        <span>${fr.source_mapped ? '<span class="badge badge-ok">source-mapped</span>' : ""}${isApp ? '<span class="badge badge-info">in_app</span>' : '<span class="badge badge-muted">external</span>'}</span>
+      </div>
+      ${ctx ? `<pre class="code-ctx">${esc(pre)}\n${ctx}${esc(post)}</pre>` : ""}
+    </div>`;
+}
+
+function renderKvTable(obj: Record<string, unknown> | undefined | null, emptyText: string): string {
+  if (!obj || typeof obj !== "object") return `<p class="muted">${esc(emptyText)}</p>`;
+  const entries = Object.entries(obj);
+  if (!entries.length) return `<p class="muted">${esc(emptyText)}</p>`;
+  return `
+    <table class="kv-table">
+      <tbody>
+        ${entries
+          .slice(0, 30)
+          .map(([k, v]) => {
+            const valStr = typeof v === "string" ? v : JSON.stringify(v);
+            return `<tr><th>${esc(k)}</th><td class="mono">${esc(valStr)}</td></tr>`;
+          })
+          .join("")}
+      </tbody>
+    </table>`;
+}
+
 function populateIssueDialog(): void {
   const titleEl = document.getElementById("dlg-issue-title");
   const bodyEl = document.getElementById("dlg-issue-body");
@@ -2344,44 +2396,77 @@ function populateIssueDialog(): void {
 
   const issue = state.selectedIssue;
   const ev = state.selectedIssueEvent;
-  titleEl.textContent = issue ? `${issue.shortId} — ${issue.title}` : "Issue";
+  titleEl.textContent = issue ? `${issue.shortId} - ${issue.title}` : "Issue";
   if (!issue) {
     bodyEl.innerHTML = "";
     return;
   }
 
-  let framesHtml = "";
+  const diag = ev?.diagnosis;
+  const reqUrl = String(ev?.payload?.request?.url || "");
+  const platform = String(ev?.payload?.platform || "unknown");
+  const rel = ev?.release || issue.last_release || "";
+  const envName = ev?.environment || issue.environment || "production";
+
+  const diagHtml = diag
+    ? `
+      <div class="diag-card ${diag.is_noise_candidate ? "diag-card-noise" : ""}">
+        <div class="row-gap">
+          <strong>Diagnosis &amp; Where to Fix</strong>
+          <span class="badge badge-info">${esc(diag.category)}</span>
+          <span class="badge badge-${diag.severity_hint === "high" ? "error" : diag.severity_hint === "low" ? "muted" : "warn"}">${esc(diag.severity_hint)}</span>
+        </div>
+        <p>${esc(diag.summary)}</p>
+        <p><strong>Where to look:</strong> <span class="mono">${esc(diag.root_cause_file || issue.culprit || "unmapped")}</span></p>
+        <p><strong>Suggested fix:</strong> ${esc(diag.suggested_fix)}</p>
+        <pre class="snippet-box mono">${esc(diag.search_command)}</pre>
+        <div class="row-gap">
+          <button type="button" class="issue-action-btn" id="btn-copy-ai-prompt">Copy AI Fix Prompt</button>
+          <button type="button" class="issue-action-btn" id="btn-copy-search-cmd">Copy Search Command</button>
+        </div>
+      </div>`
+    : "";
+
+  const appFrameCards: string[] = [];
+  const extFrameCards: string[] = [];
   const excVals = ev?.payload?.exception?.values;
   if (Array.isArray(excVals)) {
-    framesHtml = excVals
-      .map((exc: any) => {
-        const frames = exc?.stacktrace?.frames || [];
-        return frames
-          .slice()
-          .reverse()
-          .map((fr: any) => {
-            const pre = Array.isArray(fr.pre_context) ? fr.pre_context.join("\n") : "";
-            const ctx = fr.context_line ? `<span class="code-line-active">${esc(fr.context_line)}</span>` : "";
-            const post = Array.isArray(fr.post_context) ? fr.post_context.join("\n") : "";
-            return `
-              <div class="stack-frame">
-                <div class="stack-frame-head">
-                  <span>${esc(fr.filename || fr.abs_path || "?")} : ${esc(fr.lineno ?? "?")} (${esc(fr.function || "anon")})</span>
-                  <span>${fr.source_mapped ? '<span class="badge badge-ok">source-mapped</span>' : ""}</span>
-                </div>
-                ${ctx ? `<pre class="code-ctx">${esc(pre)}\n${ctx}${esc(post)}</pre>` : ""}
-              </div>`;
-          })
-          .join("");
-      })
-      .join("");
+    for (const exc of excVals) {
+      const frames = Array.isArray(exc?.stacktrace?.frames) ? exc.stacktrace.frames.slice().reverse() : [];
+      for (const fr of frames) {
+        if (isExternalFrame(fr)) {
+          extFrameCards.push(renderFrameCard(fr, false));
+        } else {
+          appFrameCards.push(renderFrameCard(fr, true));
+        }
+      }
+    }
+  }
+
+  let framesHtml = "";
+  if (appFrameCards.length > 0 && extFrameCards.length > 0) {
+    framesHtml = `${appFrameCards.join("")}
+      <details class="external-frames">
+        <summary>External / SDK frames (${extFrameCards.length})</summary>
+        ${extFrameCards.join("")}
+      </details>`;
+  } else if (appFrameCards.length > 0) {
+    framesHtml = appFrameCards.join("");
+  } else if (extFrameCards.length > 0) {
+    framesHtml = extFrameCards.join("");
   }
 
   const crumbs = Array.isArray(ev?.payload?.breadcrumbs?.values) ? ev.payload.breadcrumbs.values : [];
   const crumbsHtml = crumbs.length
     ? crumbs
         .slice(-15)
-        .map((b: any) => `<li><span class="mono">[${esc(b.category || "default")}]</span> ${esc(b.message || "")}</li>`)
+        .map((b: any) => {
+          const status = b?.data?.status_code;
+          const dur = b?.data?.duration_ms;
+          const statusBadge = typeof status === "number" ? ` <span class="badge ${status >= 500 ? "badge-error" : "badge-info"}">${status}</span>` : "";
+          const durBadge = typeof dur === "number" ? ` <span class="badge badge-muted">${dur} ms</span>` : "";
+          return `<li><span class="mono">[${esc(b.category || "default")}]</span> ${esc(b.message || "")}${statusBadge}${durBadge}</li>`;
+        })
         .join("")
     : "<li>No breadcrumbs captured.</li>";
 
@@ -2389,16 +2474,53 @@ function populateIssueDialog(): void {
     <div class="stack-col">
       <div class="row-gap">
         <span class="badge badge-${esc(issue.status)}">${esc(issue.status)}</span>
-        <button type="button" data-issue-status="resolved" data-issue-id="${issue.id}" data-issue-rel="${esc(issue.last_release || "")}">Resolve</button>
-        <button type="button" data-issue-status="ignored" data-issue-id="${issue.id}">Ignore</button>
-        <button type="button" data-issue-status="unresolved" data-issue-id="${issue.id}">Reopen</button>
-        ${ev?.trace_id ? `<button type="button" data-open-trace="${esc(ev.trace_id)}">Inspect Trace Logs</button>` : ""}
+        <button type="button" class="issue-action-btn" data-issue-status="resolved" data-issue-id="${issue.id}" data-issue-rel="${esc(issue.last_release || "")}">Resolve</button>
+        <button type="button" class="issue-action-btn" data-issue-status="ignored" data-issue-id="${issue.id}">Ignore</button>
+        <button type="button" class="issue-action-btn" data-issue-status="unresolved" data-issue-id="${issue.id}">Reopen</button>
+        ${ev?.trace_id ? `<button type="button" class="issue-action-btn" data-open-trace="${esc(ev.trace_id)}">Inspect Trace Logs</button>` : ""}
       </div>
+      <div class="meta-strip">
+        <span class="meta-pill">env: ${esc(envName)}</span>
+        <span class="meta-pill">platform: ${esc(platform)}</span>
+        ${rel ? `<span class="meta-pill">release: ${esc(rel)}</span>` : ""}
+        ${issue.culprit ? `<span class="meta-pill">culprit: ${esc(issue.culprit)}</span>` : ""}
+        ${reqUrl ? `<span class="meta-pill">url: ${esc(reqUrl)}</span>` : ""}
+      </div>
+      ${diagHtml}
       <h3>Stack Trace</h3>
       <div>${framesHtml || "<p>No stacktrace attached to latest event.</p>"}</div>
+      <div class="grid-2">
+        <div>
+          <h3>Extra Context</h3>
+          ${renderKvTable(ev?.payload?.extra, "No extra context attached.")}
+        </div>
+        <div>
+          <h3>Tags</h3>
+          ${renderKvTable(ev?.tags, "No tags attached.")}
+        </div>
+      </div>
       <h3>Breadcrumbs</h3>
       <ul>${crumbsHtml}</ul>
     </div>`;
+
+  document.getElementById("btn-copy-ai-prompt")?.addEventListener("click", async () => {
+    if (!diag?.ai_fix_prompt) return;
+    try {
+      await navigator.clipboard.writeText(diag.ai_fix_prompt);
+      showToast("AI Fix Prompt copied to clipboard");
+    } catch {
+      showToast("Clipboard copy blocked; open MCP diagnose_issue instead");
+    }
+  });
+  document.getElementById("btn-copy-search-cmd")?.addEventListener("click", async () => {
+    if (!diag?.search_command) return;
+    try {
+      await navigator.clipboard.writeText(diag.search_command);
+      showToast("Search command copied");
+    } catch {
+      showToast("Clipboard copy blocked");
+    }
+  });
 
   bindTraceOpenButtons(bodyEl);
   bodyEl.querySelectorAll<HTMLButtonElement>("[data-issue-status]").forEach((btn) => {
@@ -3738,6 +3860,10 @@ function openProjectSettingsDialog(projectId: number): void {
         <input id="pf-ext" type="checkbox" name="ignore_browser_extensions" ${f.ignore_browser_extensions ? "checked" : ""}>
         <span>Ignore browser extension errors</span>
       </label>
+      <label class="check-row" for="pf-third-party">
+        <input id="pf-third-party" type="checkbox" name="ignore_third_party_scripts" ${f.ignore_third_party_scripts !== false ? "checked" : ""}>
+        <span>Ignore third-party widget errors (Google Translate, external trackers)</span>
+      </label>
       <label class="check-row" for="pf-crawl">
         <input id="pf-crawl" type="checkbox" name="ignore_crawlers" ${f.ignore_crawlers ? "checked" : ""}>
         <span>Ignore known bots / crawlers</span>
@@ -3827,6 +3953,7 @@ function openProjectSettingsDialog(projectId: number): void {
       allowed_domains: splitFilterList(getVal("pf-domains")),
       ignore_messages: splitFilterList(getVal("pf-ignore-msg")),
       ignore_browser_extensions: getChecked("pf-ext"),
+      ignore_third_party_scripts: getChecked("pf-third-party"),
       ignore_crawlers: getChecked("pf-crawl"),
       ignore_localhost: getChecked("pf-local"),
       scrub_ip_addresses: getChecked("pf-ip"),

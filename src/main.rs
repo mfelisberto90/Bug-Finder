@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 
-use bugfinder::cli_integrate::{run_init_cli, run_pipe_cli, run_wrap_cli};
+use bugfinder::cli_integrate::{
+    run_init_cli, run_pipe_cli, run_sourcemaps_upload_cli, run_wrap_cli,
+};
 use bugfinder::config::{parse_cli_args, AppConfig, CliCommand};
 use bugfinder::http::router::build_router;
 use bugfinder::mcp::{run_mcp_stdio, run_synthetic_test, run_tail_cli};
@@ -42,6 +44,7 @@ fn main() -> ExitCode {
                    bugfinder init --dsn DSN [--dir PATH] [--stack auto|web|node|next|vite|python|laravel|go|rust] [--sdk zero-dep|sentry]\n  \
                    bugfinder wrap --dsn DSN [--service NAME] [--heartbeat-url URL] -- CMD...\n  \
                    bugfinder pipe --dsn DSN [--service NAME]\n  \
+                   bugfinder sourcemaps upload --url URL --org SLUG --project SLUG --release VER --token TOK --dir PATH [--delete-after-upload]\n  \
                    bugfinder migrate [--data DIR] [--db URL]\n  \
                    bugfinder backup --out FILE [--data DIR]\n  \
                    bugfinder doctor [--url URL] [--data DIR] [--db URL] [--json]\n  \
@@ -242,6 +245,32 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("pipe error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        CliCommand::SourcemapsUpload {
+            base_url,
+            org,
+            project,
+            release,
+            token,
+            dir,
+            delete_after_upload,
+        } => match run_sourcemaps_upload_cli(
+            &base_url,
+            &org,
+            &project,
+            &release,
+            &token,
+            &dir,
+            delete_after_upload,
+        ) {
+            Ok(count) => {
+                println!("Uploaded {count} SourceMap file(s) for release '{release}'.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sourcemaps upload error: {e}");
                 ExitCode::FAILURE
             }
         },

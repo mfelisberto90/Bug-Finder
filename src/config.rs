@@ -60,6 +60,15 @@ pub enum CliCommand {
         service: Option<String>,
         env_name: String,
     },
+    SourcemapsUpload {
+        base_url: String,
+        org: String,
+        project: String,
+        release: String,
+        token: String,
+        dir: PathBuf,
+        delete_after_upload: bool,
+    },
     Version,
     Help,
 }
@@ -967,6 +976,75 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                         dsn,
                         service,
                         env_name,
+                    },
+                    bind_override: None,
+                    data_override: None,
+                    db_override: None,
+                });
+            }
+            "sourcemaps" => {
+                if args.get(2).map(|s| s.as_str()) != Some("upload") {
+                    return Err("Expected 'bugfinder sourcemaps upload ...'".into());
+                }
+                let mut base_url = env::var("BUGFINDER_URL").unwrap_or_default();
+                let mut org = env::var("BUGFINDER_ORG").unwrap_or_default();
+                let mut project = env::var("BUGFINDER_PROJECT").unwrap_or_default();
+                let mut release = String::new();
+                let mut token = env::var("BUGFINDER_TOKEN").unwrap_or_default();
+                let mut dir = PathBuf::from(".");
+                let mut delete_after_upload = false;
+                let mut j = 3;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--url" => {
+                            j += 1;
+                            base_url = args.get(j).cloned().ok_or("--url requires a value")?;
+                        }
+                        "--org" => {
+                            j += 1;
+                            org = args.get(j).cloned().ok_or("--org requires a value")?;
+                        }
+                        "--project" => {
+                            j += 1;
+                            project = args.get(j).cloned().ok_or("--project requires a value")?;
+                        }
+                        "--release" => {
+                            j += 1;
+                            release = args.get(j).cloned().ok_or("--release requires a value")?;
+                        }
+                        "--token" => {
+                            j += 1;
+                            token = args.get(j).cloned().ok_or("--token requires a value")?;
+                        }
+                        "--dir" => {
+                            j += 1;
+                            dir = PathBuf::from(args.get(j).ok_or("--dir requires a path")?);
+                        }
+                        "--delete-after-upload" => delete_after_upload = true,
+                        other => return Err(format!("Unknown sourcemaps upload option: {other}")),
+                    }
+                    j += 1;
+                }
+                if base_url.trim().is_empty()
+                    || org.trim().is_empty()
+                    || project.trim().is_empty()
+                    || release.trim().is_empty()
+                    || token.trim().is_empty()
+                {
+                    return Err(
+                        "sourcemaps upload requires --url, --org, --project, --release, and --token (or BUGFINDER_TOKEN)"
+                            .into(),
+                    );
+                }
+                return Ok(ParsedArgs {
+                    command: CliCommand::SourcemapsUpload {
+                        base_url,
+                        org,
+                        project,
+                        release,
+                        token,
+                        dir,
+                        delete_after_upload,
                     },
                     bind_override: None,
                     data_override: None,

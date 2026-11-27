@@ -1709,6 +1709,7 @@ impl StorageBackend for PostgresStorage {
                     span_id: r.get("span_id"),
                     tags: r.get("tags_json"),
                     payload,
+                    diagnosis: None,
                 }
             })
             .collect())
@@ -1763,6 +1764,7 @@ impl StorageBackend for PostgresStorage {
                 span_id: r.get("span_id"),
                 tags: r.get("tags_json"),
                 payload,
+                diagnosis: None,
             }
         }))
     }
@@ -2252,15 +2254,50 @@ impl StorageBackend for PostgresStorage {
         .fetch_optional(&mut *tx)
         .await
         .map_err(map_pg_err)?;
+        if let Some(r) = row {
+            tx.commit().await.map_err(map_pg_err)?;
+            return Ok(Some(SourceMapRecord {
+                id: r.get("id"),
+                release_version: r.get("release_version"),
+                debug_id: r.get("debug_id"),
+                filename: r.get("filename"),
+                blob_sha256: r.get("blob_sha256"),
+                size_bytes: r.get("size_bytes"),
+            }));
+        }
+        if let Some(target_stem) = crate::domain::sourcemap::extract_hashed_bundle_prefix(filename)
+        {
+            let candidates = sqlx::query(
+                "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
+                 FROM source_maps
+                 WHERE project_id = $1
+                 ORDER BY CASE WHEN release_version = $2 THEN 0 WHEN release_version = '' THEN 1 ELSE 2 END, id DESC
+                 LIMIT 100",
+            )
+            .bind(project_id)
+            .bind(rel_s)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_pg_err)?;
+            for r in candidates {
+                let rec = SourceMapRecord {
+                    id: r.get("id"),
+                    release_version: r.get("release_version"),
+                    debug_id: r.get("debug_id"),
+                    filename: r.get("filename"),
+                    blob_sha256: r.get("blob_sha256"),
+                    size_bytes: r.get("size_bytes"),
+                };
+                if crate::domain::sourcemap::extract_hashed_bundle_prefix(&rec.filename).as_ref()
+                    == Some(&target_stem)
+                {
+                    tx.commit().await.map_err(map_pg_err)?;
+                    return Ok(Some(rec));
+                }
+            }
+        }
         tx.commit().await.map_err(map_pg_err)?;
-        Ok(row.map(|r| SourceMapRecord {
-            id: r.get("id"),
-            release_version: r.get("release_version"),
-            debug_id: r.get("debug_id"),
-            filename: r.get("filename"),
-            blob_sha256: r.get("blob_sha256"),
-            size_bytes: r.get("size_bytes"),
-        }))
+        Ok(None)
     }
 
     async fn list_monitors(&self, ctx: &TenantCtx) -> Result<Vec<UptimeMonitorDto>, String> {

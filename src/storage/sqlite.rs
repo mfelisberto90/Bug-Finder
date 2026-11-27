@@ -1894,6 +1894,7 @@ impl StorageBackend for SqliteStorage {
                         span_id: r.get(9)?,
                         tags: serde_json::from_str(&tags_s).unwrap_or_else(|_| json!({})),
                         payload,
+                        diagnosis: None,
                     })
                 })
                 .map_err(map_sqlite_err)?;
@@ -1949,6 +1950,7 @@ impl StorageBackend for SqliteStorage {
                         span_id: r.get(9)?,
                         tags: serde_json::from_str(&tags_s).unwrap_or_else(|_| json!({})),
                         payload,
+                        diagnosis: None,
                     })
                 })
                 .optional()
@@ -1973,6 +1975,7 @@ impl StorageBackend for SqliteStorage {
                         span_id: r.get(9)?,
                         tags: serde_json::from_str(&tags_s).unwrap_or_else(|_| json!({})),
                         payload,
+                        diagnosis: None,
                     })
                 })
                 .optional()
@@ -2544,27 +2547,64 @@ impl StorageBackend for SqliteStorage {
                     return Ok(Some(rec));
                 }
             }
-            conn.query_row(
-                "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
-                 FROM source_maps
-                 WHERE organization_id = ?1 AND project_id = ?2
-                   AND (filename = ?3 OR filename = ?4)
-                 ORDER BY CASE WHEN release_version = '' THEN 0 ELSE 1 END, id DESC
-                 LIMIT 1",
-                params![organization_id, project_id, map_name, fname],
-                |r| {
-                    Ok(SourceMapRecord {
-                        id: r.get(0)?,
-                        release_version: r.get(1)?,
-                        debug_id: r.get(2)?,
-                        filename: r.get(3)?,
-                        blob_sha256: r.get(4)?,
-                        size_bytes: r.get(5)?,
+            if let Some(exact) = conn
+                .query_row(
+                    "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
+                     FROM source_maps
+                     WHERE organization_id = ?1 AND project_id = ?2
+                       AND (filename = ?3 OR filename = ?4)
+                     ORDER BY CASE WHEN release_version = '' THEN 0 ELSE 1 END, id DESC
+                     LIMIT 1",
+                    params![organization_id, project_id, map_name, fname],
+                    |r| {
+                        Ok(SourceMapRecord {
+                            id: r.get(0)?,
+                            release_version: r.get(1)?,
+                            debug_id: r.get(2)?,
+                            filename: r.get(3)?,
+                            blob_sha256: r.get(4)?,
+                            size_bytes: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(map_sqlite_err)?
+            {
+                return Ok(Some(exact));
+            }
+            if let Some(target_stem) = crate::domain::sourcemap::extract_hashed_bundle_prefix(&fname)
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
+                         FROM source_maps
+                         WHERE organization_id = ?1 AND project_id = ?2
+                         ORDER BY CASE WHEN release_version = ?3 THEN 0 WHEN release_version = '' THEN 1 ELSE 2 END, id DESC
+                         LIMIT 100",
+                    )
+                    .map_err(map_sqlite_err)?;
+                let rows = stmt
+                    .query_map(params![organization_id, project_id, rel_s], |r| {
+                        Ok(SourceMapRecord {
+                            id: r.get(0)?,
+                            release_version: r.get(1)?,
+                            debug_id: r.get(2)?,
+                            filename: r.get(3)?,
+                            blob_sha256: r.get(4)?,
+                            size_bytes: r.get(5)?,
+                        })
                     })
-                },
-            )
-            .optional()
-            .map_err(map_sqlite_err)
+                    .map_err(map_sqlite_err)?;
+                for row in rows {
+                    let rec = row.map_err(map_sqlite_err)?;
+                    if crate::domain::sourcemap::extract_hashed_bundle_prefix(&rec.filename).as_ref()
+                        == Some(&target_stem)
+                    {
+                        return Ok(Some(rec));
+                    }
+                }
+            }
+            Ok(None)
         })
         .await
     }

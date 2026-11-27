@@ -306,6 +306,43 @@ pub fn strip_url_basename(raw: &str) -> &str {
     without_query.rsplit('/').next().unwrap_or(without_query)
 }
 
+/// Extract `(stem_with_separator, extension)` from Vite/Rollup/Webpack hashed bundle names
+/// such as `index-B8xK2pLm.js` -> `Some(("index-", ".js"))` or `chunk.a1b2c3d4.mjs` -> `Some(("chunk.", ".mjs"))`.
+pub fn extract_hashed_bundle_prefix(filename: &str) -> Option<(String, String)> {
+    let clean = strip_url_basename(filename);
+    let no_map = clean.strip_suffix(".map").unwrap_or(clean);
+    let (base, ext) = if let Some(b) = no_map.strip_suffix(".mjs") {
+        (b, ".mjs")
+    } else if let Some(b) = no_map.strip_suffix(".cjs") {
+        (b, ".cjs")
+    } else {
+        let b = no_map.strip_suffix(".js")?;
+        (b, ".js")
+    };
+    let (sep_idx, sep_char) = base.rmatch_indices(&['-', '.'][..]).next()?;
+    let hash = &base[sep_idx + 1..];
+    if hash.len() < 6 || hash.len() > 24 {
+        return None;
+    }
+    if !hash
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let has_digit = hash.bytes().any(|b| b.is_ascii_digit());
+    let has_upper = hash.bytes().any(|b| b.is_ascii_uppercase());
+    let has_lower = hash.bytes().any(|b| b.is_ascii_lowercase());
+    let looks_like_hash = has_digit || (has_upper && has_lower);
+    if !looks_like_hash || sep_idx == 0 {
+        return None;
+    }
+    Some((
+        format!("{}{}", &base[..sep_idx], sep_char).to_ascii_lowercase(),
+        ext.to_ascii_lowercase(),
+    ))
+}
+
 pub fn demangle_event_with_maps<F>(ev: &mut Value, mut fetch_map: F) -> bool
 where
     F: FnMut(Option<&str>, &str) -> Option<Arc<SourceMapV3>>,
@@ -447,5 +484,15 @@ mod tests {
         assert_eq!(fr["filename"], "src/checkout.ts");
         assert_eq!(fr["function"], "submitOrder");
         assert_eq!(fr["source_mapped"], true);
+
+        assert_eq!(
+            extract_hashed_bundle_prefix("https://cdn.example.com/assets/index-B8xK2pLm.js"),
+            Some(("index-".to_string(), ".js".to_string()))
+        );
+        assert_eq!(
+            extract_hashed_bundle_prefix("index-Z9yW1qRt.js.map"),
+            Some(("index-".to_string(), ".js".to_string()))
+        );
+        assert_eq!(extract_hashed_bundle_prefix("bugfinder-mini.js"), None);
     }
 }
