@@ -1,4 +1,5 @@
 use crate::domain::models::ProjectFilters;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -225,6 +226,77 @@ pub fn strip_ansi_and_bidi(input: &str) -> String {
     out
 }
 
+static PREFILTER_AC: OnceLock<AhoCorasick> = OnceLock::new();
+
+fn prefilter_ac() -> &'static AhoCorasick {
+    PREFILTER_AC.get_or_init(|| {
+        AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build([
+                "private key",
+                "bearer",
+                "basic",
+                "eyj",
+                "sk_live_",
+                "sk_test_",
+                "rk_live_",
+                "rk_test_",
+                "sk-proj-",
+                "sk-ant-",
+                "whsec_",
+                "ghp_",
+                "gho_",
+                "ghu_",
+                "ghs_",
+                "glpat-",
+                "xoxb-",
+                "xoxp-",
+                "npm_",
+                "pypi-",
+                "bf_",
+                "akia",
+                "asia",
+                "aiza",
+                "sg.",
+                "://",
+            ])
+            .expect("Scrubber SIMD prefilter AhoCorasick must compile")
+    })
+}
+
+fn fast_might_need_scrub(bytes: &[u8], scrub_emails: bool) -> (bool, bool, bool) {
+    let mut has_nul = false;
+    let mut has_at = false;
+    let mut has_eq = false;
+    let mut has_q_or_amp = false;
+    let mut has_plus = false;
+    let mut has_zero_seven = false;
+    let mut digits = 0usize;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        match b {
+            0 => has_nul = true,
+            b'@' => has_at = true,
+            b'=' => has_eq = true,
+            b'?' | b'&' => has_q_or_amp = true,
+            b'+' => has_plus = true,
+            b'0' if bytes.get(idx + 1) == Some(&b'7') => has_zero_seven = true,
+            b'0'..=b'9' => digits += 1,
+            _ => {}
+        }
+    }
+
+    let cheap_hit = has_nul
+        || (has_eq && has_q_or_amp)
+        || digits >= 13
+        || (scrub_emails && (has_at || (digits >= 10 && (has_plus || has_zero_seven))));
+    if cheap_hit {
+        return (true, has_nul, has_at);
+    }
+    let ac_hit = prefilter_ac().is_match(bytes);
+    (ac_hit, has_nul, has_at)
+}
+
 pub struct Scrubber {
     safe_keys: HashSet<String>,
     sensitive_keys: HashSet<String>,
@@ -304,31 +376,12 @@ impl Scrubber {
         input: &'a str,
         report: &mut ScrubReport,
     ) -> Cow<'a, str> {
-        let has_nul = input.contains('\0');
-        let has_pem = input.contains("PRIVATE KEY");
-        let has_auth_hdr = contains_ascii_ci(input.as_bytes(), b"bearer")
-            || contains_ascii_ci(input.as_bytes(), b"basic");
-        let has_jwt = input.contains("eyJ");
-        let has_prefixed = has_prefixed_secret_hint(input);
-        let has_url_creds = input.contains("://") && input.contains('@');
-        let has_query = input.contains('=') && (input.contains('?') || input.contains('&'));
-        let digit_count = input.bytes().filter(|b| b.is_ascii_digit()).count();
-        let has_card_digits = digit_count >= 13;
-        let has_phone_hint =
-            self.scrub_emails && digit_count >= 10 && (input.contains('+') || input.contains("07"));
-        let has_email = self.scrub_emails && input.contains('@');
-
-        if !(has_nul
-            || has_pem
-            || has_auth_hdr
-            || has_jwt
-            || has_prefixed
-            || has_url_creds
-            || has_query
-            || has_card_digits
-            || has_phone_hint
-            || has_email)
-        {
+        if input.len() < 6 && memchr::memchr(0, input.as_bytes()).is_none() {
+            return Cow::Borrowed(input);
+        }
+        let (might_need, has_nul, _has_at) =
+            fast_might_need_scrub(input.as_bytes(), self.scrub_emails);
+        if !might_need {
             return Cow::Borrowed(input);
         }
 

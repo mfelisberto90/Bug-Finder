@@ -23,9 +23,34 @@
     consoleWrapped: false,
     inConsole: false,
     slowMs: 5000,
+    tracePropagation: false,
+    traceId: "",
     sessionPinged: false,
     recentEvents: Object.create(null)
   };
+
+  function sanitizeUrl(raw) {
+    if (!raw) return "";
+    var s = String(raw);
+    var hashIdx = s.indexOf("#");
+    if (hashIdx !== -1) s = s.slice(0, hashIdx);
+    var qIdx = s.indexOf("?");
+    if (qIdx === -1) return s;
+    var base = s.slice(0, qIdx);
+    var query = s.slice(qIdx + 1);
+    var parts = query.split("&");
+    var sensitive = /^(token|access_token|refresh_token|id_token|api_key|apikey|secret|password|passwd|pwd|code|session|sig|signature|jwt|auth|client_secret|sentry_key)$/i;
+    for (var i = 0; i < parts.length; i++) {
+      var eq = parts[i].indexOf("=");
+      if (eq !== -1) {
+        var k = parts[i].slice(0, eq);
+        if (sensitive.test(k)) {
+          parts[i] = k + "=[Filtered]";
+        }
+      }
+    }
+    return base + "?" + parts.join("&");
+  }
 
   function nowMs() {
     try {
@@ -273,13 +298,14 @@
       user: cfg.user || undefined,
       extra: extra || undefined,
       breadcrumbs: { values: cfg.breadcrumbs.slice() },
-      request: { url: typeof location !== "undefined" ? location.href : "" },
+      contexts: cfg.traceId ? { trace: { trace_id: cfg.traceId, span_id: uuidHex().slice(0, 16) } } : undefined,
+      request: { url: typeof location !== "undefined" ? sanitizeUrl(location.href) : "" },
       exception: {
         values: [{ type: name, value: message, stacktrace: { frames: frames } }]
       }
     };
     sendEnvelope(
-      { event_id: eid, sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+      { event_id: eid, sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "2.0.0" } },
       [[{ type: "event" }, payload]]
     );
     return eid;
@@ -293,7 +319,7 @@
     }
     var eid = uuidHex();
     sendEnvelope(
-      { event_id: eid, sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+      { event_id: eid, sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "2.0.0" } },
       [[{ type: "event" }, {
         event_id: eid,
         timestamp: Date.now() / 1000,
@@ -305,7 +331,8 @@
         tags: cfg.tags,
         user: cfg.user || undefined,
         extra: extra || undefined,
-        request: { url: typeof location !== "undefined" ? location.href : "" },
+        contexts: cfg.traceId ? { trace: { trace_id: cfg.traceId, span_id: uuidHex().slice(0, 16) } } : undefined,
+        request: { url: typeof location !== "undefined" ? sanitizeUrl(location.href) : "" },
         breadcrumbs: { values: cfg.breadcrumbs.slice() }
       }]]
     );
@@ -320,7 +347,7 @@
     if (!cfg.logBuffer.length) return;
     var batch = cfg.logBuffer.splice(0, 100);
     sendEnvelope(
-      { sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+      { sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "2.0.0" } },
       [[
         { type: "log", item_count: batch.length, content_type: "application/vnd.sentry.items.log+json" },
         { version: 2, items: batch }
@@ -368,9 +395,32 @@
         return origFetch.apply(root, arguments);
       }
       var method = ((initOpts && initOpts.method) || (input && input.method) || "GET").toUpperCase();
-      var safePath = urlStr.split("?")[0].slice(0, 200);
+      var safePath = sanitizeUrl(urlStr).split("?")[0].slice(0, 200);
+      var callArgs = arguments;
+      if (cfg.tracePropagation && cfg.traceId && typeof location !== "undefined") {
+        try {
+          var targetOrigin = new URL(urlStr, location.href).origin;
+          if (targetOrigin === location.origin) {
+            var nextInit = initOpts ? Object.assign({}, initOpts) : {};
+            var h = nextInit.headers;
+            var hasTp = false;
+            if (typeof Headers !== "undefined" && h instanceof Headers) {
+              hasTp = h.has("traceparent");
+              if (!hasTp) h.set("traceparent", "00-" + cfg.traceId + "-" + uuidHex().slice(0, 16) + "-01");
+            } else {
+              var hdrObj = Object.assign({}, h || {});
+              for (var hk in hdrObj) {
+                if (String(hk).toLowerCase() === "traceparent") hasTp = true;
+              }
+              if (!hasTp) hdrObj.traceparent = "00-" + cfg.traceId + "-" + uuidHex().slice(0, 16) + "-01";
+              nextInit.headers = hdrObj;
+            }
+            callArgs = [input, nextInit];
+          }
+        } catch (_) {}
+      }
       var startedAt = nowMs();
-      return origFetch.apply(root, arguments).then(
+      return origFetch.apply(root, callArgs).then(
         function (resp) {
           var dur = Math.max(0, Math.round(nowMs() - startedAt));
           var st = resp ? resp.status : 0;
@@ -447,7 +497,7 @@
         if (rawUrl && !isOwnTelemetryUrl(rawUrl) && !self._bfBound && typeof self.addEventListener === "function") {
           self._bfBound = true;
           var method = self._bfMethod || "GET";
-          var safePath = rawUrl.split("?")[0].slice(0, 200);
+          var safePath = sanitizeUrl(rawUrl).split("?")[0].slice(0, 200);
           var xhrStartedAt = 0;
           self.addEventListener("loadstart", function () {
             xhrStartedAt = nowMs();
@@ -546,6 +596,10 @@
     cfg.release = options.release || "";
     cfg.environment = options.environment || "production";
     cfg.maxBreadcrumbs = options.maxBreadcrumbs || 50;
+    cfg.tracePropagation = Boolean(options.tracePropagation);
+    if (cfg.tracePropagation && !cfg.traceId) {
+      cfg.traceId = uuidHex();
+    }
     if (options.slowThresholdMs && Number(options.slowThresholdMs) >= 500) {
       cfg.slowMs = Number(options.slowThresholdMs);
     }
@@ -553,7 +607,7 @@
     if (cfg.release && !cfg.sessionPinged && cfg.endpoint) {
       cfg.sessionPinged = true;
       sendEnvelope(
-        { sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "1.0.0" } },
+        { sent_at: new Date().toISOString(), dsn: cfg.rawDsn || undefined, sdk: { name: "bugfinder.mini", version: "2.0.0" } },
         [[{ type: "session" }, { init: true, status: "ok", errors: 0, sid: uuidHex(), attrs: { release: cfg.release, environment: cfg.environment } }]],
         true
       );
@@ -680,6 +734,13 @@
         }
       } catch (_) {}
       window.addEventListener("pagehide", function () { flushLogs(true); });
+      if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState === "hidden") {
+            flushLogs(true);
+          }
+        });
+      }
     }
   }
 
@@ -714,6 +775,7 @@
           environment: ds.env || "production",
           release: ds.release || "",
           slowThresholdMs: ds.slowMs ? Number(ds.slowMs) : 5000,
+          tracePropagation: ds.tracePropagation === "true",
           captureFetch: capFetch,
           captureConsole: ds.captureConsole || ""
         });

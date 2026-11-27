@@ -197,8 +197,9 @@ dependencies = [
 
 [[package]]
 name = "bugfinder"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
+ "aho-corasick",
  "async-trait",
  "axum",
  "base64",
@@ -211,6 +212,7 @@ dependencies = [
  "http",
  "http-body-util",
  "libc",
+ "memchr",
  "rand",
  "regex",
  "ring",

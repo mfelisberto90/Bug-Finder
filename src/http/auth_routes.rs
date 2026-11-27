@@ -42,7 +42,7 @@ fn dummy_scrypt_hash() -> String {
                 password_hash::{PasswordHasher, SaltString},
                 Params, Scrypt,
             };
-            let salt = SaltString::generate(&mut rand::thread_rng());
+            let salt = SaltString::generate(&mut rand::rngs::OsRng);
             let params = Params::new(14, 8, 1, 32).expect("valid scrypt params");
             Scrypt
                 .hash_password_customized(b"dummy-timing-guard", None, None, params, &salt)
@@ -72,12 +72,16 @@ pub struct LoginRequest {
 }
 
 pub fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        let trimmed = part.trim();
-        if let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim() == name {
-                return Some(v.trim().to_string());
+    for hdr in headers.get_all(header::COOKIE) {
+        let Ok(raw) = hdr.to_str() else {
+            continue;
+        };
+        for part in raw.split(';') {
+            let trimmed = part.trim();
+            if let Some((k, v)) = trimmed.split_once('=') {
+                if k.trim() == name {
+                    return Some(v.trim().to_string());
+                }
             }
         }
     }

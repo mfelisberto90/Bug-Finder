@@ -8,4 +8,5 @@ pub mod mfa;
 pub mod oidc;
 pub mod ratelimit;
 pub mod ssrf;
+pub mod waf;
 pub mod webauthn;

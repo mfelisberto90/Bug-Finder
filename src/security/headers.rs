@@ -1,6 +1,11 @@
 use crate::config::AppConfig;
+use crate::http::auth_routes::extract_cookie;
 use crate::security::auth::{random_token_b64, sha256_hex};
-use crate::security::ratelimit::BoundedMap;
+use crate::security::ratelimit::ShardedBoundedMap;
+use crate::security::waf::{
+    detect_http_exploit_probe, is_anomalous_http_method, is_canary_or_dotfile_probe,
+    is_scanner_user_agent,
+};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
@@ -8,7 +13,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -20,125 +25,15 @@ pub struct ClientIp(pub IpAddr);
 #[derive(Debug, Clone)]
 pub struct PeerIp(pub IpAddr);
 
-const SCANNER_USER_AGENTS: &[&str] = &[
-    "sqlmap",
-    "nuclei",
-    "nikto",
-    "ffuf",
-    "gobuster",
-    "feroxbuster",
-    "masscan",
-    "zgrab",
-    "dirbuster",
-    "wpscan",
-    "acunetix",
-    "nessus",
-    "havij",
-    "nmap scripting engine",
-];
-
-const CANARY_EXACT_OR_PREFIXES: &[&str] = &[
-    "/.env",
-    "/.git",
-    "/.aws",
-    "/.ssh",
-    "/.svn",
-    "/.ds_store",
-    "/wp-admin",
-    "/wp-login.php",
-    "/wp-includes",
-    "/xmlrpc.php",
-    "/phpmyadmin",
-    "/pma",
-    "/admin.php",
-    "/config.php",
-    "/vendor/phpunit",
-    "/actuator",
-    "/server-status",
-    "/server-info",
-    "/cgi-bin/",
-];
-
-const SENSITIVE_DUMP_SUFFIXES: &[&str] = &[
-    ".sql", ".sql.gz", ".bak", ".old", ".swp", ".orig", ".env.bak",
-];
-
 const BENIGN_404_ASSET_SUFFIXES: &[&str] = &[
     ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".css", ".txt",
 ];
 
-/// Matches decoy canary endpoints, nested dotfiles (`/api/.env`, `/v1/.git/HEAD`), and DB/backup
-/// dump probes while explicitly exempting RFC 8615 `/.well-known/*` browser/WebAuthn routes.
-pub fn is_canary_or_dotfile_probe(path: &str) -> bool {
-    let low = path.trim().to_ascii_lowercase();
-    if low.starts_with("/.well-known/") || low == "/.well-known" {
-        return false;
-    }
-    if CANARY_EXACT_OR_PREFIXES.iter().any(|p| {
-        low == *p
-            || low
-                .strip_prefix(*p)
-                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('.'))
-    }) {
-        return true;
-    }
-    if SENSITIVE_DUMP_SUFFIXES.iter().any(|ext| low.ends_with(ext)) {
-        return true;
-    }
-    for seg in low.split('/') {
-        if seg.is_empty() {
-            continue;
-        }
-        if seg == ".env"
-            || seg.starts_with(".env.")
-            || seg == ".git"
-            || seg == ".aws"
-            || seg == ".ssh"
-            || seg == ".svn"
-            || seg == ".htpasswd"
-            || seg == ".htaccess"
-        {
-            return true;
-        }
-    }
-    // Block generic root hidden dotfiles/directories (e.g. /.pypirc, /.npmrc, /.netrc,
-    // /.bash_history, /.DS_Store) on the very first probe while keeping /.well-known/* exempt above.
-    let no_query = low.split(&['?', '#'][..]).next().unwrap_or(&low);
-    let trimmed_root = no_query.trim_start_matches('/');
-    if let Some(rest) = trimmed_root.strip_prefix('.') {
-        if let Some(first) = rest.as_bytes().first().copied() {
-            if first.is_ascii_alphanumeric() || first == b'_' || first == b'-' {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Rejects HTTP/WebDAV/proxy verbs that legitimate browsers and Sentry/OTLP SDKs never emit.
-pub fn is_anomalous_http_method(method: &str) -> bool {
-    matches!(
-        method,
-        "TRACE"
-            | "TRACK"
-            | "CONNECT"
-            | "PROPFIND"
-            | "PROPPATCH"
-            | "MKCOL"
-            | "COPY"
-            | "MOVE"
-            | "LOCK"
-            | "UNLOCK"
-            | "SEARCH"
-            | "DEBUG"
-    )
-}
-
 pub struct ScannerGuard {
-    bans: Mutex<BoundedMap<String, Instant>>,
-    strikes: Mutex<BoundedMap<String, u32>>,
-    probe_bursts: Mutex<BoundedMap<String, (Instant, u32)>>,
-    active_sessions: Mutex<BoundedMap<String, i64>>,
+    bans: ShardedBoundedMap<String, Instant, 16>,
+    strikes: ShardedBoundedMap<String, u32, 16>,
+    probe_bursts: ShardedBoundedMap<String, (Instant, u32), 16>,
+    active_sessions: ShardedBoundedMap<String, i64, 16>,
 }
 
 impl Default for ScannerGuard {
@@ -157,10 +52,10 @@ fn now_unix_secs() -> i64 {
 impl ScannerGuard {
     pub fn new() -> Self {
         Self {
-            bans: Mutex::new(BoundedMap::new(4096)),
-            strikes: Mutex::new(BoundedMap::new(4096)),
-            probe_bursts: Mutex::new(BoundedMap::new(4096)),
-            active_sessions: Mutex::new(BoundedMap::new(16384)),
+            bans: ShardedBoundedMap::new(4096),
+            strikes: ShardedBoundedMap::new(4096),
+            probe_bursts: ShardedBoundedMap::new(4096),
+            active_sessions: ShardedBoundedMap::new(16384),
         }
     }
 
@@ -168,22 +63,20 @@ impl ScannerGuard {
         if session_sha256.is_empty() {
             return;
         }
-        let mut guard = self
-            .active_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.insert(session_sha256.to_string(), expires_at);
+        let key = session_sha256.to_string();
+        self.active_sessions.with_shard_mut(&key, |guard| {
+            guard.insert(key.clone(), expires_at);
+        });
     }
 
     pub fn untrack_session(&self, session_sha256: &str) {
         if session_sha256.is_empty() {
             return;
         }
-        let mut guard = self
-            .active_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.remove(&session_sha256.to_string());
+        let key = session_sha256.to_string();
+        self.active_sessions.with_shard_mut(&key, |guard| {
+            guard.remove(&key);
+        });
     }
 
     pub fn is_active_session(&self, session_sha256: &str) -> bool {
@@ -191,50 +84,46 @@ impl ScannerGuard {
             return false;
         }
         let now = now_unix_secs();
-        let mut guard = self
-            .active_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let key = session_sha256.to_string();
-        if let Some(exp) = guard.get_mut(&key) {
-            if *exp > now {
-                return true;
+        self.active_sessions.with_shard_mut(&key, |guard| {
+            if let Some(exp) = guard.get_mut(&key) {
+                if *exp > now {
+                    return true;
+                }
+                guard.remove(&key);
             }
-            guard.remove(&key);
-        }
-        false
+            false
+        })
     }
 
     pub fn is_banned(&self, ip_hmac: &str) -> bool {
-        let mut guard = self.bans.lock().unwrap_or_else(|e| e.into_inner());
         let key = ip_hmac.to_string();
-        if let Some(until) = guard.get_mut(&key) {
-            if Instant::now() < *until {
-                return true;
+        self.bans.with_shard_mut(&key, |guard| {
+            if let Some(until) = guard.get_mut(&key) {
+                if Instant::now() < *until {
+                    return true;
+                }
+                guard.remove(&key);
             }
-            guard.remove(&key);
-        }
-        false
+            false
+        })
     }
 
     pub fn ban_15m(&self, ip_hmac: &str) {
-        let strike_num = {
-            let mut s_guard = self.strikes.lock().unwrap_or_else(|e| e.into_inner());
-            let key = ip_hmac.to_string();
+        let key = ip_hmac.to_string();
+        let strike_num = self.strikes.with_shard_mut(&key, |s_guard| {
             if let Some(cnt) = s_guard.get_mut(&key) {
                 *cnt = cnt.saturating_add(1);
                 *cnt
             } else {
-                s_guard.insert(key, 1);
+                s_guard.insert(key.clone(), 1);
                 1
             }
-        };
+        });
         let ttl_secs = if strike_num >= 2 { 3600 } else { 900 };
-        let mut guard = self.bans.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(
-            ip_hmac.to_string(),
-            Instant::now() + Duration::from_secs(ttl_secs),
-        );
+        self.bans.with_shard_mut(&key, |guard| {
+            guard.insert(key.clone(), Instant::now() + Duration::from_secs(ttl_secs));
+        });
     }
 
     /// Behavioral enumeration scorer: quarantines unauthenticated IPs that trigger `>= 20` non-asset
@@ -251,10 +140,10 @@ impl ScannerGuard {
             return false;
         }
         let now = Instant::now();
-        let reached = {
-            let mut guard = self.probe_bursts.lock().unwrap_or_else(|e| e.into_inner());
-            let key = ip_hmac.to_string();
-            match guard.get_mut(&key) {
+        let key = ip_hmac.to_string();
+        let reached = self
+            .probe_bursts
+            .with_shard_mut(&key, |guard| match guard.get_mut(&key) {
                 Some((win_start, count))
                     if now.duration_since(*win_start) <= Duration::from_secs(60) =>
                 {
@@ -268,11 +157,10 @@ impl ScannerGuard {
                     }
                 }
                 _ => {
-                    guard.insert(key, (now, 1));
+                    guard.insert(key.clone(), (now, 1));
                     false
                 }
-            }
-        };
+            });
         if reached {
             self.ban_15m(ip_hmac);
         }
@@ -294,9 +182,19 @@ pub fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, config: &AppConfi
             }
         }
     }
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        // Rightmost untrusted IP if multi-hop (bounded to 16 hops matching GlitchTip proxy_headers.py)
-        for raw in xff.split(',').rev().take(16) {
+    // RFC 9113 multi-header safe: iterate all X-Forwarded-For header lines right-to-left (bounded to 16 hops)
+    let xff_vals: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let mut hops_checked = 0usize;
+    for xff in xff_vals.into_iter().rev() {
+        for raw in xff.split(',').rev() {
+            if hops_checked >= 16 {
+                return peer_ip;
+            }
+            hops_checked += 1;
             if let Ok(ip) = raw.trim().parse::<IpAddr>() {
                 if !config.is_trusted_proxy(ip) {
                     return ip;
@@ -555,8 +453,13 @@ pub fn inject_csp_nonce_into_html(html: &str, nonce: &str) -> String {
 
 fn apply_security_headers(resp: &mut Response, path: &str, nonce: &str, is_https: bool) {
     let h = resp.headers_mut();
+    let https_upgrade = if is_https {
+        "; upgrade-insecure-requests"
+    } else {
+        ""
+    };
     let csp = format!(
-        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'nonce-{nonce}'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+        "default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'nonce-{nonce}'; style-src-elem 'self' 'nonce-{nonce}'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'{https_upgrade}"
     );
     if let Ok(v) = HeaderValue::from_str(&csp) {
         h.insert("content-security-policy", v);
@@ -602,14 +505,14 @@ fn apply_security_headers(resp: &mut Response, path: &str, nonce: &str, is_https
             HeaderValue::from_static("no-store, private"),
         );
     }
-    if path != "/robots.txt" && !path.starts_with("/sdk/") {
+    if path != "/robots.txt" && path != "/llms.txt" && !path.starts_with("/sdk/") {
         h.insert(
             "x-robots-tag",
             HeaderValue::from_static("noindex, nofollow, noarchive"),
         );
     }
 
-    if path == "/robots.txt" || path == "/api/health" {
+    if path == "/robots.txt" || path == "/llms.txt" || path == "/api/health" {
         h.remove(header::SET_COOKIE);
     }
 }
@@ -649,26 +552,15 @@ pub async fn security_headers_middleware(
         return resp;
     }
 
-    let raw_session_cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|raw| {
-            raw.split(';').find_map(|part| {
-                let (k, v) = part.trim().split_once('=')?;
-                if k.trim() == "bf_session" {
-                    Some(v.trim())
-                } else {
-                    None
-                }
-            })
-        })
-        .filter(|val| {
-            val.len() >= 32
-                && val
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        });
-    let session_sha = raw_session_cookie.map(|s| sha256_hex(s.as_bytes()));
+    let raw_session_cookie = extract_cookie(&headers, "bf_session").filter(|val| {
+        val.len() >= 32
+            && val
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
+    let session_sha = raw_session_cookie
+        .as_deref()
+        .map(|s| sha256_hex(s.as_bytes()));
     let mut has_active_session = session_sha
         .as_deref()
         .is_some_and(|s| state.scanner_guard.is_active_session(s));
@@ -681,7 +573,7 @@ pub async fn security_headers_middleware(
                 .query()
                 .is_some_and(|q| q.contains("sentry_key=") || q.contains("glitchtip_key=")));
 
-    // CGNAT-safe deterministic Edge WAF & honeypot guard (< 5 µs, zero OOM):
+    // CGNAT-safe deterministic SIMD Edge WAF & honeypot guard (< 1 µs, zero OOM):
     // Only verified active sessions and public-ingest DSN auth skip checks.
     let unauth_ip_hmac = if !has_active_session && !has_ingest_auth {
         let ip_hmac = state
@@ -691,12 +583,11 @@ pub async fn security_headers_middleware(
         let ua = headers
             .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+            .unwrap_or("");
         let is_canary = is_canary_or_dotfile_probe(&path);
-        let is_scanner = SCANNER_USER_AGENTS.iter().any(|s| ua.contains(s));
+        let is_scanner = is_scanner_user_agent(ua);
         let is_bad_method = is_anomalous_http_method(&method_str);
-        let exploit_probe = crate::security::anti_rea::detect_http_exploit_probe(&full_uri);
+        let exploit_probe = detect_http_exploit_probe(&full_uri);
 
         if (already_banned || is_canary || is_scanner || is_bad_method || exploit_probe.is_some())
             && session_sha.is_some()

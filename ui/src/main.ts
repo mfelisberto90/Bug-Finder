@@ -4,7 +4,9 @@ import {
   bufToB64u,
   setCsrfToken,
   setTransportErrorHook,
+  setUnauthorizedHook,
   type ActiveSessionItem,
+  type AiBlueprintResponse,
   type AlertRule,
   type ApiTokenItem,
   type AuthStatus,
@@ -118,6 +120,8 @@ interface AppStateModel {
   sdkMeta: SdkMeta | null;
   connectProjectId: number | null;
   connectStackTab: string;
+  connectAiStack: string;
+  connectAiCache: Record<string, AiBlueprintResponse>;
   connectOptTunnel: boolean;
   connectOptShield: boolean;
   connectOptFetch: boolean;
@@ -195,7 +199,9 @@ const state: AppStateModel = {
   probeRunning: false,
   sdkMeta: null,
   connectProjectId: null,
-  connectStackTab: "web",
+  connectStackTab: "ai",
+  connectAiStack: "auto",
+  connectAiCache: {},
   connectOptTunnel: false,
   connectOptShield: false,
   connectOptFetch: false,
@@ -503,6 +509,73 @@ setTransportErrorHook((info) => {
   );
 });
 
+function purgeSensitiveClientState(keepSessionOrg = false): void {
+  stopLiveTail();
+  stopConnectSse();
+  state.projects = [];
+  state.issues = [];
+  state.issueOffset = 0;
+  state.issueTotalHits = 0;
+  state.selectedIssue = null;
+  state.selectedIssueEvent = null;
+  state.logs = [];
+  state.liveEntries = [];
+  state.logsHasMore = false;
+  state.transactions = [];
+  state.releases = [];
+  state.monitors = [];
+  state.alerts = [];
+  state.tokens = [];
+  state.members = [];
+  state.invitations = [];
+  state.lastInviteUrl = null;
+  state.lastCreatedToken = null;
+  state.shieldEvents = [];
+  state.shieldSummary = {
+    events_24h: 0,
+    high_critical_24h: 0,
+    secret_leaks_24h: 0,
+    active_quarantines: 0
+  };
+  state.shieldQuarantine = [];
+  state.shieldProjectFilter = null;
+  state.auditLogs = [];
+  state.auditVerify = null;
+  state.activeProjectModalId = null;
+  state.activeProjectKeys = [];
+  state.traceView = null;
+  state.connectAiCache = {};
+  if (!keepSessionOrg) {
+    state.user = null;
+    state.orgSlug = "";
+    state.orgs = [];
+    state.mfaStatus = null;
+    state.totpEnrollData = null;
+    state.recoveryCodes = null;
+    state.sessions = [];
+    state.orgSecurity = {
+      scrub_ip_addresses: false,
+      event_throttle_rate: 0,
+      require_mfa_for_admins: false
+    };
+    state.mfaChallenge = null;
+    state.selfCheck = null;
+    state.lastProbe = null;
+    state.connectProjectId = null;
+    setCsrfToken("");
+  }
+  try {
+    sessionStorage.clear();
+  } catch {}
+}
+
+setUnauthorizedHook(() => {
+  if (!state.user) return;
+  purgeSensitiveClientState(false);
+  closeAllDialogs();
+  render();
+});
+
 async function boot(): Promise<void> {
   if (state.inviteToken) {
     const invRes = await apiFetch<PublicInvitationInfo>(
@@ -696,17 +769,9 @@ async function switchTab(target: TabId): Promise<void> {
 
 async function switchOrganization(slug: string): Promise<void> {
   if (!slug || slug === state.orgSlug) return;
-  stopLiveTail();
   closeAllDialogs();
+  purgeSensitiveClientState(true);
   state.orgSlug = slug;
-  state.issues = [];
-  state.issueOffset = 0;
-  state.issueTotalHits = 0;
-  state.logs = [];
-  state.liveEntries = [];
-  state.logsHasMore = false;
-  state.selectedIssue = null;
-  state.selectedIssueEvent = null;
   await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
   render();
 }
@@ -2753,52 +2818,12 @@ function bindChromeHandlers(): void {
   });
 
   const performLogout = async () => {
-    stopLiveTail();
     closeAllDialogs();
     await apiFetch("/api/auth/logout", { method: "POST", body: {} });
     state.needsSetup = false;
-    state.user = null;
-    state.orgSlug = "";
-    state.orgs = [];
     state.tab = "issues";
     state.shieldSubTab = "anti-rea";
-    state.projects = [];
-    state.issues = [];
-    state.issueOffset = 0;
-    state.issueTotalHits = 0;
-    state.selectedIssue = null;
-    state.selectedIssueEvent = null;
-    state.logs = [];
-    state.liveEntries = [];
-    state.logsHasMore = false;
-    state.transactions = [];
-    state.releases = [];
-    state.monitors = [];
-    state.alerts = [];
-    state.tokens = [];
-    state.members = [];
-    state.invitations = [];
-    state.lastInviteUrl = null;
-    state.lastCreatedToken = null;
-    state.shieldEvents = [];
-    state.shieldSummary = { events_24h: 0, high_critical_24h: 0, secret_leaks_24h: 0, active_quarantines: 0 };
-    state.shieldQuarantine = [];
-    state.shieldProjectFilter = null;
-    state.mfaStatus = null;
-    state.totpEnrollData = null;
-    state.recoveryCodes = null;
-    state.sessions = [];
-    state.orgSecurity = { scrub_ip_addresses: false, event_throttle_rate: 0, require_mfa_for_admins: false };
-    state.auditLogs = [];
-    state.auditVerify = null;
-    state.mfaChallenge = null;
-    state.activeProjectModalId = null;
-    state.activeProjectKeys = [];
-    state.traceView = null;
-    state.selfCheck = null;
-    state.lastProbe = null;
-    state.connectProjectId = null;
-    setCsrfToken("");
+    purgeSensitiveClientState(false);
     render();
   };
 
@@ -2936,6 +2961,7 @@ function bindCopyButtons(scope: ParentNode): void {
 }
 
 const CONNECT_STACK_TABS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "ai", label: "AI Auto-Setup (1-Prompt)" },
   { id: "web", label: "HTML / Web (1 Tag)" },
   { id: "cli", label: "CLI init" },
   { id: "wrap", label: "Zero Code (wrap/pipe)" },
@@ -2944,6 +2970,34 @@ const CONNECT_STACK_TABS: ReadonlyArray<{ id: string; label: string }> = [
   { id: "php", label: "PHP / Laravel" },
   { id: "otlp", label: "Go / Rust / OTLP" }
 ];
+
+const AI_STACK_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "auto", label: "Auto-detect" },
+  { id: "web", label: "Web / SPA" },
+  { id: "node", label: "Node / Next" },
+  { id: "rust", label: "Rust" },
+  { id: "python", label: "Python" },
+  { id: "laravel", label: "Laravel / PHP" },
+  { id: "go", label: "Go" }
+];
+
+async function ensureProjectAiBlueprint(proj: Project, stack: string): Promise<void> {
+  const key = `${proj.id}:${stack}`;
+  if (state.connectAiCache[key] || !state.orgSlug) return;
+  const res = await apiFetch<AiBlueprintResponse>(
+    `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/ai-blueprint/?stack=${encodeURIComponent(stack)}`
+  );
+  if (res.ok && res.data) {
+    state.connectAiCache[key] = res.data;
+    if (
+      state.connectProjectId === proj.id &&
+      state.connectStackTab === "ai" &&
+      state.connectAiStack === stack
+    ) {
+      renderConnectAppBody();
+    }
+  }
+}
 
 function buildConnectSnippet(
   proj: Project,
@@ -3085,12 +3139,31 @@ function renderConnectAppBody(): void {
   }
 
   const info = buildConnectSnippet(proj, state.connectStackTab);
+  const aiKey = `${proj.id}:${state.connectAiStack}`;
+  const aiBp = state.connectAiCache[aiKey] || null;
+  if (state.connectStackTab === "ai" && !aiBp) {
+    void ensureProjectAiBlueprint(proj, state.connectAiStack);
+  }
   const tabsHtml = CONNECT_STACK_TABS.map(
     (t) =>
       `<button type="button" class="subtab-btn" role="tab" aria-selected="${
         state.connectStackTab === t.id ? "true" : "false"
       }" data-connect-tab="${t.id}">${esc(t.label)}</button>`
   ).join("");
+
+  const aiControlsHtml =
+    state.connectStackTab === "ai"
+      ? `
+        <div class="row-gap">
+          <span class="badge badge-ok">Autonomous 1-Prompt</span>
+          ${AI_STACK_OPTIONS.map(
+            (opt) =>
+              `<button type="button" class="subtab-btn" aria-selected="${
+                state.connectAiStack === opt.id ? "true" : "false"
+              }" data-ai-stack="${opt.id}">${esc(opt.label)}</button>`
+          ).join("")}
+        </div>`
+      : "";
 
   const togglesHtml =
     state.connectStackTab === "web" || state.connectStackTab === "node"
@@ -3122,6 +3195,22 @@ function renderConnectAppBody(): void {
     ? `Connected! Live event received (${state.connectLiveDetail || "OK"})`
     : "Waiting for first real-time event via SSE...";
 
+  const activeHeading =
+    state.connectStackTab === "ai"
+      ? "Paste this 1-Prompt into your AI coding agent (auto-wires all endpoints, WAF, maps & check)"
+      : info.heading;
+  const activeNote =
+    state.connectStackTab === "ai"
+      ? `Includes stealth proxy routes (/_obs/*), CSP nonce + SRI sha384, backend traces/SQLSTATE, Edge WAF + ETag blocklist, private SourceMaps, MCP, and final verification.`
+      : info.note;
+  const activeCode =
+    state.connectStackTab === "ai"
+      ? aiBp?.prompt || "Generating project AI blueprint..."
+      : info.code;
+  const checkCmd =
+    aiBp?.check_command ||
+    `bugfinder check --dsn "${info.dsn}" --app-url "https://app.example.com"`;
+
   bodyEl.innerHTML = `
     <div class="stack-col">
       <div class="row-gap">
@@ -3130,13 +3219,21 @@ function renderConnectAppBody(): void {
         <button type="button" data-copy-text="${esc(info.dsn)}">Copy DSN</button>
       </div>
       <div class="subtabs" role="tablist" aria-label="Integration Stack">${tabsHtml}</div>
+      ${aiControlsHtml}
       ${togglesHtml}
       <div class="connect-snippet-head">
-        <strong>${esc(info.heading)}</strong>
-        <button type="button" data-copy-text="${esc(info.code)}">Copy Snippet</button>
+        <strong>${esc(activeHeading)}</strong>
+        <button type="button" data-copy-text="${esc(activeCode)}">${
+          state.connectStackTab === "ai" ? "Copy AI Prompt" : "Copy Snippet"
+        }</button>
       </div>
-      <p>${esc(info.note)}</p>
-      <pre class="snippet-box">${esc(info.code)}</pre>
+      <p>${esc(activeNote)}</p>
+      <pre class="snippet-box">${esc(activeCode)}</pre>
+      <div class="connect-snippet-head">
+        <strong>Verification Shell (run after integration to confirm all 7 layers)</strong>
+        <button type="button" data-copy-text="${esc(checkCmd)}">Copy Check Command</button>
+      </div>
+      <pre class="snippet-box">${esc(checkCmd)}</pre>
       <div id="connect-live-status" class="${
         isConnected ? "connect-live-bar connect-live-ok" : "connect-live-bar"
       }" role="status" aria-live="polite">
@@ -3158,7 +3255,14 @@ function renderConnectAppBody(): void {
 
   bodyEl.querySelectorAll<HTMLButtonElement>("[data-connect-tab]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      state.connectStackTab = btn.dataset.connectTab || "web";
+      state.connectStackTab = btn.dataset.connectTab || "ai";
+      renderConnectAppBody();
+    });
+  });
+
+  bodyEl.querySelectorAll<HTMLButtonElement>("[data-ai-stack]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.connectAiStack = btn.dataset.aiStack || "auto";
       renderConnectAppBody();
     });
   });

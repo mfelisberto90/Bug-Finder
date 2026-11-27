@@ -1,47 +1,12 @@
 use crate::domain::models::{NormalizedLog, ShieldPolicy};
 use crate::security::auth::sha256_hex;
-use crate::security::ratelimit::BoundedMap;
+use crate::security::ratelimit::ShardedBoundedMap;
 use hmac::{Hmac, Mac};
-use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 
 type HmacSha256 = Hmac<Sha256>;
-
-struct IdsRegexes {
-    sqli: Regex,
-    traversal: Regex,
-    ssrf: Regex,
-    jndi_ssti: Regex,
-}
-
-static IDS_RX: OnceLock<IdsRegexes> = OnceLock::new();
-
-fn build_ascii_rx(pat: &str) -> Regex {
-    RegexBuilder::new(pat)
-        .unicode(false)
-        .build()
-        .expect("Anti-REA IDS regex must compile cleanly")
-}
-
-fn ids_rx() -> &'static IdsRegexes {
-    IDS_RX.get_or_init(|| IdsRegexes {
-        sqli: build_ascii_rx(
-            r#"(?i)(?:\bunion\s+(?:all\s+)?select\s+(?:null|\d+|'|")|'\s*or\s+'?1'?\s*=\s*'?1|;\s*(?:waitfor\s+delay|pg_sleep\s*\(|sleep\s*\(\s*\d))"#,
-        ),
-        traversal: build_ascii_rx(
-            r"(?i)(?:(?:\.\./|\.\.\\|%2e%2e/|%2e%2e%2f){1,})(?:etc/passwd|etc/shadow|win\.ini|proc/self|\.env\b|\.git/config)|(?:/etc/passwd\b|/etc/shadow\b|/proc/self/environ\b)",
-        ),
-        ssrf: build_ascii_rx(
-            r"(?i)(?:169\.254\.169\.254/latest/meta-data|metadata\.google\.internal/computemetadata)",
-        ),
-        jndi_ssti: build_ascii_rx(
-            r"(?i)(?:\$\{jndi:(?:ldap|rmi|dns)://|\{\{\s*7\s*\*\s*7\s*\}\})",
-        ),
-    })
-}
 
 const STATIC_ASSET_EXTS: &[&str] = &[
     ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".css",
@@ -74,8 +39,8 @@ pub struct RuntimeIntegrityReport {
 }
 
 pub struct ShieldEngine {
-    auth_bursts: Mutex<BoundedMap<(i64, String), (i64, u32)>>,
-    cooldowns: Mutex<BoundedMap<(i64, String), i64>>,
+    auth_bursts: ShardedBoundedMap<(i64, String), (i64, u32), 16>,
+    cooldowns: ShardedBoundedMap<(i64, String), i64, 16>,
 }
 
 impl Default for ShieldEngine {
@@ -87,8 +52,8 @@ impl Default for ShieldEngine {
 impl ShieldEngine {
     pub fn new() -> Self {
         Self {
-            auth_bursts: Mutex::new(BoundedMap::new(4096)),
-            cooldowns: Mutex::new(BoundedMap::new(4096)),
+            auth_bursts: ShardedBoundedMap::new(4096),
+            cooldowns: ShardedBoundedMap::new(4096),
         }
     }
 
@@ -99,15 +64,16 @@ impl ShieldEngine {
         cooldown_ms: i64,
         now_ms: i64,
     ) -> bool {
-        let mut guard = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
         let k = (project_id, key.to_string());
-        if let Some(last) = guard.get_mut(&k) {
-            if now_ms - *last < cooldown_ms {
-                return false;
+        self.cooldowns.with_shard_mut(&k, |guard| {
+            if let Some(last) = guard.get_mut(&k) {
+                if now_ms - *last < cooldown_ms {
+                    return false;
+                }
             }
-        }
-        guard.insert(k, now_ms);
-        true
+            guard.insert(k.clone(), now_ms);
+            true
+        })
     }
 
     /// Evaluates logs/errors already ingested using deterministic signatures + bounded O(1) burst counters.
@@ -175,23 +141,24 @@ impl ShieldEngine {
         }
 
         let burst_hit = {
-            let mut guard = self.auth_bursts.lock().unwrap_or_else(|e| e.into_inner());
             let key = (project_id, actor_hmac.clone());
-            let mut reached = false;
-            match guard.get_mut(&key) {
-                Some((win_start, count)) if now_ms - *win_start <= 60_000 => {
-                    *count = count.saturating_add(1);
-                    if *count >= 20 {
-                        reached = true;
-                        *count = 0;
-                        *win_start = now_ms;
+            self.auth_bursts.with_shard_mut(&key, |guard| {
+                let mut reached = false;
+                match guard.get_mut(&key) {
+                    Some((win_start, count)) if now_ms - *win_start <= 60_000 => {
+                        *count = count.saturating_add(1);
+                        if *count >= 20 {
+                            reached = true;
+                            *count = 0;
+                            *win_start = now_ms;
+                        }
+                    }
+                    _ => {
+                        guard.insert(key.clone(), (now_ms, 1));
                     }
                 }
-                _ => {
-                    guard.insert(key, (now_ms, 1));
-                }
-            }
-            reached
+                reached
+            })
         };
 
         if burst_hit
@@ -358,77 +325,12 @@ fn detect_probe_in_text(text: &str) -> Option<&'static str> {
     if text.len() < 8 {
         return None;
     }
-    let rx = ids_rx();
-    if rx.sqli.is_match(text) {
-        return Some("sqli");
-    }
-    if rx.traversal.is_match(text) {
-        return Some("path_traversal");
-    }
-    if rx.ssrf.is_match(text) {
-        return Some("metadata_ssrf");
-    }
-    if rx.jndi_ssti.is_match(text) {
-        return Some("jndi_ssti");
-    }
-    None
+    crate::security::waf::detect_probe_in_bytes(text.as_bytes())
 }
 
-fn decode_percent_once(input: &[u8], max_bytes: usize) -> (Vec<u8>, bool) {
-    let mut out = Vec::with_capacity(input.len().min(max_bytes));
-    let mut had_null = false;
-    let mut i = 0usize;
-    let limit = input.len().min(max_bytes);
-    while i < limit {
-        let b = input[i];
-        if b == 0 {
-            had_null = true;
-            i += 1;
-            continue;
-        }
-        if b == b'%' && i + 2 < limit {
-            let hi = (input[i + 1] as char).to_digit(16);
-            let lo = (input[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                let decoded = ((h << 4) | l) as u8;
-                if decoded == 0 {
-                    had_null = true;
-                } else {
-                    out.push(decoded);
-                }
-                i += 3;
-                continue;
-            }
-        }
-        if b == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(b);
-        }
-        i += 1;
-    }
-    (out, had_null)
-}
-
-/// Bounded `< 5 µs` HTTP URI/query exploit inspector (2-pass percent-decoding + linear ASCII regexes).
-/// Immune to ReDoS and CPU amplification attacks.
+/// Bounded `< 1 µs` SIMD HTTP URI/query exploit inspector (delegated to `security::waf`).
 pub fn detect_http_exploit_probe(raw_uri: &str) -> Option<&'static str> {
-    if raw_uri.len() > 4096 {
-        return Some("uri_overflow");
-    }
-    if raw_uri.as_bytes().contains(&0) {
-        return Some("null_byte");
-    }
-    let (pass1, null1) = decode_percent_once(raw_uri.as_bytes(), 4096);
-    if null1 {
-        return Some("null_byte");
-    }
-    let (pass2, null2) = decode_percent_once(&pass1, 4096);
-    if null2 {
-        return Some("null_byte");
-    }
-    let decoded = String::from_utf8_lossy(&pass2);
-    detect_probe_in_text(&decoded).or_else(|| detect_probe_in_text(raw_uri))
+    crate::security::waf::detect_http_exploit_probe(raw_uri)
 }
 
 fn extract_http_status(attrs: &Value) -> Option<u16> {

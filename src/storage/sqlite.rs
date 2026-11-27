@@ -240,6 +240,19 @@ impl SqliteStorage {
         }
 
         let _ = writer.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA cache_size = -4000;");
+        let _ = writer.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_logs_org_ts ON log_events(organization_id, timestamp_ms DESC);
+             CREATE TRIGGER IF NOT EXISTS trg_audit_logs_immutable_update
+             BEFORE UPDATE ON audit_logs
+             BEGIN
+                 SELECT RAISE(ABORT, 'audit_logs is append-only and cannot be updated');
+             END;
+             CREATE TRIGGER IF NOT EXISTS trg_audit_logs_immutable_delete
+             BEFORE DELETE ON audit_logs
+             BEGIN
+                 SELECT RAISE(ABORT, 'audit_logs is append-only and cannot be deleted');
+             END;",
+        );
 
         #[cfg(unix)]
         {
@@ -255,7 +268,7 @@ impl SqliteStorage {
             )
             .map_err(|e| format!("Open SQLite reader: {e}"))?;
             let _ = r.execute_batch(
-                "PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -2000;",
+                "PRAGMA busy_timeout = 5000; PRAGMA query_only = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -2000; PRAGMA mmap_size = 67108864;",
             );
             readers.push(Mutex::new(r));
         }
@@ -445,7 +458,7 @@ fn build_alert_jobs_for_event(
     ctx: &EventAlertContext<'_>,
 ) -> Result<Vec<AlertDispatchJob>, String> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT id, name, trigger_type, threshold_count, window_sec, cooldown_sec,
                     channel_type, target_url, webhook_secret, email_to, last_triggered_at
              FROM alert_rules
@@ -1235,7 +1248,7 @@ impl StorageBackend for SqliteStorage {
     async fn list_user_organizations(&self, user_id: i64) -> Result<Vec<OrganizationDto>, String> {
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT o.id, o.slug, o.name, m.role, o.created_at
                      FROM organizations o
                      JOIN organization_members m ON m.organization_id = o.id
@@ -1301,7 +1314,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT p.id, p.organization_id, p.slug, p.name, p.platform, p.first_event_at,
                             p.filters_json,
                             (SELECT public_key FROM project_keys pk WHERE pk.project_id = p.id AND pk.is_active = 1 ORDER BY pk.id ASC LIMIT 1),
@@ -1445,7 +1458,7 @@ impl StorageBackend for SqliteStorage {
         let pslug = project_slug.to_string();
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT k.id, k.project_id, k.label, k.public_key, k.rate_limit_per_min, k.is_active, k.created_at
                      FROM project_keys k
                      JOIN projects p ON p.id = k.project_id AND p.organization_id = k.organization_id
@@ -1865,7 +1878,7 @@ impl StorageBackend for SqliteStorage {
         let lim = limit.clamp(1, 100);
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, event_id, issue_id, project_id, timestamp_ms, level, environment,
                             release, trace_id, span_id, tags_json, payload_blob, payload_compressed
                      FROM issue_events
@@ -2101,7 +2114,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT name, resource_type, last_seen
                      FROM log_resources WHERE organization_id = ?1
                      ORDER BY last_seen DESC LIMIT 200",
@@ -2134,7 +2147,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT (timestamp_ms / 3600000) * 3600000 AS b, level_num, COUNT(*)
                      FROM log_events
                      WHERE organization_id = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
@@ -2188,7 +2201,7 @@ impl StorageBackend for SqliteStorage {
         let cat = category.to_string();
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT bucket_hour, SUM(quantity)
                      FROM hourly_stats
                      WHERE organization_id = ?1 AND category = ?2 AND bucket_hour >= ?3 AND bucket_hour <= ?4
@@ -2228,7 +2241,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT name, op, status, duration_ms, timestamp_ms
                      FROM transaction_events
                      WHERE organization_id = ?1 AND timestamp_ms >= ?2
@@ -2301,7 +2314,7 @@ impl StorageBackend for SqliteStorage {
         let tid = trace_id.to_string();
         self.read(move |conn| {
             let mut tx_stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, name, op, status, duration_ms, span_id, environment, release, spans_json, timestamp_ms
                      FROM transaction_events WHERE organization_id = ?1 AND trace_id = ?2 ORDER BY timestamp_ms ASC LIMIT 100",
                 )
@@ -2329,7 +2342,7 @@ impl StorageBackend for SqliteStorage {
             }
 
             let mut err_stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT ie.issue_id, i.short_id, i.title, ie.event_id, ie.level, ie.timestamp_ms
                      FROM issue_events ie
                      JOIN issues i ON i.id = ie.issue_id
@@ -2355,7 +2368,7 @@ impl StorageBackend for SqliteStorage {
             }
 
             let mut log_stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, timestamp_ms, level_num, body, service, span_id, attributes_json
                      FROM log_events WHERE organization_id = ?1 AND trace_id = ?2 ORDER BY id ASC LIMIT 200",
                 )
@@ -2394,7 +2407,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT r.version, MIN(r.first_seen), MAX(r.last_seen),
                             (SELECT COUNT(*) FROM issues i WHERE i.organization_id = ?1 AND i.first_release = r.version),
                             COALESCE((SELECT SUM(rs.healthy_count) FROM release_sessions rs WHERE rs.organization_id = ?1 AND rs.release_version = r.version), 0),
@@ -2575,7 +2588,7 @@ impl StorageBackend for SqliteStorage {
             if let Some(target_stem) = crate::domain::sourcemap::extract_hashed_bundle_prefix(&fname)
             {
                 let mut stmt = conn
-                    .prepare(
+                    .prepare_cached(
                         "SELECT id, release_version, debug_id, filename, blob_sha256, size_bytes
                          FROM source_maps
                          WHERE organization_id = ?1 AND project_id = ?2
@@ -2613,7 +2626,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, project_id, uuid, name, expected_interval_sec, last_heartbeat_at, status, is_active, created_at
                      FROM uptime_monitors WHERE organization_id = ?1 ORDER BY id ASC",
                 )
@@ -2793,7 +2806,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, project_id, name, trigger_type, threshold_count, window_sec, cooldown_sec,
                             channel_type, target_url, webhook_secret, email_to, last_triggered_at, is_active, created_at
                      FROM alert_rules WHERE organization_id = ?1 ORDER BY id DESC",
@@ -2950,7 +2963,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, name, token_prefix, role, scopes, last_used_at, expires_at, created_at
                      FROM api_tokens WHERE organization_id = ?1 ORDER BY id DESC",
                 )
@@ -3054,7 +3067,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT u.id, u.email, u.name, m.role, u.is_active
                      FROM organization_members m
                      JOIN users u ON u.id = m.user_id
@@ -3179,7 +3192,7 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(map_sqlite_err)?;
             let mut tok_stmt = tx
-                .prepare("SELECT id, role FROM api_tokens WHERE organization_id = ?1 AND user_id = ?2")
+                .prepare_cached("SELECT id, role FROM api_tokens WHERE organization_id = ?1 AND user_id = ?2")
                 .map_err(map_sqlite_err)?;
             let tok_ids: Vec<(i64, String)> = tok_stmt
                 .query_map(params![org_id, target_user_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -3632,7 +3645,7 @@ impl StorageBackend for SqliteStorage {
                             .map_err(map_sqlite_err)?;
                             if !is_up {
                                 let mut rstmt = tx
-                                    .prepare(
+                                    .prepare_cached(
                                         "SELECT id, name, channel_type, target_url, webhook_secret, email_to, cooldown_sec, last_triggered_at
                                          FROM alert_rules
                                          WHERE organization_id = ?1 AND project_id = ?2 AND is_active = 1 AND trigger_type = 'uptime_down'",
@@ -3818,7 +3831,7 @@ impl StorageBackend for SqliteStorage {
 
             // Detect missed uptime heartbeats
             let mut stmt = tx
-                .prepare(
+                .prepare_cached(
                     "SELECT m.id, m.organization_id, m.project_id, p.slug, m.name, m.uuid
                      FROM uptime_monitors m
                      JOIN projects p ON p.id = m.project_id
@@ -3855,7 +3868,7 @@ impl StorageBackend for SqliteStorage {
                 )
                 .map_err(map_sqlite_err)?;
                 let mut rstmt = tx
-                    .prepare(
+                    .prepare_cached(
                         "SELECT id, name, channel_type, target_url, webhook_secret, email_to, cooldown_sec, last_triggered_at
                          FROM alert_rules WHERE organization_id = ?1 AND project_id = ?2 AND trigger_type = 'uptime_down' AND is_active = 1",
                     )
@@ -4031,7 +4044,7 @@ impl StorageBackend for SqliteStorage {
 
             let mut alerts = Vec::new();
             let mut stmt = tx
-                .prepare(
+                .prepare_cached(
                     "SELECT id, name, trigger_type, cooldown_sec, channel_type, target_url, webhook_secret, email_to, last_triggered_at
                      FROM alert_rules
                      WHERE organization_id = ?1 AND project_id = ?2 AND is_active = 1
@@ -4143,7 +4156,7 @@ impl StorageBackend for SqliteStorage {
                 .map_err(map_sqlite_err)?;
 
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, project_id, signal_type, category, severity, risk_score, source_kind,
                             actor_hmac, session_id, path, details_json, action_taken, timestamp_ms
                      FROM security_events
@@ -4200,7 +4213,7 @@ impl StorageBackend for SqliteStorage {
         self.read(move |conn| {
             let now_sec = now_ms() / 1000;
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, project_id, subject_type, subject_hmac, reason, risk_score, expires_at, created_at
                      FROM shield_quarantine
                      WHERE organization_id = ?1 AND expires_at > ?2
@@ -4313,7 +4326,7 @@ impl StorageBackend for SqliteStorage {
                 )
                 .map_err(map_sqlite_err)?;
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, name, cose_alg, sign_count, last_used_at, created_at
                      FROM webauthn_credentials WHERE user_id = ?1 ORDER BY id DESC",
                 )
@@ -4523,7 +4536,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<RecoveryCodeRecord>, String> {
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare("SELECT id, code_hash FROM user_mfa_recovery_codes WHERE user_id = ?1 AND used_at IS NULL")
+                .prepare_cached("SELECT id, code_hash FROM user_mfa_recovery_codes WHERE user_id = ?1 AND used_at IS NULL")
                 .map_err(map_sqlite_err)?;
             let rows = stmt
                 .query_map(params![user_id], |r| {
@@ -4733,7 +4746,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<WebAuthnCredRecord>, String> {
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, user_id, name, credential_id_b64, cose_alg, public_key_b64, sign_count, last_used_at, created_at
                      FROM webauthn_credentials WHERE user_id = ?1 ORDER BY id DESC",
                 )
@@ -4828,7 +4841,7 @@ impl StorageBackend for SqliteStorage {
         let cur = current_token_sha256.to_string();
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT rowid, token_sha256, user_agent, ip_hmac, last_seen_at, created_at
                      FROM sessions
                      WHERE user_id = ?1 AND organization_id = ?2 AND expires_at > ?3
@@ -5000,7 +5013,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT i.id, i.email, i.role, COALESCE(u.email, ''), i.expires_at, i.accepted_at, i.created_at
                      FROM org_invitations i
                      LEFT JOIN users u ON u.id = i.invited_by
@@ -5230,7 +5243,7 @@ impl StorageBackend for SqliteStorage {
         let off = offset.max(0);
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, actor_user_id, actor_email, action, target_type, target_id, ip_hmac, metadata_json, entry_hash, created_at
                      FROM audit_logs
                      WHERE organization_id = ?1 AND (?2 IS NULL OR action = ?2)
@@ -5263,7 +5276,7 @@ impl StorageBackend for SqliteStorage {
         let org_id = ctx.organization_id;
         self.read(move |conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, actor_user_id, action, target_type, target_id, metadata_json, prev_hash, entry_hash, created_at
                      FROM audit_logs WHERE organization_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT 500",
                 )

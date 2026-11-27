@@ -1,10 +1,13 @@
 #![recursion_limit = "256"]
 
+pub mod ai_blueprint;
 pub mod alerts;
+pub mod cli_check;
 pub mod cli_integrate;
 pub mod config;
 pub mod domain;
 pub mod http;
+pub mod lint;
 pub mod mcp;
 pub mod runtime;
 pub mod security;

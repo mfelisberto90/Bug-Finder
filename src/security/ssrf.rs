@@ -178,6 +178,9 @@ mod tests {
     #[test]
     fn ssrf_blocks_metadata_loopback_and_private_ranges() {
         assert!(validate_webhook_url("http://169.254.169.254/latest/meta-data", true).is_err());
+        assert!(validate_webhook_url("http://[fd00:ec2::254]/latest/meta-data", true).is_err());
+        assert!(validate_webhook_url("http://100.100.100.200/latest/meta-data", true).is_err());
+        assert!(validate_webhook_url("http://192.0.0.192/opc/v2/instance/", true).is_err());
         assert!(validate_webhook_url("https://127.0.0.1:8080/hook", false).is_err());
         assert!(validate_webhook_url("https://0.1.2.3/hook", false).is_err());
         assert!(validate_webhook_url("https://10.0.0.5/hook", false).is_err());

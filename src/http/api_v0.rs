@@ -3706,3 +3706,134 @@ pub async fn send_project_test_event(
     )
         .into_response()
 }
+
+pub async fn get_project_ai_blueprint(
+    State(state): State<Arc<AppState>>,
+    Path((org, proj)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
+    method: Method,
+) -> Response {
+    let ctx = match authenticate_api_tenant(&state, &headers, &ext, &method, Some(&org)).await {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    if let Err(r) = require_scope(&ctx, "project:read") {
+        return *r;
+    }
+    let projects = match state.storage.list_projects(&ctx).await {
+        Ok(list) => list,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let Some(project) = projects.into_iter().find(|p| p.slug == proj) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Project not found" })),
+        )
+            .into_response();
+    };
+
+    let base_url = state
+        .config
+        .public_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| {
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("127.0.0.1:8080")
+                .trim();
+            let peer_ip = ext
+                .get::<PeerIp>()
+                .map(|p| p.0)
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let scheme =
+                if crate::security::headers::is_https_request(&headers, peer_ip, &state.config) {
+                    "https"
+                } else {
+                    "http"
+                };
+            format!("{scheme}://{host}")
+        });
+
+    let key = project
+        .dsn_public_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<PUBLIC_KEY>");
+    let dsn = if let Some((scheme, rest)) = base_url.split_once("://") {
+        format!("{scheme}://{key}@{rest}/{}", project.id)
+    } else {
+        format!("https://{key}@bugs.example.com/{}", project.id)
+    };
+    let stack = crate::ai_blueprint::normalize_stack(
+        query.get("stack").map(String::as_str).unwrap_or("auto"),
+    );
+    let app_url = query.get("app_url").map(String::as_str);
+    let (mini_sri, shield_sri) = crate::http::router::sdk_sri_hashes();
+    let prompt = crate::ai_blueprint::render_project_ai_blueprint(
+        &crate::ai_blueprint::ProjectBlueprintParams {
+            base_url: &base_url,
+            org_slug: &ctx.organization_slug,
+            project_slug: &project.slug,
+            project_id: project.id,
+            dsn: &dsn,
+            tunnel_slug: project.tunnel_slug.as_deref(),
+            app_url,
+            stack,
+            mini_sdk_sri: mini_sri,
+            shield_sdk_sri: shield_sri,
+        },
+    );
+    let app_url_display = app_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://app.example.com");
+    let check_command = format!("bugfinder check --dsn \"{dsn}\" --app-url \"{app_url_display}\"");
+    let shell_command =
+        format!("./scripts/check.sh --dsn \"{dsn}\" --app-url \"{app_url_display}\"");
+    let org_clean = crate::ai_blueprint::sanitize_slug(&ctx.organization_slug);
+    let proj_clean = crate::ai_blueprint::sanitize_slug(&project.slug);
+    let tunnel_ep = project
+        .tunnel_slug
+        .as_deref()
+        .map(|t| format!("{base_url}/t/{}", crate::ai_blueprint::sanitize_slug(t)));
+
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store, private")],
+        Json(json!({
+            "project_id": project.id,
+            "org_slug": org_clean,
+            "project_slug": proj_clean,
+            "stack": stack,
+            "dsn": dsn,
+            "base_url": base_url,
+            "check_command": check_command,
+            "shell_command": shell_command,
+            "prompt": prompt,
+            "endpoints": {
+                "health": format!("{base_url}/api/health"),
+                "llms_txt": format!("{base_url}/llms.txt"),
+                "mini_sdk": format!("{base_url}/sdk/bugfinder-mini.js"),
+                "shield_sdk": format!("{base_url}/sdk/bugfinder-shield.js"),
+                "envelope": format!("{base_url}/api/{}/envelope/", project.id),
+                "tunnel": tunnel_ep,
+                "otlp_logs": format!("{base_url}/api/{}/otlp/v1/logs", project.id),
+                "shield": format!("{base_url}/api/{}/shield/", project.id),
+                "blocklist": format!("{base_url}/api/0/projects/{org_clean}/{proj_clean}/shield/blocklist/"),
+                "sourcemaps": format!("{base_url}/api/0/projects/{org_clean}/{proj_clean}/releases/<RELEASE>/sourcemaps/"),
+            }
+        })),
+    )
+        .into_response()
+}
