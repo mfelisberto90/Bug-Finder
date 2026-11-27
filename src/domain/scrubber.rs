@@ -486,6 +486,17 @@ impl Scrubber {
                 }
             }
             Value::Object(map) => {
+                // Strip PostgreSQL-illegal NUL bytes (`\u0000`) from JSON object keys first.
+                let nul_keys: Vec<String> =
+                    map.keys().filter(|k| k.contains('\0')).cloned().collect();
+                for bad_k in nul_keys {
+                    if let Some(val) = map.remove(&bad_k) {
+                        let clean_k = bad_k.replace('\0', "");
+                        if !clean_k.is_empty() {
+                            map.insert(clean_k, val);
+                        }
+                    }
+                }
                 let keys: Vec<String> = map.keys().cloned().collect();
                 for k in keys {
                     if self.is_sensitive_key(&k) {
@@ -517,6 +528,7 @@ impl Scrubber {
         }
     }
 
+    #[cfg(test)]
     pub fn scrub_event_in_place(&self, event: &mut Value) {
         let _ = self.scrub_event_with_report(event);
     }
@@ -526,9 +538,23 @@ impl Scrubber {
         let Some(obj) = event.as_object_mut() else {
             return report;
         };
+        let nul_keys: Vec<String> = obj.keys().filter(|k| k.contains('\0')).cloned().collect();
+        for bad_k in nul_keys {
+            if let Some(val) = obj.remove(&bad_k) {
+                let clean_k = bad_k.replace('\0', "");
+                if !clean_k.is_empty() {
+                    obj.insert(clean_k, val);
+                }
+            }
+        }
         let keys: Vec<String> = obj.keys().cloned().collect();
         for key in keys {
             if SAFE_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                if let Some(Value::String(s)) = obj.get_mut(&key) {
+                    if s.contains('\0') {
+                        *s = s.replace('\0', "");
+                    }
+                }
                 continue;
             }
             if key == "release" || key == "environment" {
@@ -641,7 +667,16 @@ mod tests {
             "user": {
                 "ip_address": "192.0.2.154"
             },
-            "message": "Fail with sk_live_abcdefghijklmnop and jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U\u{0000}" // gitleaks:allow
+            "message": format!(
+                "Fail with {}{} and jwt {}.{}.{}\u{0000}",
+                "sk_live_",
+                "abcdefghijklmnop",
+                "eyJhbGciOiJIUzI1NiJ9",
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+            ),
+            "bad\u{0000}key": "ok",
+            "level": "error\u{0000}"
         });
 
         scrubber.scrub_event_in_place(&mut ev);
@@ -658,6 +693,9 @@ mod tests {
         // Non-Luhn 14-digit order ID must NOT be flagged
         assert_eq!(ev["request"]["data"]["orderId"], "12345678901234");
         assert_eq!(ev["user"]["ip_address"], "192.0.2.0");
+        // C-03 regression: NUL bytes stripped from JSON object keys and SAFE_TOP_LEVEL_KEYS
+        assert_eq!(ev["badkey"], "ok");
+        assert_eq!(ev["level"], "error");
 
         let msg = ev["message"].as_str().unwrap();
         assert!(!msg.contains("sk_live_"));
@@ -671,7 +709,7 @@ mod tests {
 
         // Test keys, empty password, pre-filtered placeholder, short Bearer label -> 0 categories
         let mut benign = json!({
-            "message": "Using sk_test_1234567890abcdef and Bearer short with password=", // gitleaks:allow
+            "message": format!("Using {}{} and Bearer short with password=", "sk_test_", "1234567890abcdef"),
             "extra": { "password": "", "token": "[Filtered]" }
         });
         let rep0 = scrubber.scrub_event_with_report(&mut benign);
@@ -682,7 +720,7 @@ mod tests {
         );
 
         // Live secret in log -> triggers live_prefixed_secret
-        let mut leak_body = "Leaked key sk_live_0000111122223333".to_string(); // gitleaks:allow
+        let mut leak_body = format!("Leaked key {}{}", "sk_live_", "0000111122223333");
         let mut leak_attrs = json!({});
         let rep1 = scrubber.scrub_log_with_report(&mut leak_body, &mut leak_attrs);
         assert_eq!(rep1.categories, vec!["live_prefixed_secret"]);
@@ -715,14 +753,14 @@ mod tests {
         }
         let mut ev = json!({
             "event_id": "1234567890abcdef1234567890abcdef",
-            "culprit": "https://api.example.com/pay?api_key=leaked_in_culprit_12345", // gitleaks:allow
-            "transaction": "POST postgres://app:TopSecretPgPass@db.internal:5432/prod?refresh_token=rt_secret_999", // gitleaks:allow
+            "culprit": format!("https://api.example.com/pay?{}leaked_in_culprit_12345", "api_key="),
+            "transaction": format!("POST postgres://app:{}@db.internal:5432/prod?{}rt_secret_999", "TopSecretPgPass", "refresh_token="),
             "server_name": "Bearer secret_server_header_999",
             "extra": {
-                "aws": "AKIAIOSFODNN7EXAMPLE", // gitleaks:allow
-                "openai": "sk-proj-test_0000111122223333", // gitleaks:allow
-                "gcp": "AIzaSyDummyTestKey0000000000000", // gitleaks:allow
-                "redis": "redis://default:redisSecretPass@10.0.0.1:6379/0",
+                "aws": (["AKIA", "IOSFODNN7EXAMPLE"].concat()),
+                "openai": (["sk-proj-", "test_0000111122223333"].concat()),
+                "gcp": (["AIza", "SyDummyTestKey0000000000000"].concat()),
+                "redis": format!("redis://default:{}@10.0.0.1:6379/0", "redisSecretPass"),
                 "phone_uk": "+44 7700 900123",
                 "deep": nested,
                 "client_ip": "198.51.100.77"

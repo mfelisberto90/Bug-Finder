@@ -418,6 +418,12 @@ pub fn run_lint(root: &Path) -> Result<usize, Vec<String>> {
                 "CSPRNG violation: non-OS RNG call detected in {rel}"
             ));
         }
+        let gitleaks_bypass = concat!("gitleaks", ":allow");
+        if text.contains(gitleaks_bypass) {
+            errors.push(format!(
+                "Secret-scanner bypass comment is forbidden in {rel}; construct synthetic test strings dynamically"
+            ));
+        }
         if text.contains("unicode(false)") {
             let rx_builder_tok = concat!("RegexBuilder", "::new");
             let neg_class_tok = concat!("[", "^");
@@ -453,6 +459,7 @@ pub fn run_lint(root: &Path) -> Result<usize, Vec<String>> {
             rel.as_str(),
             "src/http/auth_routes.rs" | "src/storage/sqlite.rs" | "src/storage/postgres.rs"
         ) && !text.contains("seal_secret")
+            && !text.contains("seal_webhook_secret")
         {
             errors.push(format!("AEAD invariant missing seal_secret call in {rel}"));
         }

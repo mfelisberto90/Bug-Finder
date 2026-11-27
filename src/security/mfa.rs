@@ -1,11 +1,6 @@
-use crate::security::auth::{constant_time_eq, sha256_hex};
-use hmac::{Hmac, Mac};
-use rand::rngs::OsRng;
-use rand::RngCore;
-use sha1::Sha1;
+use crate::security::auth::{constant_time_eq, fill_os_random, sha256_hex};
+use ring::hmac as ring_hmac;
 use std::fmt::Write as _;
-
-type HmacSha1 = Hmac<Sha1>;
 
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const RECOVERY_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -58,15 +53,15 @@ pub fn decode_base32(input: &str) -> Result<Vec<u8>, String> {
 
 pub fn generate_totp_secret_b32() -> String {
     let mut raw = [0u8; 20];
-    OsRng.fill_bytes(&mut raw);
+    fill_os_random(&mut raw);
     encode_base32(&raw)
 }
 
 pub fn totp_code_for_step(secret: &[u8], step: i64) -> String {
     let counter = (step.max(0) as u64).to_be_bytes();
-    let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC-SHA1 accepts any key size");
-    mac.update(&counter);
-    let digest = mac.finalize().into_bytes();
+    let key = ring_hmac::Key::new(ring_hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret);
+    let tag = ring_hmac::sign(&key, &counter);
+    let digest = tag.as_ref();
     let offset = (digest[19] & 0x0F) as usize;
     let bin = ((digest[offset] as u32 & 0x7F) << 24)
         | ((digest[offset + 1] as u32) << 16)
@@ -132,7 +127,7 @@ pub fn generate_recovery_codes() -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(10);
     for _ in 0..10 {
         let mut raw = [0u8; 10];
-        OsRng.fill_bytes(&mut raw);
+        fill_os_random(&mut raw);
         let mut chars = String::with_capacity(11);
         for (idx, b) in raw.iter().enumerate() {
             if idx == 5 {
@@ -142,7 +137,7 @@ pub fn generate_recovery_codes() -> Vec<(String, String)> {
         }
         let norm: String = chars.chars().filter(|&c| c != '-').collect();
         let mut salt = [0u8; 8];
-        OsRng.fill_bytes(&mut salt);
+        fill_os_random(&mut salt);
         let salt_hex = hex::encode(salt);
         let digest = sha256_hex(format!("{salt_hex}:{norm}").as_bytes());
         out.push((chars, format!("v1:{salt_hex}:{digest}")));

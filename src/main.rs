@@ -518,6 +518,7 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
     let app = build_router(state.clone());
     let svc = app.into_make_service_with_connect_info::<SocketAddr>();
 
+    let shutdown_tx_sig = state.shutdown_tx.clone();
     let shutdown_fut = async move {
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
@@ -548,16 +549,31 @@ async fn run_server(config: Arc<AppConfig>, desktop_app: bool) -> u8 {
             _ = sigterm => {}
             _ = desktop_exit => {}
         }
+        // Immediately terminate active SSE streams so axum::serve drains cleanly before SIGKILL.
+        let _ = shutdown_tx_sig.send(true);
     };
 
     // Pin the server future cleanly so LTO does not bloat worker thread stack
     use std::future::IntoFuture;
-    let serve_res = Box::pin(
+    let mut serve_fut = Box::pin(
         axum::serve(listener, svc)
             .with_graceful_shutdown(shutdown_fut)
             .into_future(),
-    )
-    .await;
+    );
+    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    let serve_res = tokio::select! {
+        res = &mut serve_fut => res,
+        _ = async {
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } => {
+            Ok(())
+        }
+    };
 
     maint_stop.notify_waiters();
     state.batch_writer.shutdown().await;

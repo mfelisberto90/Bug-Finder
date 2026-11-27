@@ -55,6 +55,34 @@ jobs:
       - name: Run native Rust security invariant linter
         run: cargo run --locked -- lint --dir .
 
+      - name: Audit Cargo.lock against OSV RustSec advisories
+        run: |
+          python3 - <<'PY'
+          import json, re, sys, urllib.request
+          IGNORED = {"RUSTSEC-2026-0543"}  # informational unmaintained notice on chrono
+          pkgs = []
+          with open("Cargo.lock", "r", encoding="utf-8") as f:
+              for blk in f.read().split("[[package]]")[1:]:
+                  mn = re.search(r'^name\s*=\s*"([^"]+)"', blk, re.M)
+                  mv = re.search(r'^version\s*=\s*"([^"]+)"', blk, re.M)
+                  if mn and mv:
+                      pkgs.append((mn.group(1), mv.group(1)))
+          payload = {"queries": [{"package": {"ecosystem": "crates.io", "name": n}, "version": v} for n, v in pkgs]}
+          req = urllib.request.Request("https://api.osv.dev/v1/querybatch", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=20) as r:
+              res = json.loads(r.read().decode())
+          bad = []
+          for (n, v), item in zip(pkgs, res.get("results", [])):
+              for vuln in item.get("vulns", []):
+                  vid = vuln.get("id", "")
+                  if vid and vid not in IGNORED:
+                      bad.append(f"{n}@{v} -> {vid}")
+          if bad:
+              print("Active RustSec/CVE advisories found:\n" + "\n".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print(f"OSV Cargo.lock audit PASS ({len(pkgs)} crates scanned, 0 active CVEs)")
+          PY
+
       - name: Run clippy with -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
 

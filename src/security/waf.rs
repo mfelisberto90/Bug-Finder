@@ -87,7 +87,7 @@ const EXPLOIT_PATTERNS: &[(&str, ExploitKind)] = &[
     ("union all select", ExploitKind::Sqli),
     ("waitfor delay", ExploitKind::Sqli),
     ("pg_sleep(", ExploitKind::Sqli),
-    ("sleep(", ExploitKind::Sqli),
+    ("select sleep(", ExploitKind::Sqli),
     ("benchmark(", ExploitKind::Sqli),
     ("' or 1=1", ExploitKind::Sqli),
     ("' or '1'='1", ExploitKind::Sqli),
@@ -166,10 +166,35 @@ pub fn is_scanner_user_agent(user_agent: &str) -> bool {
     scanner_ua_ac().is_match(user_agent)
 }
 
-/// Matches decoy canary endpoints, nested dotfiles (`/api/.env`, `/v1/.git/HEAD`), `.js.map`
-/// harvest probes, and DB/backup dumps while exempting RFC 8615 `/.well-known/*` routes.
+/// Matches browser DevTools `.js.map` / `.css.map` requests (return 404 without banning CGNAT IP).
+pub fn is_sourcemap_probe(path: &str) -> bool {
+    let raw = path.trim();
+    let mut buf = [0u8; 4096];
+    let decoded = if raw.len() <= 4096 && raw.contains('%') {
+        let (n, _) = decode_percent_stack(raw.as_bytes(), &mut buf);
+        std::str::from_utf8(&buf[..n]).unwrap_or(raw)
+    } else {
+        raw
+    };
+    let low = decoded.to_ascii_lowercase();
+    let no_query = low.split(&['?', '#'][..]).next().unwrap_or(&low);
+    no_query.ends_with(".js.map") || no_query.ends_with(".css.map")
+}
+
+/// Matches decoy canary endpoints, nested dotfiles (`/api/.env`, `/v1/.git/HEAD`),
+/// and DB/backup dumps (including percent-encoded `/%2eenv`) while exempting RFC 8615 `/.well-known/*`.
 pub fn is_canary_or_dotfile_probe(path: &str) -> bool {
-    let low = path.trim().to_ascii_lowercase();
+    let raw = path.trim();
+    let mut pass1 = [0u8; 4096];
+    let mut pass2 = [0u8; 4096];
+    let decoded = if raw.len() <= 4096 && raw.contains('%') {
+        let (n1, _) = decode_percent_stack(raw.as_bytes(), &mut pass1);
+        let (n2, _) = decode_percent_stack(&pass1[..n1], &mut pass2);
+        std::str::from_utf8(&pass2[..n2]).unwrap_or(raw)
+    } else {
+        raw
+    };
+    let low = decoded.to_ascii_lowercase();
     if low.starts_with("/.well-known/") || low == "/.well-known" {
         return false;
     }
@@ -185,9 +210,6 @@ pub fn is_canary_or_dotfile_probe(path: &str) -> bool {
         return true;
     }
     let no_query = low.split(&['?', '#'][..]).next().unwrap_or(&low);
-    if no_query.ends_with(".js.map") || no_query.ends_with(".css.map") {
-        return true;
-    }
     for seg in no_query.split('/') {
         if seg.is_empty() {
             continue;
@@ -382,7 +404,9 @@ mod tests {
         assert!(is_scanner_user_agent("Mozilla/5.0 sqlmap/1.8"));
         assert!(!is_scanner_user_agent("Mozilla/5.0 Chrome/131.0"));
         assert!(is_canary_or_dotfile_probe("/.pypirc"));
-        assert!(is_canary_or_dotfile_probe("/assets/app.js.map"));
+        assert!(is_canary_or_dotfile_probe("/%2eenv"));
+        assert!(is_sourcemap_probe("/assets/app.js.map"));
+        assert!(!is_canary_or_dotfile_probe("/assets/app.js.map"));
         assert!(!is_canary_or_dotfile_probe("/.well-known/security.txt"));
         assert!(!is_canary_or_dotfile_probe("/.well-known/webauthn"));
     }

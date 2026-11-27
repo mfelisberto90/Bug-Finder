@@ -270,7 +270,10 @@ pub fn decide_quarantine(
     actor_hmac: &str,
     session_id: Option<&str>,
 ) -> Option<(String, String)> {
-    if !policy.enabled || risk_score < policy.quarantine_threshold {
+    if !policy.enabled
+        || policy.mode.eq_ignore_ascii_case("detect")
+        || risk_score < policy.quarantine_threshold
+    {
         return None;
     }
     let clean_sid = session_id.map(str::trim).filter(|s| s.len() >= 8);
@@ -510,7 +513,33 @@ mod tests {
         assert_eq!(combo.risk_score, 100);
         assert_eq!(combo.severity, "critical");
 
-        let policy = ShieldPolicy::default();
+        // H-08 regression: detect mode must NEVER quarantine sessions or IPs
+        let detect_policy = ShieldPolicy::default();
+        assert_eq!(
+            decide_quarantine(
+                &detect_policy,
+                "browser",
+                90,
+                "ip_hmac_1",
+                Some("sess_12345678")
+            ),
+            None
+        );
+        assert_eq!(
+            decide_quarantine(
+                &detect_policy,
+                "backend_verified",
+                90,
+                "ip_hmac_1",
+                Some("sess_12345678"),
+            ),
+            None
+        );
+
+        let policy = ShieldPolicy {
+            mode: "defend".to_string(),
+            ..ShieldPolicy::default()
+        };
         // Browser report NEVER bans IP globally; only quarantines session
         assert_eq!(
             decide_quarantine(&policy, "browser", 90, "ip_hmac_1", None),

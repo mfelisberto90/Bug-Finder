@@ -1,7 +1,8 @@
 (function (root) {
   "use strict";
 
-  var origFetch = typeof root.fetch === "function" ? root.fetch : null;
+  var origFetch = root.__bfOrigFetch || (typeof root.fetch === "function" ? root.fetch : null);
+  if (origFetch) root.__bfOrigFetch = origFetch;
   var curScript = typeof document !== "undefined" ? document.currentScript : null;
 
   var cfg = {
@@ -163,9 +164,22 @@
     try {
       var s = String(rawUrl || "");
       if (!s) return false;
-      if (cfg.endpoint && s.indexOf(cfg.endpoint) !== -1) return true;
-      if (cfg.shieldEndpoint && s.indexOf(cfg.shieldEndpoint) !== -1) return true;
-      return /\/api\/\d+\/(?:envelope|store|security|shield|otlp\/v1\/logs)\b/.test(s);
+      var resolved = s;
+      var pathname = s;
+      if (typeof URL === "function") {
+        try {
+          var base = typeof location !== "undefined" && location.href ? location.href : undefined;
+          var u = base ? new URL(s, base) : new URL(s);
+          resolved = u.href;
+          pathname = u.pathname || "";
+        } catch (_) {}
+      }
+      if (cfg.endpoint && (s.indexOf(cfg.endpoint) !== -1 || resolved.indexOf(cfg.endpoint) !== -1)) return true;
+      if (cfg.shieldEndpoint && (s.indexOf(cfg.shieldEndpoint) !== -1 || resolved.indexOf(cfg.shieldEndpoint) !== -1)) return true;
+      if (/\/_obs\//.test(pathname) || /\/sdk\/bugfinder-/.test(pathname)) return true;
+      if (/^\/t\/[^/?#]+(?:\/|$)/.test(pathname)) return true;
+      if (/^\/(?:api\/)?v1\/logs(?:\/|$)/.test(pathname)) return true;
+      return /\/api\/[^/?#]+\/(?:envelope|store|security|shield|otlp\/v1\/logs)(?:\/|$)/.test(pathname);
     } catch (_) {
       return false;
     }
@@ -236,13 +250,16 @@
       lines.push(safeJsonStringify(items[i][1]));
     }
     var body = lines.join("\n") + "\n";
+    var utf8Bytes = typeof TextEncoder !== "undefined"
+      ? new TextEncoder().encode(body).length
+      : body.length * 2;
     var url = cfg.endpoint + (cfg.dsnKey ? "?sentry_key=" + encodeURIComponent(cfg.dsnKey) : "");
     try {
       if (
         preferBeacon &&
         typeof navigator !== "undefined" &&
         typeof navigator.sendBeacon === "function" &&
-        body.length <= 60000
+        utf8Bytes <= 60000
       ) {
         var blob = typeof Blob === "function"
           ? new Blob([body], { type: "text/plain;charset=UTF-8" })
@@ -250,12 +267,22 @@
         if (navigator.sendBeacon(url, blob)) return;
       }
       if (origFetch) {
+        var useKeepalive = Boolean(preferBeacon || utf8Bytes <= 16384);
         origFetch.call(root, url, {
           method: "POST",
           body: body,
-          keepalive: body.length <= 60000,
+          keepalive: useKeepalive,
           headers: { "Content-Type": "text/plain;charset=UTF-8" }
-        }).catch(function () {});
+        }).catch(function () {
+          if (useKeepalive) {
+            origFetch.call(root, url, {
+              method: "POST",
+              body: body,
+              keepalive: false,
+              headers: { "Content-Type": "text/plain;charset=UTF-8" }
+            }).catch(function () {});
+          }
+        });
       }
     } catch (_) {}
   }
@@ -354,6 +381,9 @@
       ]],
       Boolean(preferBeacon)
     );
+    if (cfg.logBuffer.length > 0 && !cfg.flushTimer) {
+      cfg.flushTimer = setTimeout(flushLogs, 800);
+    }
   }
 
   function pushLog(level, body, attrs) {
@@ -372,6 +402,9 @@
       body: String(body),
       attributes: wrapped
     });
+    if (cfg.logBuffer.length > 500) {
+      cfg.logBuffer.splice(0, cfg.logBuffer.length - 500);
+    }
     if (cfg.logBuffer.length >= 25) {
       flushLogs();
     } else if (!cfg.flushTimer) {
@@ -402,17 +435,20 @@
           var targetOrigin = new URL(urlStr, location.href).origin;
           if (targetOrigin === location.origin) {
             var nextInit = initOpts ? Object.assign({}, initOpts) : {};
-            var h = nextInit.headers;
-            var hasTp = false;
-            if (typeof Headers !== "undefined" && h instanceof Headers) {
-              hasTp = h.has("traceparent");
-              if (!hasTp) h.set("traceparent", "00-" + cfg.traceId + "-" + uuidHex().slice(0, 16) + "-01");
+            var isReq = typeof Request !== "undefined" && input instanceof Request;
+            var baseHeaders = nextInit.headers || (isReq ? input.headers : undefined);
+            var tpVal = "00-" + cfg.traceId + "-" + uuidHex().slice(0, 16) + "-01";
+            if (typeof Headers !== "undefined") {
+              var cloned = new Headers(baseHeaders || undefined);
+              if (!cloned.has("traceparent")) cloned.set("traceparent", tpVal);
+              nextInit.headers = cloned;
             } else {
-              var hdrObj = Object.assign({}, h || {});
+              var hdrObj = Object.assign({}, baseHeaders || {});
+              var hasTp = false;
               for (var hk in hdrObj) {
                 if (String(hk).toLowerCase() === "traceparent") hasTp = true;
               }
-              if (!hasTp) hdrObj.traceparent = "00-" + cfg.traceId + "-" + uuidHex().slice(0, 16) + "-01";
+              if (!hasTp) hdrObj.traceparent = tpVal;
               nextInit.headers = hdrObj;
             }
             callArgs = [input, nextInit];
@@ -648,6 +684,13 @@
         if (!ev) return;
         var dir = ev.effectiveDirective || ev.violatedDirective || "csp";
         var blocked = ev.blockedURI || "inline";
+        if (
+          blocked &&
+          blocked !== "inline" &&
+          (isOwnTelemetryUrl(blocked) || (cfg.endpoint && cfg.endpoint.indexOf(String(blocked)) === 0))
+        ) {
+          return;
+        }
         captureMessage("CSP Violation (" + dir + "): " + blocked, "warning", {
           violated_directive: dir,
           blocked_uri: String(blocked).slice(0, 500),
@@ -694,7 +737,9 @@
       try {
         if (typeof PerformanceObserver === "function") {
           var latestLcp = 0;
-          var clsValue = 0;
+          var maxSessionValue = 0;
+          var sessionValue = 0;
+          var sessionEntries = [];
           var vitalsReported = false;
           var lcpObs = new PerformanceObserver(function (list) {
             var entries = list.getEntries();
@@ -703,11 +748,44 @@
             }
           });
           lcpObs.observe({ type: "largest-contentful-paint", buffered: true });
+          var stopLcp = function () {
+            try { lcpObs.disconnect(); } catch (_) {}
+            window.removeEventListener("pointerdown", stopLcp, true);
+            window.removeEventListener("keydown", stopLcp, true);
+            if (typeof document !== "undefined") {
+              document.removeEventListener("visibilitychange", onLcpVis);
+            }
+          };
+          var onLcpVis = function () {
+            if (typeof document !== "undefined" && document.visibilityState === "hidden") stopLcp();
+          };
+          window.addEventListener("pointerdown", stopLcp, true);
+          window.addEventListener("keydown", stopLcp, true);
+          if (typeof document !== "undefined") {
+            document.addEventListener("visibilitychange", onLcpVis);
+          }
           var clsObs = new PerformanceObserver(function (list) {
             var entries = list.getEntries();
             for (var ei = 0; ei < entries.length; ei++) {
-              if (!entries[ei].hadRecentInput) {
-                clsValue += entries[ei].value || 0;
+              var entry = entries[ei];
+              if (entry.hadRecentInput) continue;
+              var first = sessionEntries[0];
+              var last = sessionEntries[sessionEntries.length - 1];
+              if (
+                sessionValue &&
+                first &&
+                last &&
+                entry.startTime - last.startTime < 1000 &&
+                entry.startTime - first.startTime < 5000
+              ) {
+                sessionValue += entry.value || 0;
+                sessionEntries.push(entry);
+              } else {
+                sessionValue = entry.value || 0;
+                sessionEntries = [entry];
+              }
+              if (sessionValue > maxSessionValue) {
+                maxSessionValue = sessionValue;
               }
             }
           });
@@ -715,6 +793,8 @@
           var flushVitals = function () {
             if (vitalsReported) return;
             vitalsReported = true;
+            stopLcp();
+            try { clsObs.disconnect(); } catch (_) {}
             if (latestLcp > 4000) {
               captureMessage("Poor Web Vital: LCP " + latestLcp + " ms", "warning", {
                 metric: "LCP",
@@ -722,10 +802,10 @@
                 threshold_ms: 4000
               });
             }
-            if (clsValue > 0.25) {
-              captureMessage("Poor Web Vital: CLS " + clsValue.toFixed(3), "warning", {
+            if (maxSessionValue > 0.25) {
+              captureMessage("Poor Web Vital: CLS " + maxSessionValue.toFixed(3), "warning", {
                 metric: "CLS",
-                value: Number(clsValue.toFixed(3)),
+                value: Number(maxSessionValue.toFixed(3)),
                 threshold: 0.25
               });
             }

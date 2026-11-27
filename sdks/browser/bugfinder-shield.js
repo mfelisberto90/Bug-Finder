@@ -1,15 +1,11 @@
 (function (root) {
   "use strict";
 
-  var origFetch = typeof root.fetch === "function" ? root.fetch : null;
+  var origFetch = root.__bfOrigFetch || (typeof root.fetch === "function" ? root.fetch : null);
   var origBeacon = typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function"
     ? navigator.sendBeacon.bind(navigator)
     : null;
   var origToString = Function.prototype.toString;
-  var origXhrOpen = typeof XMLHttpRequest !== "undefined" && XMLHttpRequest.prototype
-    ? XMLHttpRequest.prototype.open
-    : null;
-  var origWs = typeof root.WebSocket === "function" ? root.WebSocket : null;
 
   var WEIGHTS = {
     runtime_debugger_attached: 80,
@@ -170,7 +166,6 @@
       signals: sorted,
       session_id: cfg.sessionId,
       path: path,
-      source: "browser",
       details: details || {}
     });
     return report;

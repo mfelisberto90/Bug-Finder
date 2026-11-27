@@ -6,8 +6,189 @@ use crate::alerts::dispatcher::AlertDispatchJob;
 use crate::domain::envelope::{CheckInItem, SessionUpdate};
 use crate::domain::fingerprint::ComputedIssueMetadata;
 use crate::domain::models::*;
+use crate::security::crypto::{open_secret_with_keyring, seal_secret_v2};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+pub fn webhook_aad_v1(org_id: i64) -> Vec<u8> {
+    format!("alert_rules:webhook_secret:{org_id}").into_bytes()
+}
+
+pub fn webhook_aad_v2(org_id: i64, project_id: i64, channel_type: &str) -> Vec<u8> {
+    format!("alert_rules:webhook_secret:{org_id}:{project_id}:{channel_type}").into_bytes()
+}
+
+pub fn seal_webhook_secret(
+    app_key: &[u8; 32],
+    org_id: i64,
+    project_id: i64,
+    channel_type: &str,
+    plaintext: &str,
+) -> Result<String, String> {
+    seal_secret_v2(
+        app_key,
+        &webhook_aad_v2(org_id, project_id, channel_type),
+        plaintext,
+    )
+}
+
+pub fn open_webhook_secret_checked(
+    app_key: &[u8; 32],
+    prev_keys: &[[u8; 32]],
+    org_id: i64,
+    project_id: i64,
+    channel_type: &str,
+    stored: &str,
+) -> Result<String, String> {
+    if stored.is_empty() {
+        return Ok(String::new());
+    }
+    if stored.starts_with("enc:v2:") {
+        return open_secret_with_keyring(
+            app_key,
+            prev_keys,
+            &webhook_aad_v2(org_id, project_id, channel_type),
+            stored,
+            false,
+        );
+    }
+    open_secret_with_keyring(app_key, prev_keys, &webhook_aad_v1(org_id), stored, false)
+}
+
+struct StormWindow {
+    window_start_ms: i64,
+    count: u32,
+}
+
+#[derive(Default)]
+pub struct StormSampler {
+    counters: Mutex<HashMap<(i64, String), StormWindow>>,
+}
+
+impl StormSampler {
+    pub fn should_sample(
+        &self,
+        project_id: i64,
+        fingerprint: &str,
+        now_ms: i64,
+        max_per_min: u32,
+    ) -> bool {
+        if max_per_min == 0 {
+            return true;
+        }
+        let mut guard = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() > 8192 {
+            guard.retain(|_, w| now_ms.saturating_sub(w.window_start_ms) < 60_000);
+        }
+        let key = (project_id, fingerprint.to_string());
+        let entry = guard.entry(key).or_insert(StormWindow {
+            window_start_ms: now_ms,
+            count: 0,
+        });
+        if now_ms.saturating_sub(entry.window_start_ms) >= 60_000 {
+            entry.window_start_ms = now_ms;
+            entry.count = 0;
+        }
+        entry.count = entry.count.saturating_add(1);
+        entry.count <= max_per_min
+    }
+}
+
+pub fn compute_transaction_summaries(
+    rows: Vec<(String, String, f64, i64)>,
+) -> Vec<TransactionSummaryDto> {
+    struct Acc {
+        op: String,
+        durs: Vec<f64>,
+        last_seen: i64,
+    }
+    let mut map: HashMap<String, Acc> = HashMap::new();
+    for (name, op, dur, ts) in rows {
+        let dur_clean = if dur.is_finite() {
+            dur.clamp(0.0, 86_400_000.0)
+        } else {
+            0.0
+        };
+        let entry = map.entry(name).or_insert_with(|| Acc {
+            op,
+            durs: Vec::new(),
+            last_seen: ts,
+        });
+        entry.durs.push(dur_clean);
+        if ts > entry.last_seen {
+            entry.last_seen = ts;
+        }
+    }
+    let mut out: Vec<TransactionSummaryDto> = map
+        .into_iter()
+        .map(|(name, mut acc)| {
+            acc.durs
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = acc.durs.len();
+            let sum: f64 = acc.durs.iter().sum();
+            let avg = if n > 0 { sum / n as f64 } else { 0.0 };
+            let p50 = if n > 0 { acc.durs[n / 2] } else { 0.0 };
+            let p95_idx = ((n as f64) * 0.95).floor() as usize;
+            let p95 = if n > 0 {
+                acc.durs[p95_idx.min(n - 1)]
+            } else {
+                0.0
+            };
+            TransactionSummaryDto {
+                name,
+                op: acc.op,
+                count: n as i64,
+                error_count: 0,
+                p50_ms: (p50 * 10.0).round() / 10.0,
+                p95_ms: (p95 * 10.0).round() / 10.0,
+                avg_ms: (avg * 10.0).round() / 10.0,
+                last_seen: iso_from_ms(acc.last_seen),
+            }
+        })
+        .collect();
+    out.sort_by_key(|a| std::cmp::Reverse(a.count));
+    out
+}
+
+pub type ReleaseHealthRow = (String, String, i64, i64, i64, i64, i64, i64, i64);
+
+pub fn compute_release_health_list(rows: Vec<ReleaseHealthRow>) -> Vec<ReleaseHealthDto> {
+    rows.into_iter()
+        .map(
+            |(
+                version,
+                _environment,
+                first_seen,
+                last_seen,
+                healthy,
+                errored,
+                crashed,
+                abnormal,
+                issue_count,
+            )| {
+                let total = (healthy + errored + crashed + abnormal).max(0);
+                let crash_free = if total > 0 {
+                    (((total - crashed) as f64) / (total as f64) * 1000.0).round() / 10.0
+                } else {
+                    100.0
+                };
+                ReleaseHealthDto {
+                    version,
+                    first_seen: iso_from_ms(first_seen),
+                    last_seen: iso_from_ms(last_seen),
+                    issue_count,
+                    healthy_sessions: healthy,
+                    errored_sessions: errored,
+                    crashed_sessions: crashed,
+                    abnormal_sessions: abnormal,
+                    crash_free_rate: crash_free,
+                }
+            },
+        )
+        .collect()
+}
 
 pub fn compute_issues_watermark_sig(
     max_last_seen: i64,
@@ -15,14 +196,12 @@ pub fn compute_issues_watermark_sig(
     resolved_cnt: i64,
     ignored_cnt: i64,
 ) -> i64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for v in [max_last_seen, sum_events, resolved_cnt, ignored_cnt] {
-        for b in v.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-    (h & 0x7fff_ffff_ffff_ffff) as i64
+    let mut buf = [0u8; 32];
+    buf[0..8].copy_from_slice(&max_last_seen.to_le_bytes());
+    buf[8..16].copy_from_slice(&sum_events.to_le_bytes());
+    buf[16..24].copy_from_slice(&resolved_cnt.to_le_bytes());
+    buf[24..32].copy_from_slice(&ignored_cnt.to_le_bytes());
+    (fnv1a_u64(&buf) & 0x7fff_ffff_ffff_ffff) as i64
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +527,16 @@ pub trait StorageBackend: Send + Sync {
 
     async fn find_user_for_login(&self, email: &str) -> Result<Option<LoginUserRecord>, String>;
 
+    /// Resolves an OIDC login by immutable `(oidc_issuer, oidc_sub)` first; binds an existing
+    /// unbound account matching `email` only if `oidc_sub IS NULL`, rejecting email reassignment
+    /// to a different IdP subject.
+    async fn find_or_bind_oidc_user(
+        &self,
+        issuer: &str,
+        sub: &str,
+        email: &str,
+    ) -> Result<Result<Option<LoginUserRecord>, String>, String>;
+
     async fn check_login_lockout(
         &self,
         key_hmac: &str,
@@ -482,20 +671,6 @@ pub trait StorageBackend: Send + Sync {
         ctx: &TenantCtx,
         params: &LogQueryParams,
     ) -> Result<Vec<LogEventDto>, String>;
-    async fn list_log_resources(&self, ctx: &TenantCtx) -> Result<Vec<LogResourceDto>, String>;
-    async fn get_log_stats(
-        &self,
-        ctx: &TenantCtx,
-        since_ms: i64,
-        until_ms: i64,
-    ) -> Result<Value, String>;
-    async fn get_stats_v2(
-        &self,
-        ctx: &TenantCtx,
-        category: &str,
-        since_ms: i64,
-        until_ms: i64,
-    ) -> Result<Value, String>;
 
     async fn list_transactions(
         &self,
@@ -510,6 +685,7 @@ pub trait StorageBackend: Send + Sync {
         ctx: &TenantCtx,
         input: &SaveSourceMapInput<'_>,
     ) -> Result<SourceMapRecord, String>;
+    async fn get_sourcemap_total_bytes(&self, organization_id: i64) -> Result<i64, String>;
     async fn find_source_map(
         &self,
         organization_id: i64,
@@ -549,11 +725,6 @@ pub trait StorageBackend: Send + Sync {
         rule: &NewAlertRule,
     ) -> Result<AlertRuleDto, String>;
     async fn delete_alert_rule(&self, ctx: &TenantCtx, rule_id: i64) -> Result<bool, String>;
-    async fn get_alert_rule(
-        &self,
-        ctx: &TenantCtx,
-        rule_id: i64,
-    ) -> Result<Option<AlertRuleDto>, String>;
     async fn get_alert_rule_for_dispatch(
         &self,
         ctx: &TenantCtx,
@@ -666,7 +837,7 @@ pub trait StorageBackend: Send + Sync {
         cred_id: i64,
         sign_count: u32,
         now_sec: i64,
-    ) -> Result<(), String>;
+    ) -> Result<bool, String>;
     async fn delete_webauthn_credential(&self, user_id: i64, cred_id: i64) -> Result<bool, String>;
 
     // Session lifecycle, step-up & password rotation
@@ -682,13 +853,13 @@ pub trait StorageBackend: Send + Sync {
         user_id: i64,
         org_id: i64,
         session_id: i64,
-    ) -> Result<bool, String>;
+    ) -> Result<Option<String>, String>;
     async fn revoke_other_sessions(
         &self,
         user_id: i64,
         org_id: i64,
         keep_token_sha256: &str,
-    ) -> Result<usize, String>;
+    ) -> Result<Vec<String>, String>;
     async fn mark_session_reauth(
         &self,
         token_sha256: &str,
@@ -745,6 +916,7 @@ pub trait StorageBackend: Send + Sync {
         settings: &OrgSecuritySettings,
     ) -> Result<OrgSecuritySettings, String>;
     async fn count_owners_without_mfa(&self, ctx: &TenantCtx) -> Result<i64, String>;
+    async fn has_any_privileged_org_requiring_mfa(&self, user_id: i64) -> Result<bool, String>;
 
     async fn list_members(&self, ctx: &TenantCtx) -> Result<Vec<MemberDto>, String>;
     async fn invite_member(

@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 type HmacSha256 = Hmac<Sha256>;
 
 static WEBHOOK_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SMTP_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 struct PinnedResolver {
     expected_plain: String,
@@ -34,10 +35,14 @@ impl ureq::Resolver for PinnedResolver {
     }
 }
 
-fn alert_semaphore() -> Arc<Semaphore> {
+fn webhook_semaphore() -> Arc<Semaphore> {
     WEBHOOK_SEM
-        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .get_or_init(|| Arc::new(Semaphore::new(8)))
         .clone()
+}
+
+fn smtp_semaphore() -> Arc<Semaphore> {
+    SMTP_SEM.get_or_init(|| Arc::new(Semaphore::new(4))).clone()
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +71,7 @@ fn redact_secret(msg: &str, secret: &str) -> String {
         .replace(&encoded, "[REDACTED]")
 }
 
+#[cfg(test)]
 pub fn sign_webhook_body(secret: &str, timestamp: i64, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
     mac.update(timestamp.to_string().as_bytes());
@@ -147,6 +153,13 @@ pub fn format_alert_payload(job: &AlertDispatchJob) -> Value {
                 .target_url
                 .strip_prefix("telegram:")
                 .map(str::trim)
+                .or_else(|| {
+                    // Support custom HTTPS Telegram proxy URLs with `?chat_id=...` or `#chat_id=...`
+                    job.target_url
+                        .split(&['?', '&', '#'][..])
+                        .find_map(|p| p.strip_prefix("chat_id="))
+                        .map(str::trim)
+                })
                 .unwrap_or("");
             let title: String = job.title.chars().take(240).collect();
             let desc: String = job.message.chars().take(1800).collect();
@@ -224,10 +237,10 @@ pub async fn dispatch_alert(config: Arc<AppConfig>, job: AlertDispatchJob) -> Re
         let Some(smtp_cfg) = config.smtp.clone() else {
             return Err("SMTP is not configured".into());
         };
-        let permit = alert_semaphore()
+        let permit = smtp_semaphore()
             .acquire_owned()
             .await
-            .map_err(|e| format!("alert semaphore: {e}"))?;
+            .map_err(|e| format!("smtp semaphore: {e}"))?;
         let to = job.email_to.clone();
         let subj = format!("[Bug-Finder][{}] {}", job.project_slug, job.title);
         let body = format!(
@@ -259,10 +272,10 @@ pub async fn dispatch_alert(config: Arc<AppConfig>, job: AlertDispatchJob) -> Re
         job.target_url.clone()
     };
 
-    let permit = alert_semaphore()
+    let permit = webhook_semaphore()
         .acquire_owned()
         .await
-        .map_err(|e| format!("alert semaphore: {e}"))?;
+        .map_err(|e| format!("webhook semaphore: {e}"))?;
 
     let allow_http_dev = config.dev_allow_http_webhooks;
     tokio::task::spawn_blocking(move || {

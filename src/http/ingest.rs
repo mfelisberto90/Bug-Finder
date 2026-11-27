@@ -50,7 +50,7 @@ pub fn attach_ingest_cors(headers: &mut HeaderMap) {
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static(
-            "Content-Type, Content-Encoding, Authorization, X-Sentry-Auth, X-Requested-With, X-BugFinder-Check",
+            "Content-Type, Content-Encoding, Authorization, X-Sentry-Auth, X-Requested-With, X-BugFinder-Check, X-BugFinder-Project, traceparent, sentry-trace, baggage",
         ),
     );
     headers.insert(
@@ -138,6 +138,14 @@ fn clamp_event_timestamp(ev: &mut Value) {
 
 pub async fn options_ingest() -> Response {
     cors_preflight_response()
+}
+
+/// Accepts default OTel SDK `/v1/traces` and `/v1/metrics` exports with `202 Accepted`
+/// so standard OpenTelemetry exporters do not trigger behavioral 404 bans on monitored hosts.
+pub async fn ingest_otlp_noop() -> Response {
+    let mut resp = (StatusCode::ACCEPTED, Json(json!({ "partialSuccess": {} }))).into_response();
+    attach_ingest_cors(resp.headers_mut());
+    resp
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response {
@@ -326,7 +334,7 @@ async fn maybe_demangle_event(state: &AppState, auth: &ProjectAuthInfo, ev: &mut
     }
 
     let mut parsed_maps = HashMap::new();
-    for (did, base) in needed_files {
+    for (did, base) in needed_files.into_iter().take(16) {
         let key = format!(
             "{}:{}:{}",
             auth.project_id,
@@ -404,9 +412,8 @@ fn is_event_throttled(auth: &ProjectAuthInfo) -> bool {
     if eff == 0 {
         return false;
     }
-    use rand::RngCore;
     let mut b = [0u8; 1];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    crate::security::auth::fill_os_random(&mut b);
     (b[0] % 100) < eff
 }
 
@@ -568,6 +575,17 @@ async fn process_logs_batch(
 
     for l in logs.iter_mut() {
         let rep = scrubber.scrub_log_with_report(&mut l.body, &mut l.attributes);
+        crate::domain::models::strip_nul_in_place(&mut l.body);
+        crate::domain::models::strip_nul_in_place(&mut l.service);
+        crate::domain::models::strip_nul_in_place(&mut l.environment);
+        crate::domain::models::strip_nul_in_place(&mut l.host);
+        if let Some(ref mut tid) = l.trace_id {
+            crate::domain::models::strip_nul_in_place(tid);
+        }
+        if let Some(ref mut sid) = l.span_id {
+            crate::domain::models::strip_nul_in_place(sid);
+        }
+        l.timestamp_ms = crate::domain::models::clamp_ingest_ts_ms(l.timestamp_ms);
         if !dry_probe && auth.filters.shield.enabled && auth.filters.shield.secret_leak_alerts {
             for c in rep.categories {
                 if !leaked_cats.contains(&c) {
@@ -745,6 +763,14 @@ async fn handle_parsed_envelope(
             }
             EnvelopeItem::Transaction(mut tr) => {
                 tx_scrubber.scrub_log_in_place(&mut tr.name, &mut tr.spans);
+                crate::domain::models::strip_nul_in_place(&mut tr.op);
+                crate::domain::models::strip_nul_in_place(&mut tr.status);
+                crate::domain::models::strip_nul_in_place(&mut tr.trace_id);
+                crate::domain::models::strip_nul_in_place(&mut tr.span_id);
+                crate::domain::models::strip_nul_in_place(&mut tr.environment);
+                if let Some(ref mut rel) = tr.release {
+                    crate::domain::models::strip_nul_in_place(rel);
+                }
                 if dry_probe {
                     continue;
                 }
@@ -764,24 +790,39 @@ async fn handle_parsed_envelope(
                     .ingest_transactions_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            EnvelopeItem::Session(sess) => {
-                if !dry_probe {
-                    let _ = state.batch_writer.try_enqueue(IngestWriteItem::Session {
-                        organization_id: auth.organization_id,
-                        project_id: auth.project_id,
-                        session: sess,
-                        received_ms,
-                    });
+            EnvelopeItem::Session(mut sess) => {
+                crate::domain::models::strip_nul_in_place(&mut sess.release);
+                crate::domain::models::strip_nul_in_place(&mut sess.environment);
+                crate::domain::models::strip_nul_in_place(&mut sess.status);
+                if !dry_probe
+                    && state
+                        .batch_writer
+                        .try_enqueue(IngestWriteItem::Session {
+                            organization_id: auth.organization_id,
+                            project_id: auth.project_id,
+                            session: sess,
+                            received_ms,
+                        })
+                        .is_err()
+                {
+                    return Err(Box::new(rate_limited_response(5, "session")));
                 }
             }
-            EnvelopeItem::CheckIn(ci) => {
-                if !dry_probe {
-                    let _ = state.batch_writer.try_enqueue(IngestWriteItem::CheckIn {
-                        organization_id: auth.organization_id,
-                        project_id: auth.project_id,
-                        check_in: ci,
-                        received_ms,
-                    });
+            EnvelopeItem::CheckIn(mut ci) => {
+                crate::domain::models::strip_nul_in_place(&mut ci.monitor_slug);
+                crate::domain::models::strip_nul_in_place(&mut ci.status);
+                if !dry_probe
+                    && state
+                        .batch_writer
+                        .try_enqueue(IngestWriteItem::CheckIn {
+                            organization_id: auth.organization_id,
+                            project_id: auth.project_id,
+                            check_in: ci,
+                            received_ms,
+                        })
+                        .is_err()
+                {
+                    return Err(Box::new(rate_limited_response(5, "monitor")));
                 }
             }
             EnvelopeItem::Attachment { .. } | EnvelopeItem::Ignored => {}
@@ -1415,7 +1456,11 @@ pub async fn ingest_shield(
         return r;
     }
 
-    let req: ShieldIngestReq = match serde_json::from_slice(&body) {
+    let decompressed = match decompress_ingest_body(&state, &headers, &body) {
+        Ok(b) => b,
+        Err(resp) => return *resp,
+    };
+    let req: ShieldIngestReq = match serde_json::from_slice(&decompressed) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid Shield JSON payload"),
     };

@@ -261,7 +261,7 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${PREFIX}/bugfinder --headless
 Restart=on-failure
 RestartSec=3
-MemoryMax=64M
+MemoryMax=128M
 NoNewPrivileges=true
 PrivateTmp=true
 

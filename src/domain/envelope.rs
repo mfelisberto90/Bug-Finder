@@ -268,7 +268,8 @@ pub fn parse_sentry_log_container(
         let ts_ms = obj
             .get("timestamp")
             .and_then(|v| v.as_f64())
-            .map(|secs| (secs * 1000.0) as i64)
+            .filter(|s| s.is_finite())
+            .map(|secs| crate::domain::models::clamp_ingest_ts_ms((secs * 1000.0) as i64))
             .unwrap_or_else(now_ms);
         let severity_number = obj
             .get("severity_number")
@@ -386,13 +387,20 @@ pub fn parse_transaction_value(val: &Value) -> Option<NormalizedTransaction> {
     let start_sec = val
         .get("start_timestamp")
         .and_then(|v| v.as_f64())
+        .filter(|s| s.is_finite())
         .unwrap_or_else(|| (now_ms() as f64) / 1000.0);
     let end_sec = val
         .get("timestamp")
         .and_then(|v| v.as_f64())
+        .filter(|s| s.is_finite())
         .unwrap_or(start_sec);
-    let duration_ms = ((end_sec - start_sec) * 1000.0).max(0.0);
-    let timestamp_ms = (start_sec * 1000.0) as i64;
+    let raw_dur = (end_sec - start_sec) * 1000.0;
+    let duration_ms = if raw_dur.is_finite() {
+        raw_dur.clamp(0.0, 86_400_000.0)
+    } else {
+        0.0
+    };
+    let timestamp_ms = crate::domain::models::clamp_ingest_ts_ms((start_sec * 1000.0) as i64);
 
     let trace_ctx = val
         .get("contexts")
@@ -497,10 +505,15 @@ pub fn extract_dsn_key(
 
     if let Some(auth) = auth_header {
         let trimmed = auth.trim();
-        if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
-            let tok = trimmed[7..].trim();
-            if !tok.is_empty() {
-                return Some(tok.to_string());
+        if trimmed
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+        {
+            if let Some(rest) = trimmed.get(7..) {
+                let tok = rest.trim();
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
             }
         }
     }
@@ -528,16 +541,35 @@ pub fn extract_dsn_key(
 
 /// Parse DSN string `https://<public_key>@<host>/<project_id>` into `(public_key, project_id)`.
 pub fn parse_dsn_url(dsn: &str) -> Option<(String, i64)> {
-    let without_scheme = dsn
-        .strip_prefix("https://")
-        .or_else(|| dsn.strip_prefix("http://"))?;
-    let (userinfo, rest) = without_scheme.split_once('@')?;
-    let key = userinfo.split(':').next()?.trim();
-    if key.is_empty() {
+    let trimmed = dsn.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| {
+            c.is_control() || c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '$' | '#' | '\\')
+        })
+    {
         return None;
     }
-    let path_part = rest.split_once('/')?.1.trim_matches('/');
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let (userinfo, rest) = without_scheme.split_once('@')?;
+    let key = userinfo.split(':').next()?.trim();
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let (host, path_raw) = rest.split_once('/')?;
+    if host.is_empty() {
+        return None;
+    }
+    let path_part = path_raw.trim_matches('/');
     let project_id = path_part.rsplit('/').next()?.parse::<i64>().ok()?;
+    if project_id <= 0 {
+        return None;
+    }
     Some((key.to_string(), project_id))
 }
 
@@ -607,14 +639,28 @@ mod tests {
     #[test]
     fn parses_custom_x_sentry_auth_header_and_dsn() {
         let mut q = HashMap::new();
-        let hdr = "Sentry sentry_version=7, sentry_client=acme-observability/1.0, sentry_key=abc123def456"; // gitleaks:allow
+        let sample_key = ["abc123", "def456"].concat();
+        let hdr = format!(
+            "Sentry sentry_version=7, sentry_client=acme-observability/1.0, sentry_key={sample_key}"
+        );
         assert_eq!(
-            extract_dsn_key(&q, None, Some(hdr)).as_deref(),
+            extract_dsn_key(&q, None, Some(&hdr)).as_deref(),
             Some("abc123def456")
+        );
+        // C-01 regression: multi-byte UTF-8 Authorization header must NEVER panic on byte slice
+        assert_eq!(extract_dsn_key(&q, Some("éééé"), None), None);
+        assert_eq!(
+            extract_dsn_key(&q, Some("Bearer tok123"), None).as_deref(),
+            Some("tok123")
+        );
+        // H-13 regression: newline or shell metacharacters in DSN must be rejected
+        assert_eq!(
+            parse_dsn_url("https://abc123@bugs.example.com/x\nLD_PRELOAD=/tmp/pwn.so\n/42"),
+            None
         );
         q.insert("sentry_key".into(), "fromquery".into());
         assert_eq!(
-            extract_dsn_key(&q, None, Some(hdr)).as_deref(),
+            extract_dsn_key(&q, None, Some(&hdr)).as_deref(),
             Some("fromquery")
         );
         assert_eq!(

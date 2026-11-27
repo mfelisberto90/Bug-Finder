@@ -106,7 +106,7 @@ impl SourceMapV3 {
                     let Some(dc) = decode_vlq(b, &mut p) else {
                         continue;
                     };
-                    gen_col += dc;
+                    gen_col = gen_col.saturating_add(dc);
                     let mut seg = MappingSeg {
                         gen_col,
                         src_idx: None,
@@ -120,9 +120,9 @@ impl SourceMapV3 {
                             decode_vlq(b, &mut p),
                             decode_vlq(b, &mut p),
                         ) {
-                            src_idx += ds;
-                            orig_line += dl;
-                            orig_col += dcol;
+                            src_idx = src_idx.saturating_add(ds);
+                            orig_line = orig_line.saturating_add(dl);
+                            orig_col = orig_col.saturating_add(dcol);
                             if src_idx >= 0 {
                                 seg.src_idx = Some(src_idx as usize);
                                 seg.orig_line = Some(orig_line);
@@ -130,7 +130,7 @@ impl SourceMapV3 {
                             }
                             if p < b.len() {
                                 if let Some(dn) = decode_vlq(b, &mut p) {
-                                    name_idx += dn;
+                                    name_idx = name_idx.saturating_add(dn);
                                     if name_idx >= 0 {
                                         seg.name_idx = Some(name_idx as usize);
                                     }
@@ -178,8 +178,8 @@ impl SourceMapV3 {
 
         let s_idx = seg.src_idx?;
         let source = self.sources.get(s_idx)?.clone();
-        let orig_line = seg.orig_line?.max(0) as u32 + 1;
-        let orig_col = seg.orig_col.unwrap_or(0).max(0) as u32;
+        let orig_line = seg.orig_line?.clamp(0, (u32::MAX - 1) as i64) as u32 + 1;
+        let orig_col = seg.orig_col.unwrap_or(0).clamp(0, u32::MAX as i64) as u32;
         let name = seg.name_idx.and_then(|i| self.names.get(i).cloned());
 
         let (pre_context, context_line, post_context) = extract_context(
@@ -290,14 +290,6 @@ impl SourceMapCache {
             trim_heap();
         }
         parsed
-    }
-
-    pub fn get_or_parse(&self, key: &str, raw_bytes: &[u8]) -> Option<Arc<SourceMapV3>> {
-        if let Some(cached) = self.get_cached(key) {
-            return Some(cached);
-        }
-        let parsed = Arc::new(SourceMapV3::parse(raw_bytes).ok()?);
-        Some(self.insert_parsed(key, parsed))
     }
 }
 

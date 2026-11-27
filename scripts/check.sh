@@ -23,7 +23,7 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
     line="${line%$'\r'}"
     [[ -z "$line" || "$line" == \#* ]] && continue
     [[ "$line" == export\ * ]] && line="${line#export }"
-    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+    if [[ "$line" =~ ^(BUGFINDER_[A-Z0-9_]*)=(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
       val="${BASH_REMATCH[2]}"
       val="${val#\"}"
@@ -60,15 +60,22 @@ DSN="${BUGFINDER_DSN:-}"
 APP_URL="${BUGFINDER_APP_URL:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --url) URL="$2"; shift 2 ;;
-    --dsn) DSN="$2"; shift 2 ;;
-    --app-url) APP_URL="$2"; shift 2 ;;
+    --url)
+      [[ $# -ge 2 ]] || { echo "[FAIL] --url requires a value" >&2; exit 1; }
+      URL="$2"; shift 2 ;;
+    --dsn)
+      [[ $# -ge 2 ]] || { echo "[FAIL] --dsn requires a value" >&2; exit 1; }
+      DSN="$2"; shift 2 ;;
+    --app-url)
+      [[ $# -ge 2 ]] || { echo "[FAIL] --app-url requires a value" >&2; exit 1; }
+      APP_URL="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 
 FAILS=0
 URL="${URL%/}"
+DSN="${DSN%/}"
 echo "Bug-Finder Fallback Curl Check Shell (server=${URL})"
 
 if curl -fsS --max-time 3 "${URL}/api/health" >/dev/null && curl -fsS --max-time 3 "${URL}/llms.txt" >/dev/null; then
@@ -78,18 +85,23 @@ else
   FAILS=$((FAILS + 1))
 fi
 
-if [[ -n "$DSN" && "$DSN" =~ ^https?://([^@]+)@([^/]+)/([0-9]+)$ ]]; then
-  KEY="${BASH_REMATCH[1]}"
-  PID="${BASH_REMATCH[3]}"
-  CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
-    -H 'Content-Type: text/plain;charset=utf-8' \
-    -H 'X-BugFinder-Check: dry-probe' \
-    --data $'{"sdk":{"name":"check.sh","version":"2.0.0"}}\n{"type":"event"}\n{"message":"dry-probe"}\n' \
-    "${URL}/api/${PID}/envelope/?sentry_key=${KEY}" || echo 000)"
-  if [[ "$CODE" == "200" ]]; then
-    echo "[PASS] Envelope dry-probe HTTP 200 on project ${PID}"
+if [[ -n "$DSN" ]]; then
+  if [[ "$DSN" =~ ^https?://([^@]+)@([^/]+)/([0-9]+)$ ]]; then
+    KEY="${BASH_REMATCH[1]}"
+    PID="${BASH_REMATCH[3]}"
+    CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+      -H 'Content-Type: text/plain;charset=utf-8' \
+      -H 'X-BugFinder-Check: dry-probe' \
+      --data $'{"sdk":{"name":"check.sh","version":"2.0.0"}}\n{"type":"event"}\n{"message":"dry-probe"}\n' \
+      "${URL}/api/${PID}/envelope/?sentry_key=${KEY}" || echo 000)"
+    if [[ "$CODE" == "200" ]]; then
+      echo "[PASS] Envelope dry-probe HTTP 200 on project ${PID}"
+    else
+      echo "[FAIL] Envelope dry-probe returned HTTP ${CODE} on project ${PID}"
+      FAILS=$((FAILS + 1))
+    fi
   else
-    echo "[FAIL] Envelope dry-probe returned HTTP ${CODE} on project ${PID}"
+    echo "[FAIL] Malformed --dsn value"
     FAILS=$((FAILS + 1))
   fi
 fi

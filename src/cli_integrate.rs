@@ -206,6 +206,7 @@ fn upsert_env_file(
     if dry_run {
         return Ok(true);
     }
+    reject_if_symlink(path)?;
 
     let mut content = lines.join("\n");
     if !content.ends_with('\n') {
@@ -234,6 +235,18 @@ fn upsert_env_file(
     Ok(true)
 }
 
+fn reject_if_symlink(path: &Path) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to write through symlink: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_connector_file(
     path: &Path,
     content: &str,
@@ -243,6 +256,7 @@ fn write_connector_file(
     if path.exists() && !force {
         return Ok(false);
     }
+    reject_if_symlink(path)?;
     if dry_run {
         return Ok(true);
     }
@@ -278,6 +292,7 @@ fn inject_html_script_tag(
         format!("{raw}\n{script_tag}")
     };
     if !dry_run {
+        reject_if_symlink(html_path)?;
         fs::write(html_path, updated).map_err(|e| format!("Write {}: {e}", html_path.display()))?;
     }
     Ok(true)
@@ -1339,8 +1354,7 @@ fn spawn_stream_pump<R: Read + Send + 'static, W: Write + Send + 'static>(
         };
         let mut buf = String::new();
         loop {
-            buf.clear();
-            match br.read_line(&mut buf) {
+            match crate::mcp::read_bounded_line(&mut br, &mut buf, 64 * 1024) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let _ = mirror.write_all(buf.as_bytes());
@@ -1388,8 +1402,7 @@ pub fn run_pipe_reader<R: BufRead>(
     let mut agg = StreamAggregator::new(tx.clone());
     let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match crate::mcp::read_bounded_line(&mut reader, &mut line, 64 * 1024) {
             Ok(0) => break,
             Ok(_) => {
                 let scrubbed = scrub_stream_line(&line);
@@ -1537,15 +1550,7 @@ pub fn run_wrap_cli(
 }
 
 fn percent_encode_val(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    crate::domain::models::encode_uri_component(raw)
 }
 
 #[cfg(test)]
@@ -1813,6 +1818,9 @@ fn collect_sourcemap_files(
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("Failed reading sourcemap directory {}: {e}", dir.display()))?;
     for entry in entries.flatten() {
+        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+            continue;
+        }
         let p = entry.path();
         if p.is_dir() {
             let name = p
@@ -1838,15 +1846,7 @@ fn collect_sourcemap_files(
 }
 
 fn encode_uri_component_strict(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    crate::domain::models::encode_uri_component(raw)
 }
 
 pub fn run_sourcemaps_upload_cli(

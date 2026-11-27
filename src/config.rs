@@ -239,10 +239,12 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub database_url: Option<String>,
     pub app_key: [u8; 32],
+    pub previous_app_keys: Vec<[u8; 32]>,
     pub max_unzipped_bytes: usize,
     pub max_db_mb: u64,
     pub retention_days: u32,
     pub trusted_proxies: Vec<CidrBlock>,
+    pub cloudflare_proxies: Vec<CidrBlock>,
     pub trust_cf_header: bool,
     pub allowed_hosts: Vec<String>,
     pub public_url: Option<String>,
@@ -294,7 +296,7 @@ impl AppConfig {
                 .filter(|v| !v.is_empty())
         });
 
-        let is_loopback_bind = bind_addr.starts_with("127.0.0.1:")
+        let _is_loopback_bind = bind_addr.starts_with("127.0.0.1:")
             || bind_addr.starts_with("localhost:")
             || bind_addr.starts_with("[::1]:");
 
@@ -317,15 +319,18 @@ impl AppConfig {
             .unwrap_or(30);
 
         let mut trusted_proxies = Vec::new();
+        let mut cloudflare_proxies = Vec::new();
         let mut trust_cf_header = env::var("BUGFINDER_TRUST_CF_HEADER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if let Ok(raw) = env::var("BUGFINDER_TRUSTED_PROXIES") {
             for part in raw.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                let expanded = CidrBlock::expand_keyword_or_cidr(part)?;
                 if part.eq_ignore_ascii_case("cloudflare") {
                     trust_cf_header = true;
+                    cloudflare_proxies.extend(expanded.iter().cloned());
                 }
-                trusted_proxies.extend(CidrBlock::expand_keyword_or_cidr(part)?);
+                trusted_proxies.extend(expanded);
             }
         }
 
@@ -377,23 +382,25 @@ impl AppConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        let has_prod_signals = force_secure_cookies
-            || !trusted_proxies.is_empty()
-            || !allowed_hosts.is_empty()
-            || database_url.is_some()
-            || public_url
-                .as_deref()
-                .map(|u| u.starts_with("https://"))
-                .unwrap_or(false);
         let is_dev = match env::var("BUGFINDER_ENV") {
             Ok(v) => matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "dev" | "development" | "local"
             ),
-            Err(_) => !has_prod_signals && (desktop_app_mode || is_loopback_bind),
+            Err(_) => desktop_app_mode,
         };
 
         let app_key = load_or_create_app_key(&data_dir, is_dev)?;
+        let mut previous_app_keys = Vec::new();
+        if let Ok(raw_prev) = env::var("BUGFINDER_PREVIOUS_APP_KEYS") {
+            for part in raw_prev.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Ok(k) = decode_key_bytes(part, true) {
+                    if k != app_key && !previous_app_keys.contains(&k) {
+                        previous_app_keys.push(k);
+                    }
+                }
+            }
+        }
 
         let dev_allow_http_webhooks = env::var("BUGFINDER_DEV_ALLOW_HTTP_WEBHOOKS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -480,10 +487,12 @@ impl AppConfig {
             data_dir,
             database_url,
             app_key,
+            previous_app_keys,
             max_unzipped_bytes,
             max_db_mb,
             retention_days,
             trusted_proxies,
+            cloudflare_proxies,
             trust_cf_header,
             allowed_hosts,
             public_url,
@@ -524,6 +533,14 @@ impl AppConfig {
     pub fn is_trusted_proxy(&self, peer: IpAddr) -> bool {
         self.trusted_proxies.iter().any(|c| c.contains(peer))
     }
+
+    pub fn is_cloudflare_peer(&self, peer: IpAddr) -> bool {
+        if self.cloudflare_proxies.is_empty() {
+            // Explicit BUGFINDER_TRUST_CF_HEADER=1 without keyword expansion trusts configured proxies
+            return self.is_trusted_proxy(peer);
+        }
+        self.cloudflare_proxies.iter().any(|c| c.contains(peer))
+    }
 }
 
 fn load_or_create_app_key(data_dir: &Path, is_dev: bool) -> Result<[u8; 32], String> {
@@ -536,7 +553,7 @@ fn load_or_create_app_key(data_dir: &Path, is_dev: bool) -> Result<[u8; 32], Str
                         .into(),
                 );
             }
-            return decode_key_bytes(trimmed);
+            return decode_key_bytes(trimmed, is_dev);
         }
     }
 
@@ -544,13 +561,11 @@ fn load_or_create_app_key(data_dir: &Path, is_dev: bool) -> Result<[u8; 32], Str
     if key_file.is_file() {
         let content = fs::read_to_string(&key_file)
             .map_err(|e| format!("Failed reading {}: {e}", key_file.display()))?;
-        return decode_key_bytes(content.trim());
+        return decode_key_bytes(content.trim(), true);
     }
 
-    use rand::rngs::OsRng;
-    use rand::RngCore;
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    crate::security::auth::fill_os_random(&mut bytes);
     let hex_key = hex::encode(bytes);
 
     let tmp_path = data_dir.join(".app_key.tmp");
@@ -573,7 +588,16 @@ fn load_or_create_app_key(data_dir: &Path, is_dev: bool) -> Result<[u8; 32], Str
     Ok(bytes)
 }
 
-fn decode_key_bytes(raw: &str) -> Result<[u8; 32], String> {
+fn decode_key_bytes(raw: &str, is_dev: bool) -> Result<[u8; 32], String> {
+    if !is_dev {
+        let distinct = raw.bytes().collect::<std::collections::HashSet<u8>>().len();
+        if distinct < 8 {
+            return Err(
+                "BUGFINDER_APP_KEY has insufficient character entropy; generate with `bugfinder keygen`"
+                    .into(),
+            );
+        }
+    }
     if raw.len() == 64 {
         if let Ok(bytes) = hex::decode(raw) {
             if bytes.len() == 32 {
@@ -727,6 +751,8 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                     if args[j] == "--url" {
                         j += 1;
                         url = args.get(j).cloned().ok_or("--url requires a value")?;
+                    } else {
+                        return Err(format!("Unknown healthcheck argument: {}", args[j]));
                     }
                     j += 1;
                 }
@@ -828,17 +854,19 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 });
             }
             "test-event" | "test-log" => {
-                let mut dsn = String::new();
+                let mut dsn = env::var("BUGFINDER_DSN").unwrap_or_default();
                 let mut j = 2;
                 while j < args.len() {
                     if args[j] == "--dsn" {
                         j += 1;
                         dsn = args.get(j).cloned().ok_or("--dsn requires value")?;
+                    } else {
+                        return Err(format!("Unknown {sub} argument: {}", args[j]));
                     }
                     j += 1;
                 }
                 if dsn.is_empty() {
-                    return Err(format!("{sub} requires --dsn <url>"));
+                    return Err(format!("{sub} requires --dsn <url> or BUGFINDER_DSN"));
                 }
                 let command = if sub == "test-event" {
                     CliCommand::TestEvent { dsn }
@@ -1208,6 +1236,9 @@ pub fn parse_cli_args(args: &[String]) -> Result<ParsedArgs, String> {
                 });
             }
             "keygen" => {
+                if args.len() > 2 {
+                    return Err(format!("Unknown keygen argument: {}", args[2]));
+                }
                 return Ok(ParsedArgs {
                     command: CliCommand::Keygen,
                     bind_override: None,

@@ -1,4 +1,9 @@
 use axum::body::Body;
+
+mod sqlx {
+    pub use sqlx_core::query::query;
+    pub use sqlx_core::query_scalar::query_scalar;
+}
 use axum::http::{header, Request, StatusCode};
 use bugfinder::config::AppConfig;
 use bugfinder::http::router::build_router;
@@ -314,8 +319,8 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
     assert!(!log_dump.contains("sk_live_secret1234567890")); // gitleaks:allow
     assert!(!log_dump.contains("123456"));
 
-    // Verify stats_v2
-    let (sv2_st, _, sv2_raw) = send_raw(
+    // Verify dead stats_v2 route was cleanly removed (404)
+    let (sv2_st, _, _) = send_raw(
         &router,
         "GET",
         "/api/0/organizations/alpha/stats_v2/?category=error&statsPeriod=24h",
@@ -323,14 +328,7 @@ async fn end_to_end_sentry_envelope_logs_otlp_glitchtip_sourcemap_and_mcp() {
         Vec::new(),
     )
     .await;
-    assert_eq!(sv2_st, StatusCode::OK);
-    let sv2: Value = serde_json::from_slice(&sv2_raw).unwrap();
-    assert!(
-        sv2["groups"][0]["totals"]["sum(quantity)"]
-            .as_i64()
-            .unwrap()
-            >= 2
-    );
+    assert_eq!(sv2_st, StatusCode::NOT_FOUND);
 
     // Verify Anti-AdBlock Tunnel `/t/:slug`
     let (tun_st, _, tun_body) = send_json(
@@ -975,8 +973,8 @@ async fn postgres_rls_live_isolation_test() {
         .unwrap();
     aead_tx.commit().await.unwrap();
     assert!(
-        raw_wh.starts_with("enc:v1:"),
-        "PG webhook secret not AEAD sealed: {raw_wh}"
+        raw_wh.starts_with("enc:v2:"),
+        "PG webhook secret not AEAD v2 sealed: {raw_wh}"
     );
 
     // Cascade revocation on remove_member under NOBYPASSRLS
@@ -1187,6 +1185,8 @@ async fn postgres_rls_live_isolation_test() {
         .unwrap();
 
     for tbl in [
+        "users",
+        "login_attempts",
         "user_mfa",
         "user_mfa_recovery_codes",
         "mfa_challenges",
@@ -2838,7 +2838,7 @@ async fn security_aead_audit_chain_and_network_hardening_test() {
             )
             .unwrap();
         assert!(mfa_enc.starts_with("enc:v1:"), "got {mfa_enc}");
-        assert!(wh_enc.starts_with("enc:v1:"), "got {wh_enc}");
+        assert!(wh_enc.starts_with("enc:v2:"), "got {wh_enc}");
         assert!(!wh_enc.contains("whsec_raw_plaintext"));
     }
 
@@ -3547,7 +3547,7 @@ async fn alerts_telegram_discord_and_oidc_flow_test() {
                 let pay = URL_SAFE_NO_PAD.encode(
                     serde_json::to_vec(&json!({
                         "iss": issuer_clone,
-                        "sub": "oidc-sub-001",
+                        "sub": format!("oidc-sub-{email}"),
                         "aud": "bf-test-client",
                         "exp": exp,
                         "nonce": nonce,
@@ -5070,4 +5070,104 @@ async fn v2_turbo_e2e_security_ai_blueprint_and_check_shell_test() {
 
     let (repeat_st, _, _) = send_json(&router, "GET", "/robots.txt", &[], Value::Null).await;
     assert_eq!(repeat_st, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn v2_1_security_hardening_regression_test() {
+    let (_dir, state, router, dsn_key, project_id) = setup_test_app().await;
+
+    // 1. C-01: Multi-byte UTF-8 Authorization header must return 401 cleanly (zero UTF-8 slice panic)
+    let (utf8_st, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/"),
+        &[("authorization", "éééé")],
+        b"{}\n".to_vec(),
+    )
+    .await;
+    assert_eq!(utf8_st, StatusCode::UNAUTHORIZED);
+
+    // 2. C-02: Zstandard giant-window header bomb rejected with 413 before decoder allocation
+    let zstd_bomb = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0xF8, 0x00, 0x00];
+    let (zst_st, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/?sentry_key={dsn_key}"),
+        &[("content-encoding", "zstd")],
+        zstd_bomb,
+    )
+    .await;
+    assert_eq!(zst_st, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 3. C-03: Event containing NUL bytes in JSON object keys & safe top-level keys ingests cleanly
+    let nul_env = "{\"sdk\":{\"name\":\"test\",\"version\":\"1.0\"}}\n{\"type\":\"event\"}\n{\"message\":\"ok\\u0000msg\",\"level\":\"error\\u0000\",\"extra\":{\"bad\\u0000key\":\"val\"}}\n";
+    let (nul_st, _, _) = send_raw(
+        &router,
+        "POST",
+        &format!("/api/{project_id}/envelope/?sentry_key={dsn_key}"),
+        &[],
+        nul_env.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(nul_st, StatusCode::OK);
+    state.batch_writer.flush_now().await;
+
+    // 4. H-07: /v1/traces & /v1/metrics return 202 (no 404 self-ban), and .js.map returns 404 without banning IP
+    for path in ["/v1/traces", "/v1/metrics"] {
+        let (st, _, _) = send_raw(&router, "POST", path, &[], b"{}".to_vec()).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "path={path}");
+    }
+    let (map_st, _, _) = send_raw(&router, "GET", "/assets/app.js.map", &[], Vec::new()).await;
+    assert_eq!(map_st, StatusCode::NOT_FOUND);
+    let (health_st, _, _) = send_raw(&router, "GET", "/api/health", &[], Vec::new()).await;
+    assert_eq!(
+        health_st,
+        StatusCode::OK,
+        "DevTools .js.map 404 must not trigger CGNAT IP ban"
+    );
+
+    // 5. H-01: Step-up /api/auth/reauth must reject password-only reauth when TOTP MFA is enrolled
+    let (cookie, csrf) =
+        login_cookie_and_csrf(&router, "owner@alpha.test", "StrongPassword123!").await;
+    let (enroll_st, _, enroll_body) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/enroll",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            ("x-csrf-token", csrf.as_str()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(enroll_st, StatusCode::OK);
+    let secret_b32 = enroll_body["secret_b32"].as_str().unwrap();
+    let secret_raw = bugfinder::security::mfa::decode_base32(secret_b32).unwrap();
+    let code = bugfinder::security::mfa::totp_code_at(&secret_raw, chrono::Utc::now().timestamp());
+    let (conf_st, _, _) = send_json(
+        &router,
+        "POST",
+        "/api/auth/mfa/totp/confirm",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            ("x-csrf-token", csrf.as_str()),
+        ],
+        json!({ "code": code }),
+    )
+    .await;
+    assert_eq!(conf_st, StatusCode::OK);
+
+    let (pw_reauth_st, _, pw_reauth_body) = send_json(
+        &router,
+        "POST",
+        "/api/auth/reauth",
+        &[
+            (header::COOKIE.as_str(), cookie.as_str()),
+            ("x-csrf-token", csrf.as_str()),
+        ],
+        json!({ "password": "StrongPassword123!" }),
+    )
+    .await;
+    assert_eq!(pw_reauth_st, StatusCode::FORBIDDEN);
+    assert_eq!(pw_reauth_body["code"], "mfa_step_up_required");
 }

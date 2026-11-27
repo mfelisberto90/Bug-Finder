@@ -20,30 +20,26 @@ name = "bugfinder"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
+tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path", "original-uri"] }
 http = "1.1"
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+rusqlite = { version = "0.43", features = ["bundled", "backup"] }
+sqlx-core = { version = "0.8", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
+sqlx-postgres = { version = "0.8", default-features = false, features = ["uuid", "chrono", "json"] }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 brotli = "7"
-ruzstd = "0.7"
+ruzstd = "0.9"
 scrypt = { version = "0.11", default-features = false, features = ["std", "simple"] }
 ring = "0.17"
-sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2.6"
 hex = "0.4"
 base64 = "0.22"
-rand = "0.8"
 uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 regex = { version = "1.11", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
@@ -57,6 +53,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.14"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [build-dependencies]
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }

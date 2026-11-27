@@ -45,6 +45,7 @@ type MountedMode = "none" | "loading" | "setup" | "login" | "mfa" | "invite" | "
 const ALL_TOKEN_SCOPES = [
   "org:read",
   "org:write",
+  "org:admin",
   "member:read",
   "member:write",
   "member:admin",
@@ -74,7 +75,6 @@ interface AppStateModel {
   issueFilterStatus: string;
   issueSearch: string;
   issueSort: "date" | "freq" | "new";
-  issueOffset: number;
   issueTotalHits: number;
   selectedIssue: IssueSummary | null;
   selectedIssueEvent: IssueEventDetail | null;
@@ -108,7 +108,6 @@ interface AppStateModel {
   inviteError: string | null;
   mfaChallenge: { challenge_token: string; methods: string[] } | null;
   mfaMethod: "totp" | "recovery";
-  activeProjectModalId: number | null;
   activeProjectKeys: ProjectKeyItem[];
   lastCreatedToken: string | null;
   traceView: Record<string, any> | null;
@@ -154,7 +153,6 @@ const state: AppStateModel = {
   issueFilterStatus: "unresolved",
   issueSearch: "",
   issueSort: "date",
-  issueOffset: 0,
   issueTotalHits: 0,
   selectedIssue: null,
   selectedIssueEvent: null,
@@ -188,7 +186,6 @@ const state: AppStateModel = {
   inviteError: null,
   mfaChallenge: null,
   mfaMethod: "totp",
-  activeProjectModalId: null,
   activeProjectKeys: [],
   lastCreatedToken: null,
   traceView: null,
@@ -253,6 +250,16 @@ function publicOrigin(): string {
   return (state.sdkMeta?.public_url || location.origin).replace(/\/+$/, "");
 }
 
+function formatProjectDsn(proj?: Project | null, fallback = "<KEY>"): string {
+  const origin = publicOrigin();
+  if (proj?.dsn_public_key) {
+    return `${origin.replace("://", `://${proj.dsn_public_key}@`)}/${proj.id}`;
+  }
+  return fallback === "(no active key)"
+    ? fallback
+    : `${origin.replace("://", `://${fallback}@`)}/${proj ? proj.id : 1}`;
+}
+
 function esc(val: unknown): string {
   return String(val ?? "")
     .replace(/&/g, "&amp;")
@@ -260,6 +267,85 @@ function esc(val: unknown): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function renderDataTable(
+  capId: string,
+  caption: string,
+  headers: string[],
+  rowsHtml: string,
+  tbodyId?: string
+): string {
+  const ths = headers.map((h) => `<th>${esc(h)}</th>`).join("");
+  return `<div tabindex="0" role="region" aria-labelledby="${capId}" class="table-wrapper"><table class="data-table"><caption id="${capId}" class="hp-field">${esc(caption)}</caption><thead><tr>${ths}</tr></thead><tbody${tbodyId ? ` id="${tbodyId}"` : ""}>${rowsHtml}</tbody></table></div>`;
+}
+
+async function copyToClipboard(
+  txt: string,
+  okMsg = "Copied to clipboard",
+  failMsg = "Clipboard permission denied — copy text manually"
+): Promise<void> {
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      showToast("Clipboard unavailable — copy text manually");
+      return;
+    }
+    await navigator.clipboard.writeText(txt);
+    showToast(okMsg);
+  } catch {
+    showToast(failMsg);
+  }
+}
+
+async function openTraceById(tid: string): Promise<void> {
+  const res = await apiFetch<any>(
+    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/traces/${encodeURIComponent(tid)}/`
+  );
+  if (res.ok && res.data) {
+    state.traceView = res.data;
+    populateTraceDialog();
+    const dlg = document.getElementById("dlg-trace") as HTMLDialogElement | null;
+    if (dlg) openDialog(dlg);
+  } else {
+    showToast(res.error || "Failed loading trace");
+  }
+}
+
+async function mutateWithReauth<T = any>(
+  url: string,
+  init: { method?: string; body?: unknown },
+  successMsg: string,
+  opts: {
+    failMsg?: string;
+    reload?: boolean;
+    refreshSelfCheck?: boolean;
+    onSuccess?: (data: T | null) => void;
+    onFailure?: () => Promise<void> | void;
+  } = {}
+): Promise<void> {
+  const run = async () => {
+    const res = await apiFetch<T>(url, init);
+    if (res.reauth_required) {
+      openReauthDialog(run, res.code === "mfa_step_up_required");
+      return;
+    }
+    if (!res.ok) {
+      showToast(res.error || opts.failMsg || "Operation failed");
+      if (opts.onFailure) await opts.onFailure();
+      return;
+    }
+    opts.onSuccess?.(res.data);
+    showToast(successMsg);
+    if (opts.reload !== false) {
+      if (opts.refreshSelfCheck) {
+        await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
+      } else {
+        await loadCurrentTabData();
+      }
+      renderMainPane();
+    }
+  };
+  await run();
 }
 
 function ensureRoots(): {
@@ -394,7 +480,7 @@ async function refreshSelfCheck(): Promise<void> {
   }
 }
 
-function syncSelfCheckSlots(): void {
+function syncSelfCheckSlots(rerenderMain = true): void {
   if (!state.user) {
     const authSlot = document.getElementById("auth-selfcheck-slot");
     if (authSlot) {
@@ -419,7 +505,7 @@ function syncSelfCheckSlots(): void {
     });
   }
 
-  if (state.tab === "selfcheck" && mountedMode === "dashboard") {
+  if (rerenderMain && state.tab === "selfcheck" && mountedMode === "dashboard") {
     renderMainPane();
   }
 }
@@ -514,7 +600,6 @@ function purgeSensitiveClientState(keepSessionOrg = false): void {
   stopConnectSse();
   state.projects = [];
   state.issues = [];
-  state.issueOffset = 0;
   state.issueTotalHits = 0;
   state.selectedIssue = null;
   state.selectedIssueEvent = null;
@@ -541,7 +626,6 @@ function purgeSensitiveClientState(keepSessionOrg = false): void {
   state.shieldProjectFilter = null;
   state.auditLogs = [];
   state.auditVerify = null;
-  state.activeProjectModalId = null;
   state.activeProjectKeys = [];
   state.traceView = null;
   state.connectAiCache = {};
@@ -578,9 +662,16 @@ setUnauthorizedHook(() => {
 
 async function boot(): Promise<void> {
   if (state.inviteToken) {
-    const invRes = await apiFetch<PublicInvitationInfo>(
-      `/api/auth/invites/${encodeURIComponent(state.inviteToken)}`
-    );
+    const [invRes, me] = await Promise.all([
+      apiFetch<PublicInvitationInfo>(
+        `/api/auth/invites/${encodeURIComponent(state.inviteToken)}`
+      ),
+      apiFetch<any>("/api/auth/me")
+    ]);
+    if (me.ok && me.data) {
+      state.user = me.data.user;
+      setCsrfToken(me.data.csrf_token || "");
+    }
     if (invRes.ok && invRes.data) {
       state.inviteInfo = invRes.data;
       state.inviteError = null;
@@ -639,7 +730,6 @@ async function fetchIssuesPage(append: boolean): Promise<void> {
     } else {
       state.issues = res.data;
     }
-    state.issueOffset = state.issues.length;
     state.issueTotalHits = res.hits ?? state.issues.length;
   }
 }
@@ -812,7 +902,6 @@ function updateLiveTailDomInPlace(): void {
   if (!tbody) return;
   const items = state.liveTailOn ? state.liveEntries : state.logs;
   tbody.innerHTML = renderLogRowsHtml(items);
-  bindTraceOpenButtons(tbody);
   const toggleBtn = document.getElementById("btn-toggle-live");
   if (toggleBtn) {
     toggleBtn.textContent = state.liveTailOn ? "Pause Live Tail" : "Start Live Tail (SSE)";
@@ -883,21 +972,31 @@ function renderAuthScreen(): string {
       </main>
       <div id="auth-selfcheck-slot">${errBanner}</div>`;
     }
+    const info = state.inviteInfo;
+    const isSignedInInvitee = Boolean(
+      state.user && state.user.email.toLowerCase() === info.email.toLowerCase()
+    );
+    const reqAttr = isSignedInInvitee ? "" : "required";
     return `
       <main class="auth-wrap">
         <section class="card auth-card stack-col">
           <div class="brand-row"><div class="brand-title"><span class="brand-mark">BF</span> Accept Invitation</div></div>
-          <p>You were invited to join <strong>${esc(state.inviteInfo.organization_name)}</strong> (${esc(state.inviteInfo.role)}) with email <span class="mono">${esc(state.inviteInfo.email)}</span>.</p>
+          <p>You were invited to join <strong>${esc(info.organization_name)}</strong> (${esc(info.role)}) with email <span class="mono">${esc(info.email)}</span>.</p>
+          ${
+            isSignedInInvitee
+              ? `<p class="muted">You are already signed in as ${esc(state.user!.email)}. Click Accept below to join directly without changing your password.</p>`
+              : ""
+          }
           <form id="invite-accept-form" class="stack-col">
             <div class="hp-field" aria-hidden="true">
               <label for="inv-website">Website</label>
               <input id="inv-website" name="website" tabindex="-1" autocomplete="off">
             </div>
-            <label for="inv-name">Full Name
-              <input id="inv-name" name="name" type="text" required autocomplete="name" enterkeyhint="next" autofocus>
+            <label for="inv-name">Full Name${isSignedInInvitee ? " (optional)" : ""}
+              <input id="inv-name" name="name" type="text" ${reqAttr} autocomplete="name" enterkeyhint="next" value="${esc(isSignedInInvitee ? state.user!.name : "")}" autofocus>
             </label>
-            <label for="inv-password">New Password (min 10 chars)
-              <input id="inv-password" name="password" type="password" required minlength="10" autocomplete="new-password" enterkeyhint="done">
+            <label for="inv-password">${isSignedInInvitee ? "New Password (optional — leave blank to keep current)" : "New Password (min 10 chars)"}
+              <input id="inv-password" name="password" type="password" ${reqAttr} ${isSignedInInvitee ? "" : 'minlength="10"'} autocomplete="new-password" enterkeyhint="done">
             </label>
             <div class="cta-dock">
               <button type="submit" data-primary-cta="true">Accept Invitation &amp; Sign In</button>
@@ -1089,17 +1188,7 @@ function renderIssuesTab(): string {
       <button type="button" id="btn-open-issue-filters">Filters (${esc(state.issueFilterStatus || "all")})</button>
     </div>
 
-    <div tabindex="0" role="region" aria-labelledby="issues-cap" class="table-wrapper">
-      <table class="data-table">
-        <caption id="issues-cap" class="hp-field">Issues table</caption>
-        <thead>
-          <tr>
-            <th>Issue</th><th>Level</th><th>Status</th><th>Events</th><th>Users</th><th>Last Seen</th>
-          </tr>
-        </thead>
-        <tbody>${rowsHtml}</tbody>
-      </table>
-    </div>
+    ${renderDataTable("issues-cap", "Issues table", ["Issue", "Level", "Status", "Events", "Users", "Last Seen"], rowsHtml)}
 
     <div class="pager-row">
       <span class="mono">Showing ${state.issues.length} of ${totalLabel} issues</span>
@@ -1138,15 +1227,7 @@ function renderLogsTab(): string {
       <button type="button" id="btn-search-logs">Search</button>
     </div>
 
-    <div tabindex="0" role="region" aria-labelledby="logs-cap" class="table-wrapper">
-      <table class="data-table">
-        <caption id="logs-cap" class="hp-field">Structured logs stream</caption>
-        <thead>
-          <tr><th>Time</th><th>Level</th><th>Service</th><th>Message Body</th><th>Trace ID</th></tr>
-        </thead>
-        <tbody id="logs-tbody">${rowsHtml}</tbody>
-      </table>
-    </div>
+    ${renderDataTable("logs-cap", "Structured logs stream", ["Time", "Level", "Service", "Message Body", "Trace ID"], rowsHtml, "logs-tbody")}
 
     <div id="logs-pager-row" class="pager-row ${showMore ? "" : "is-hidden"}">
       <span class="mono">Loaded ${state.logs.length} logs</span>
@@ -1196,24 +1277,12 @@ function renderPerfTab(): string {
     <div class="stack-col">
       <section class="card">
         <h2>Transactions (p50 / p95)</h2>
-        <div tabindex="0" role="region" aria-labelledby="tx-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="tx-cap" class="hp-field">Transactions</caption>
-            <thead><tr><th>Transaction</th><th>Count</th><th>Errors</th><th>p50</th><th>p95</th></tr></thead>
-            <tbody>${txRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("tx-cap", "Transactions", ["Transaction", "Count", "Errors", "p50", "p95"], txRows)}
       </section>
 
       <section class="card">
         <h2>Release Health (Crash-Free Sessions)</h2>
-        <div tabindex="0" role="region" aria-labelledby="rel-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="rel-cap" class="hp-field">Releases</caption>
-            <thead><tr><th>Release</th><th>Crash-Free %</th><th>Healthy</th><th>Crashed</th><th>New Issues</th></tr></thead>
-            <tbody>${relRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("rel-cap", "Releases", ["Release", "Crash-Free %", "Healthy", "Crashed", "New Issues"], relRows)}
       </section>
     </div>`;
 }
@@ -1288,24 +1357,12 @@ function renderUptimeTab(): string {
     <div class="stack-col">
       <section class="card">
         <h2>Heartbeat Monitors</h2>
-        <div tabindex="0" role="region" aria-labelledby="mon-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="mon-cap" class="hp-field">Monitors</caption>
-            <thead><tr><th>Name</th><th>Status</th><th>Interval</th><th>Check-in Endpoint</th><th>Actions</th></tr></thead>
-            <tbody>${monRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("mon-cap", "Monitors", ["Name", "Status", "Interval", "Check-in Endpoint", "Actions"], monRows)}
       </section>
 
       <section class="card">
         <h2>Alert Rules (Webhook / Slack / Discord / SMTP)</h2>
-        <div tabindex="0" role="region" aria-labelledby="al-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="al-cap" class="hp-field">Alerts</caption>
-            <thead><tr><th>Name</th><th>Trigger</th><th>Channel</th><th>Target</th><th>Actions</th></tr></thead>
-            <tbody>${alertRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("al-cap", "Alerts", ["Name", "Trigger", "Channel", "Target", "Actions"], alertRows)}
       </section>
     </div>`;
 }
@@ -1313,15 +1370,11 @@ function renderUptimeTab(): string {
 function renderProjectsTab(): string {
   const origin = publicOrigin();
   const firstProj = state.projects[0];
-  const sampleDsn = firstProj?.dsn_public_key
-    ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
-    : `${origin.replace("://", "://<KEY>@")}/1`;
+  const sampleDsn = formatProjectDsn(firstProj);
 
   const projCards = state.projects
     .map((p) => {
-      const dsn = p.dsn_public_key
-        ? `${origin.replace("://", `://${p.dsn_public_key}@`)}/${p.id}`
-        : "(no active key)";
+      const dsn = formatProjectDsn(p, "(no active key)");
       return `
         <article class="card stack-col">
           <div class="row-gap">
@@ -1423,21 +1476,9 @@ function renderProjectsTab(): string {
           ? `<div class="secret-banner secret-banner-info">Invite link (72h): <span class="mono">${esc(state.lastInviteUrl)}</span> <button type="button" data-copy-text="${esc(state.lastInviteUrl)}">Copy Link</button></div>`
           : ""
       }
-      <div tabindex="0" role="region" aria-labelledby="mem-cap" class="table-wrapper">
-        <table class="data-table">
-          <caption id="mem-cap" class="hp-field">Team Members</caption>
-          <thead><tr><th>Member</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
-          <tbody>${memberRows || '<tr><td colspan="4">No team members found.</td></tr>'}</tbody>
-        </table>
-      </div>
+      ${renderDataTable("mem-cap", "Team Members", ["Member", "Role", "Status", "Action"], memberRows || '<tr><td colspan="4">No team members found.</td></tr>')}
       <h3>Expiring Pending / Historical Invitations</h3>
-      <div tabindex="0" role="region" aria-labelledby="inv-cap" class="table-wrapper">
-        <table class="data-table">
-          <caption id="inv-cap" class="hp-field">Organization Invitations</caption>
-          <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Expires</th><th>Action</th></tr></thead>
-          <tbody>${inviteRows || '<tr><td colspan="5">No invite links generated yet.</td></tr>'}</tbody>
-        </table>
-      </div>
+      ${renderDataTable("inv-cap", "Organization Invitations", ["Email", "Role", "Status", "Expires", "Action"], inviteRows || '<tr><td colspan="5">No invite links generated yet.</td></tr>')}
     </section>
 
     <section class="card">
@@ -1470,13 +1511,7 @@ bugfinder mcp --org ${esc(state.orgSlug)} --token &lt;API_TOKEN&gt;</pre>
           ? `<div class="secret-banner secret-banner-ok">Copy token now (shown once): <span class="mono">${esc(state.lastCreatedToken)}</span> <button type="button" data-copy-text="${esc(state.lastCreatedToken)}">Copy Token</button></div>`
           : ""
       }
-      <div tabindex="0" role="region" aria-labelledby="tok-cap" class="table-wrapper">
-        <table class="data-table">
-          <caption id="tok-cap" class="hp-field">API Tokens</caption>
-          <thead><tr><th>Name</th><th>Prefix</th><th>Role</th><th>Scopes</th><th>Expires</th><th>Action</th></tr></thead>
-          <tbody>${tokRows || '<tr><td colspan="6">No API tokens yet.</td></tr>'}</tbody>
-        </table>
-      </div>
+      ${renderDataTable("tok-cap", "API Tokens", ["Name", "Prefix", "Role", "Scopes", "Expires", "Action"], tokRows || '<tr><td colspan="6">No API tokens yet.</td></tr>')}
     </section>`;
 }
 
@@ -1626,13 +1661,7 @@ function renderShieldMfaSubTab(): string {
           </label>
           <button type="submit">Register Passkey</button>
         </form>
-        <div tabindex="0" role="region" aria-labelledby="pk-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="pk-cap" class="hp-field">Registered Passkeys</caption>
-            <thead><tr><th>Name</th><th>Algorithm</th><th>Sign Count</th><th>Action</th></tr></thead>
-            <tbody>${passkeyRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("pk-cap", "Registered Passkeys", ["Name", "Algorithm", "Sign Count", "Action"], passkeyRows)}
       </section>
 
       <section class="card stack-col">
@@ -1654,13 +1683,7 @@ function renderShieldMfaSubTab(): string {
           <h2>Active Sessions</h2>
           <button type="button" class="btn-danger" id="btn-revoke-other-sessions">Revoke Other Sessions</button>
         </div>
-        <div tabindex="0" role="region" aria-labelledby="sess-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="sess-cap" class="hp-field">Active Sessions</caption>
-            <thead><tr><th>User Agent / IP HMAC</th><th>Last Seen</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody>${sessionRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("sess-cap", "Active Sessions", ["User Agent / IP HMAC", "Last Seen", "Status", "Action"], sessionRows)}
       </section>
     </div>`;
 }
@@ -1721,13 +1744,7 @@ function renderShieldAuditSubTab(): string {
           }
         </div>
         ${ver && !ver.valid ? `<div class="badge badge-error">${esc(ver.detail)}</div>` : ""}
-        <div tabindex="0" role="region" aria-labelledby="aud-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="aud-cap" class="hp-field">Audit Log Chain</caption>
-            <thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Target</th><th>SHA-256 Hash</th></tr></thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("aud-cap", "Audit Log Chain", ["Timestamp", "Actor", "Action", "Target", "SHA-256 Hash"], rows)}
       </section>
     </div>`;
 }
@@ -1737,13 +1754,14 @@ function renderShieldTab(): string {
   if (state.shieldSubTab === "audit") return renderShieldAuditSubTab();
   const origin = publicOrigin();
   const firstProj = state.projects[0];
-  const sampleDsn = firstProj?.dsn_public_key
-    ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
-    : `${origin.replace("://", "://<KEY>@")}/1`;
+  const sampleDsn = formatProjectDsn(firstProj);
   const pid = firstProj ? firstProj.id : 1;
   const pslug = firstProj?.slug || "app";
   const org = state.orgSlug;
-  const mode = firstProj?.filters?.shield?.mode || "detect";
+  const shCfg = firstProj?.filters?.shield;
+  const mode = shCfg?.mode || "detect";
+  const threshold = shCfg?.quarantine_threshold ?? 80;
+  const canaries = shCfg?.canary_globals ?? ["__BF_INTERNAL_SECRETS__"];
   const s = state.shieldSummary;
 
   const projOpts = state.projects
@@ -1791,8 +1809,8 @@ function renderShieldTab(): string {
   BugFinderShield.init({
     dsn: "${sampleDsn}",
     mode: "${mode}",
-    threshold: 80,
-    canaryGlobals: ["__BF_INTERNAL_SECRETS__"],
+    threshold: ${threshold},
+    canaryGlobals: ${JSON.stringify(canaries)},
     clearStorageKeys: ["auth_token"]
   });
 </script>`;
@@ -1875,24 +1893,12 @@ if sys.gettrace() is not None:
     <div class="stack-col">
       <section class="card stack-col">
         <h2>Active Quarantine (CGNAT-Safe: Browser Sessions / Verified Backend IPs)</h2>
-        <div tabindex="0" role="region" aria-labelledby="sh-q-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="sh-q-cap" class="hp-field">Active quarantine entries</caption>
-            <thead><tr><th>Type</th><th>HMAC</th><th>Reason</th><th>Score</th><th>Expires</th><th>Action</th></tr></thead>
-            <tbody>${qRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("sh-q-cap", "Active quarantine entries", ["Type", "HMAC", "Reason", "Score", "Expires", "Action"], qRows)}
       </section>
 
       <section class="card stack-col">
         <h2>Anti-REA, Log-IDS &amp; Secret Leak Radar Events</h2>
-        <div tabindex="0" role="region" aria-labelledby="sh-ev-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="sh-ev-cap" class="hp-field">Security events</caption>
-            <thead><tr><th>Signal</th><th>Category</th><th>Severity / Score</th><th>Source &amp; Path</th><th>Action / Time</th></tr></thead>
-            <tbody>${evRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("sh-ev-cap", "Security events", ["Signal", "Category", "Severity / Score", "Source & Path", "Action / Time"], evRows)}
       </section>
 
       <section class="card stack-col">
@@ -1948,10 +1954,7 @@ function renderSelfCheckTab(): string {
   const rep = state.selfCheck;
   const summary = getEffectiveSelfStatus();
   const origin = publicOrigin();
-  const firstProj = state.projects[0];
-  const sampleDsn = firstProj?.dsn_public_key
-    ? `${origin.replace("://", `://${firstProj.dsn_public_key}@`)}/${firstProj.id}`
-    : `${origin.replace("://", "://<KEY>@")}/1`;
+  const sampleDsn = formatProjectDsn(state.projects[0]);
 
   const rssMb = rep?.vm_rss_bytes != null ? (rep.vm_rss_bytes / (1024 * 1024)).toFixed(1) : "-";
   const dbMb = rep ? (rep.db_size_bytes / (1024 * 1024)).toFixed(2) : "-";
@@ -2090,24 +2093,12 @@ function renderSelfCheckTab(): string {
 
       <section class="card stack-col">
         <h2>Internal Application Errors</h2>
-        <div tabindex="0" role="region" aria-labelledby="self-err-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="self-err-cap" class="hp-field">Internal application errors</caption>
-            <thead><tr><th>Source</th><th>Component</th><th>Severity</th><th>Message &amp; Detail</th><th>Count / Time</th></tr></thead>
-            <tbody>${errRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("self-err-cap", "Internal application errors", ["Source", "Component", "Severity", "Message & Detail", "Count / Time"], errRows)}
       </section>
 
       <section class="card stack-col">
         <h2>Auto-Check Diagnostics (System &amp; Setup Readiness)</h2>
-        <div tabindex="0" role="region" aria-labelledby="self-chk-cap" class="table-wrapper">
-          <table class="data-table">
-            <caption id="self-chk-cap" class="hp-field">System readiness diagnostics</caption>
-            <thead><tr><th>Check</th><th>Category</th><th>Status</th><th>Detail</th><th>Remediation</th></tr></thead>
-            <tbody>${checkRows}</tbody>
-          </table>
-        </div>
+        ${renderDataTable("self-chk-cap", "System readiness diagnostics", ["Check", "Category", "Status", "Detail", "Remediation"], checkRows)}
       </section>
 
       <section class="card stack-col">
@@ -2118,7 +2109,7 @@ function renderSelfCheckTab(): string {
           <button type="button" data-copy-text="${esc(cmdServiceInstall)}">Copy Service Install</button>
         </div>
         <div>
-          <p><strong>2. Run in hardened Docker container (32 MB RAM limit):</strong></p>
+          <p><strong>2. Run in hardened Docker container (128 MB RAM limit):</strong></p>
           <pre class="snippet-box">${esc(cmdDockerInstall)}</pre>
           <button type="button" data-copy-text="${esc(cmdDockerInstall)}">Copy Docker Command</button>
         </div>
@@ -2201,7 +2192,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-issue" class="bf-dialog" closedby="any" aria-labelledby="dlg-issue-title">
       <div class="dialog-head">
         <h2 id="dlg-issue-title">Issue</h2>
-        <button type="button" id="dlg-issue-close">Close</button>
+        <button type="button" id="dlg-issue-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-issue-body"></div>
     </dialog>
@@ -2209,7 +2200,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-trace" class="bf-dialog" closedby="any" aria-labelledby="dlg-trace-title">
       <div class="dialog-head">
         <h2 id="dlg-trace-title">Trace Correlation</h2>
-        <button type="button" id="dlg-trace-close">Close</button>
+        <button type="button" id="dlg-trace-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-trace-body"></div>
     </dialog>
@@ -2217,9 +2208,9 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-filters" class="bf-dialog" closedby="any" aria-labelledby="dlg-filters-title">
       <div class="dialog-head">
         <h2 id="dlg-filters-title">Issue Filters</h2>
-        <button type="button" id="dlg-filters-close">Close</button>
+        <button type="button" id="dlg-filters-close" data-close-dialog="1">Close</button>
       </div>
-      <div id="dlg-filters-body" class="stack-col">
+      <div class="stack-col">
         <label for="filter-status-sel">Status
           <select id="filter-status-sel" name="filter_status">
             <option value="unresolved">Unresolved</option>
@@ -2235,7 +2226,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-create" class="bf-dialog" closedby="any" aria-labelledby="dlg-create-title">
       <div class="dialog-head">
         <h2 id="dlg-create-title">Create Resource</h2>
-        <button type="button" id="dlg-create-close">Close</button>
+        <button type="button" id="dlg-create-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-create-body"></div>
     </dialog>
@@ -2243,7 +2234,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-proj-settings" class="bf-dialog" closedby="any" aria-labelledby="dlg-proj-settings-title">
       <div class="dialog-head">
         <h2 id="dlg-proj-settings-title">Project Filters &amp; Scrubbing</h2>
-        <button type="button" id="dlg-proj-settings-close">Close</button>
+        <button type="button" id="dlg-proj-settings-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-proj-settings-body"></div>
     </dialog>
@@ -2251,7 +2242,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-proj-keys" class="bf-dialog" closedby="any" aria-labelledby="dlg-proj-keys-title">
       <div class="dialog-head">
         <h2 id="dlg-proj-keys-title">Project DSN Keys</h2>
-        <button type="button" id="dlg-proj-keys-close">Close</button>
+        <button type="button" id="dlg-proj-keys-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-proj-keys-body"></div>
     </dialog>
@@ -2259,7 +2250,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-cmdk" class="bf-dialog" closedby="any" aria-labelledby="dlg-cmdk-title">
       <div class="dialog-head">
         <h2 id="dlg-cmdk-title">Quick Jump</h2>
-        <button type="button" id="dlg-cmdk-close">Close</button>
+        <button type="button" id="dlg-cmdk-close" data-close-dialog="1">Close</button>
       </div>
       <div class="stack-col">
         <button type="button" data-cmdk-tab="issues">Go to Issues Inbox</button>
@@ -2275,7 +2266,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-reauth" class="bf-dialog" closedby="any" aria-labelledby="dlg-reauth-title">
       <div class="dialog-head">
         <h2 id="dlg-reauth-title">Step-Up Identity Confirmation</h2>
-        <button type="button" id="dlg-reauth-close">Close</button>
+        <button type="button" id="dlg-reauth-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-reauth-body"></div>
     </dialog>
@@ -2283,7 +2274,7 @@ function mountDashboardShell(shellRoot: HTMLElement, dialogsRoot: HTMLElement): 
     <dialog id="dlg-connect-app" class="bf-dialog bf-dialog-wide" closedby="any" aria-labelledby="dlg-connect-title">
       <div class="dialog-head">
         <h2 id="dlg-connect-title">1-Click Connect App</h2>
-        <button type="button" id="dlg-connect-close">Close</button>
+        <button type="button" id="dlg-connect-close" data-close-dialog="1">Close</button>
       </div>
       <div id="dlg-connect-body"></div>
     </dialog>`;
@@ -2330,19 +2321,7 @@ function syncSidebarChrome(): void {
     logoutBtn.textContent = `Sign Out (${state.user.name})`;
   }
 
-  const summary = getEffectiveSelfStatus();
-  document.querySelectorAll<HTMLElement>("[data-selfcheck-badge]").forEach((badge) => {
-    badge.className = `badge badge-${summary.badgeClass}`;
-    badge.textContent = summary.badgeText;
-  });
-
-  const bannerSlot = document.getElementById("selfcheck-banner-slot");
-  if (bannerSlot) {
-    bannerSlot.innerHTML = renderSelfCheckBanner();
-    document.getElementById("btn-open-selfcheck")?.addEventListener("click", () => {
-      void switchTab("selfcheck");
-    });
-  }
+  syncSelfCheckSlots(false);
 }
 
 function renderMainPane(): void {
@@ -2358,7 +2337,6 @@ function renderMainPane(): void {
   else bodyHtml = renderProjectsTab();
 
   mainPane.innerHTML = bodyHtml;
-  bindMainPaneHandlers(mainPane);
 }
 
 function render(): void {
@@ -2373,7 +2351,7 @@ function render(): void {
     return;
   }
 
-  if (!state.user) {
+  if (!state.user || state.inviteToken) {
     closeAllDialogs();
     const targetMode: MountedMode = state.inviteToken
       ? "invite"
@@ -2568,26 +2546,21 @@ function populateIssueDialog(): void {
       <ul>${crumbsHtml}</ul>
     </div>`;
 
-  document.getElementById("btn-copy-ai-prompt")?.addEventListener("click", async () => {
-    if (!diag?.ai_fix_prompt) return;
-    try {
-      await navigator.clipboard.writeText(diag.ai_fix_prompt);
-      showToast("AI Fix Prompt copied to clipboard");
-    } catch {
-      showToast("Clipboard copy blocked; open MCP diagnose_issue instead");
+  document.getElementById("btn-copy-ai-prompt")?.addEventListener("click", () => {
+    if (diag?.ai_fix_prompt) {
+      void copyToClipboard(
+        diag.ai_fix_prompt,
+        "AI Fix Prompt copied to clipboard",
+        "Clipboard copy blocked; open MCP diagnose_issue instead"
+      );
     }
   });
-  document.getElementById("btn-copy-search-cmd")?.addEventListener("click", async () => {
-    if (!diag?.search_command) return;
-    try {
-      await navigator.clipboard.writeText(diag.search_command);
-      showToast("Search command copied");
-    } catch {
-      showToast("Clipboard copy blocked");
+  document.getElementById("btn-copy-search-cmd")?.addEventListener("click", () => {
+    if (diag?.search_command) {
+      void copyToClipboard(diag.search_command, "Search command copied", "Clipboard copy blocked");
     }
   });
 
-  bindTraceOpenButtons(bodyEl);
   bodyEl.querySelectorAll<HTMLButtonElement>("[data-issue-status]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const id = Number(btn.dataset.issueId);
@@ -2846,32 +2819,22 @@ function bindChromeHandlers(): void {
     });
   });
 
-  document.getElementById("dlg-issue-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-issue") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-trace-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-trace") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-filters-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-filters") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-create-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-create") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-proj-settings-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-proj-settings") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-proj-keys-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-proj-keys") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-cmdk-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-cmdk") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-reauth-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-reauth") as HTMLDialogElement | null)?.close();
-  });
-  document.getElementById("dlg-connect-close")?.addEventListener("click", () => {
-    (document.getElementById("dlg-connect-app") as HTMLDialogElement | null)?.close();
+  document.getElementById("dialogs-root")?.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement | null;
+    const closeBtn = t?.closest<HTMLElement>("[data-close-dialog]");
+    if (closeBtn) {
+      closeBtn.closest<HTMLDialogElement>("dialog")?.close();
+      return;
+    }
+    const copyBtn = t?.closest<HTMLElement>("[data-copy-text]");
+    if (copyBtn) {
+      void copyToClipboard(copyBtn.dataset.copyText || "");
+      return;
+    }
+    const traceBtn = t?.closest<HTMLElement>("[data-open-trace]");
+    if (traceBtn?.dataset.openTrace) {
+      void openTraceById(traceBtn.dataset.openTrace);
+    }
   });
 
   document.getElementById("btn-apply-filters")?.addEventListener("click", async () => {
@@ -2881,43 +2844,38 @@ function bindChromeHandlers(): void {
     await loadCurrentTabData();
     renderMainPane();
   });
+
+  const mainPane = document.getElementById("main-pane");
+  if (mainPane) bindMainPaneDelegation(mainPane);
 }
 
-function bindTraceOpenButtons(scope: ParentNode): void {
-  scope.querySelectorAll<HTMLButtonElement>("[data-open-trace]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const tid = btn.dataset.openTrace;
-      if (!tid) return;
-      const res = await apiFetch<any>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/traces/${encodeURIComponent(tid)}/`
-      );
-      if (res.ok && res.data) {
-        state.traceView = res.data;
-        populateTraceDialog();
-        const dlg = document.getElementById("dlg-trace") as HTMLDialogElement | null;
-        if (dlg) openDialog(dlg);
-      } else {
-        showToast(res.error || "Failed loading trace");
-      }
-    });
-  });
-}
-
-function openReauthDialog(onSuccess: () => Promise<void> | void): void {
+function openReauthDialog(
+  onSuccess: () => Promise<void> | void,
+  mfaStepUpRequired = false
+): void {
   const dlg = document.getElementById("dlg-reauth") as HTMLDialogElement | null;
   const body = document.getElementById("dlg-reauth-body");
   if (!dlg || !body) return;
   body.innerHTML = `
-    <form id="reauth-form" class="stack-col">
-      <p>This sensitive action requires recent confirmation of your password or 2FA code (valid for 10 minutes).</p>
-      <label for="reauth-pw">Current Password
-        <input id="reauth-pw" name="password" type="password" autocomplete="current-password" placeholder="Your password">
-      </label>
-      <label for="reauth-totp">Or TOTP Code (6 digits)
-        <input id="reauth-totp" name="totp_code" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="123456">
-      </label>
-      <button type="submit" autofocus>Confirm Identity</button>
-    </form>`;
+    <div class="stack-col">
+      <div id="dlg-reauth-msg">${
+        mfaStepUpRequired
+          ? `<div class="selfcheck-strip selfcheck-strip-warn" role="status"><strong>MFA step-up required:</strong> Your account requires a 6-digit TOTP code or a WebAuthn Passkey to confirm this action.</div>`
+          : ""
+      }</div>
+      <form id="reauth-form" class="stack-col">
+        <p>This sensitive action requires recent confirmation of your password, 2FA code, or Passkey (valid for 10 minutes).</p>
+        <label for="reauth-pw">Current Password
+          <input id="reauth-pw" name="password" type="password" autocomplete="current-password" placeholder="Your password">
+        </label>
+        <label for="reauth-totp">Or TOTP Code (6 digits)
+          <input id="reauth-totp" name="totp_code" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="123456">
+        </label>
+        <button type="submit" autofocus>Confirm Identity</button>
+      </form>
+      <div class="divider-row">or</div>
+      <button type="button" id="btn-reauth-passkey">Verify with Passkey</button>
+    </div>`;
 
   const form = document.getElementById("reauth-form") as HTMLFormElement | null;
   form?.addEventListener("submit", async (e) => {
@@ -2933,31 +2891,69 @@ function openReauthDialog(onSuccess: () => Promise<void> | void): void {
       }
     });
     if (!res.ok) {
+      if (res.code === "mfa_step_up_required") {
+        const msgBox = document.getElementById("dlg-reauth-msg");
+        if (msgBox) {
+          msgBox.innerHTML = `<div class="selfcheck-strip selfcheck-strip-warn" role="status"><strong>MFA step-up required:</strong> Password alone is not sufficient for MFA-enabled accounts. Enter a 6-digit TOTP code or click "Verify with Passkey".</div>`;
+        }
+        showToast("MFA step-up required: use TOTP code or Passkey");
+        return;
+      }
       showToast(res.error || "Identity confirmation failed");
       return;
     }
     dlg.close();
     await onSuccess();
   });
-  openDialog(dlg);
-}
 
-function bindCopyButtons(scope: ParentNode): void {
-  scope.querySelectorAll<HTMLButtonElement>("[data-copy-text]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const txt = btn.dataset.copyText || "";
-      try {
-        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-          showToast("Clipboard unavailable — copy text manually");
-          return;
-        }
-        await navigator.clipboard.writeText(txt);
-        showToast("Copied to clipboard");
-      } catch {
-        showToast("Clipboard permission denied — copy text manually");
+  document.getElementById("btn-reauth-passkey")?.addEventListener("click", async () => {
+    if (!window.PublicKeyCredential || !navigator.credentials) {
+      showToast("WebAuthn Passkeys are not supported in this browser");
+      return;
+    }
+    const begin = await apiFetch<any>("/api/auth/reauth/passkey/begin", { method: "POST", body: {} });
+    if (!begin.ok || !begin.data) {
+      showToast(begin.error || "Failed to start Passkey confirmation");
+      return;
+    }
+    try {
+      const opts = begin.data;
+      const publicKey: PublicKeyCredentialRequestOptions = {
+        challenge: b64uToBuf(opts.challenge),
+        rpId: opts.rpId,
+        timeout: opts.timeout || 120000,
+        userVerification: opts.userVerification || "preferred",
+        allowCredentials: Array.isArray(opts.allowCredentials)
+          ? opts.allowCredentials.map((c: any) => ({ type: "public-key", id: b64uToBuf(c.id) }))
+          : []
+      };
+      const cred = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
+      if (!cred) {
+        showToast("Passkey confirmation canceled");
+        return;
       }
-    });
+      const resp = cred.response as AuthenticatorAssertionResponse;
+      const fin = await apiFetch("/api/auth/reauth/passkey/finish", {
+        method: "POST",
+        body: {
+          credentialId: cred.id || bufToB64u(cred.rawId),
+          clientDataJSON: bufToB64u(resp.clientDataJSON),
+          authenticatorData: bufToB64u(resp.authenticatorData),
+          signature: bufToB64u(resp.signature)
+        }
+      });
+      if (!fin.ok) {
+        showToast(fin.error || "Passkey confirmation failed");
+        return;
+      }
+      dlg.close();
+      await onSuccess();
+    } catch (err: any) {
+      showToast(err?.message ? String(err.message) : "Error verifying Passkey");
+    }
   });
+
+  openDialog(dlg);
 }
 
 const CONNECT_STACK_TABS: ReadonlyArray<{ id: string; label: string }> = [
@@ -3005,7 +3001,7 @@ function buildConnectSnippet(
 ): { heading: string; note: string; code: string; dsn: string } {
   const origin = publicOrigin();
   const key = proj.dsn_public_key || "<PUBLIC_KEY>";
-  const dsn = `${origin.replace("://", `://${key}@`)}/${proj.id}`;
+  const dsn = formatProjectDsn(proj, "<PUBLIC_KEY>");
   const tunnelPath = proj.tunnel_slug ? `${origin}/t/${proj.tunnel_slug}` : "";
 
   const attrs: string[] = [`src="${origin}/sdk/bugfinder-mini.js"`, `data-dsn="${dsn}"`];
@@ -3251,8 +3247,6 @@ function renderConnectAppBody(): void {
       </div>
     </div>`;
 
-  bindCopyButtons(bodyEl);
-
   bodyEl.querySelectorAll<HTMLButtonElement>("[data-connect-tab]").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.connectStackTab = btn.dataset.connectTab || "ai";
@@ -3353,575 +3347,476 @@ async function openConnectAppModal(projectId?: number): Promise<void> {
   if (dlg) openDialog(dlg);
 }
 
-function bindMainPaneHandlers(mainPane: HTMLElement): void {
-  bindCopyButtons(mainPane);
-  bindTraceOpenButtons(mainPane);
+function bindMainPaneDelegation(mainPane: HTMLElement): void {
+  if (mainPane.dataset.bfDelegated === "1") return;
+  mainPane.dataset.bfDelegated = "1";
+  const orgUrl = (suffix: string) =>
+    `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/${suffix}`;
 
-  // Issues tab handlers
-  document.getElementById("btn-empty-connect-app")?.addEventListener("click", () => {
-    void openConnectAppModal(state.projects[0]?.id);
-  });
-  document.getElementById("btn-empty-go-projects")?.addEventListener("click", () => {
-    void switchTab("projects");
+  mainPane.addEventListener("click", async (e) => {
+    const t = e.target as HTMLElement | null;
+    if (!t) return;
+
+    const copyBtn = t.closest<HTMLElement>("[data-copy-text]");
+    if (copyBtn) {
+      void copyToClipboard(copyBtn.dataset.copyText || "");
+      return;
+    }
+    const traceBtn = t.closest<HTMLElement>("[data-open-trace]");
+    if (traceBtn?.dataset.openTrace) {
+      await openTraceById(traceBtn.dataset.openTrace);
+      return;
+    }
+
+    const btn = t.closest<HTMLButtonElement>("button");
+    if (!btn) return;
+
+    if (btn.dataset.openIssue) {
+      const id = Number(btn.dataset.openIssue);
+      state.selectedIssue = state.issues.find((i) => i.id === id) || null;
+      const evRes = await apiFetch<IssueEventDetail>(orgUrl(`issues/${id}/events/latest/`));
+      state.selectedIssueEvent = evRes.ok ? evRes.data : null;
+      populateIssueDialog();
+      const dlg = document.getElementById("dlg-issue") as HTMLDialogElement | null;
+      if (dlg) openDialog(dlg);
+      return;
+    }
+    if (btn.dataset.pingMonitor) {
+      await mutateWithReauth(
+        orgUrl(`heartbeat_check/${encodeURIComponent(btn.dataset.pingMonitor)}/`),
+        { method: "POST", body: {} },
+        "Heartbeat recorded (UP)",
+        { failMsg: "Ping failed" }
+      );
+      return;
+    }
+    if (btn.dataset.delMonitor) {
+      await mutateWithReauth(
+        orgUrl(`monitors/${encodeURIComponent(btn.dataset.delMonitor)}/`),
+        { method: "DELETE" },
+        "Monitor deleted",
+        { failMsg: "Failed deleting monitor" }
+      );
+      return;
+    }
+    if (btn.dataset.testAlert) {
+      const res = await apiFetch(
+        orgUrl(`alerts/${encodeURIComponent(btn.dataset.testAlert)}/test/`),
+        { method: "POST", body: {} }
+      );
+      showToast(res.ok ? "Test alert dispatched" : res.error || "Alert dispatch failed");
+      return;
+    }
+    if (btn.dataset.delAlert) {
+      await mutateWithReauth(
+        orgUrl(`alerts/${encodeURIComponent(btn.dataset.delAlert)}/`),
+        { method: "DELETE" },
+        "Alert rule deleted",
+        { failMsg: "Failed deleting alert rule" }
+      );
+      return;
+    }
+    if (btn.dataset.enableTunnel) {
+      await mutateWithReauth(
+        `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(btn.dataset.enableTunnel)}/tunnel/`,
+        { method: "POST", body: {} },
+        "Anti-AdBlock tunnel enabled",
+        { failMsg: "Tunnel update failed" }
+      );
+      return;
+    }
+    if (btn.dataset.openProjSettings) {
+      openProjectSettingsDialog(Number(btn.dataset.openProjSettings));
+      return;
+    }
+    if (btn.dataset.connectApp) {
+      await openConnectAppModal(Number(btn.dataset.connectApp));
+      return;
+    }
+    if (btn.dataset.openProjKeys) {
+      await openProjectKeysDialog(Number(btn.dataset.openProjKeys));
+      return;
+    }
+    if (btn.dataset.delMember) {
+      await mutateWithReauth(
+        orgUrl(`members/${Number(btn.dataset.delMember)}/`),
+        { method: "DELETE" },
+        "Member removed",
+        { failMsg: "Failed removing member" }
+      );
+      return;
+    }
+    if (btn.dataset.delInvite) {
+      await mutateWithReauth(
+        orgUrl(`invitations/${encodeURIComponent(btn.dataset.delInvite)}/`),
+        { method: "DELETE" },
+        "Invitation revoked",
+        { failMsg: "Failed revoking invitation" }
+      );
+      return;
+    }
+    if (btn.dataset.delToken) {
+      await mutateWithReauth(
+        `/api/0/api-tokens/${encodeURIComponent(btn.dataset.delToken)}/`,
+        { method: "DELETE" },
+        "API token revoked",
+        { failMsg: "Token revoke failed" }
+      );
+      return;
+    }
+    if (btn.dataset.shieldSubtab) {
+      state.shieldSubTab = (btn.dataset.shieldSubtab as ShieldSubTab) || "anti-rea";
+      await loadCurrentTabData();
+      renderMainPane();
+      return;
+    }
+    if (btn.dataset.delPasskey) {
+      await mutateWithReauth(
+        `/api/auth/passkeys/${Number(btn.dataset.delPasskey)}`,
+        { method: "DELETE" },
+        "Passkey removed",
+        { failMsg: "Failed removing Passkey", refreshSelfCheck: true }
+      );
+      return;
+    }
+    if (btn.dataset.revokeSession) {
+      await mutateWithReauth(
+        `/api/auth/sessions/${Number(btn.dataset.revokeSession)}`,
+        { method: "DELETE" },
+        "Session revoked",
+        { failMsg: "Failed revoking session" }
+      );
+      return;
+    }
+    if (btn.dataset.delQuarantine) {
+      await mutateWithReauth(
+        orgUrl(`shield/quarantine/${Number(btn.dataset.delQuarantine)}/`),
+        { method: "DELETE" },
+        "Quarantine released",
+        { failMsg: "Failed releasing quarantine" }
+      );
+      return;
+    }
+
+    switch (btn.id) {
+      case "btn-empty-connect-app":
+        await openConnectAppModal(state.projects[0]?.id);
+        break;
+      case "btn-empty-go-projects":
+        await switchTab("projects");
+        break;
+      case "btn-refresh-issues": {
+        const inp = document.getElementById("issue-search-input") as HTMLInputElement | null;
+        if (inp) state.issueSearch = inp.value;
+        await fetchIssuesPage(false);
+        renderMainPane();
+        break;
+      }
+      case "btn-load-more-issues":
+        await fetchIssuesPage(true);
+        renderMainPane();
+        break;
+      case "btn-open-issue-filters": {
+        const sel = document.getElementById("filter-status-sel") as HTMLSelectElement | null;
+        if (sel) sel.value = state.issueFilterStatus;
+        const dlg = document.getElementById("dlg-filters") as HTMLDialogElement | null;
+        if (dlg) openDialog(dlg);
+        break;
+      }
+      case "btn-toggle-live":
+        toggleLiveTail();
+        break;
+      case "btn-search-logs": {
+        const inp = document.getElementById("log-search-input") as HTMLInputElement | null;
+        const sel = document.getElementById("log-level-select") as HTMLSelectElement | null;
+        if (inp) state.logSearch = inp.value;
+        if (sel) state.logLevelFilter = sel.value;
+        if (state.liveTailOn) {
+          stopLiveTail();
+          state.liveEntries = [];
+          toggleLiveTail();
+        } else {
+          await fetchLogsPage(false);
+          renderMainPane();
+        }
+        break;
+      }
+      case "btn-load-more-logs":
+        await fetchLogsPage(true);
+        renderMainPane();
+        break;
+      case "btn-refresh-perf":
+        await loadCurrentTabData();
+        renderMainPane();
+        break;
+      case "btn-new-monitor":
+        openCreateDialog("monitor");
+        break;
+      case "btn-new-alert":
+        openCreateDialog("alert");
+        break;
+      case "btn-new-project":
+        openCreateDialog("project");
+        break;
+      case "btn-add-member":
+        openCreateDialog("member");
+        break;
+      case "btn-create-invite-link":
+        openCreateDialog("invite");
+        break;
+      case "btn-create-token":
+        openCreateDialog("token");
+        break;
+      case "btn-refresh-selfcheck":
+        await refreshSelfCheck();
+        showToast("Diagnostics refreshed");
+        syncSelfCheckSlots();
+        break;
+      case "btn-run-self-probe": {
+        state.probeRunning = true;
+        renderMainPane();
+        const res = await apiFetch<SelfProbeResult>(orgUrl("self-check/probe/"), {
+          method: "POST",
+          body: { send_test_log: true }
+        });
+        state.probeRunning = false;
+        if (res.ok && res.data) {
+          state.lastProbe = res.data;
+          state.selfCheck = res.data.report;
+          showToast(res.data.ok ? "E2E self-test passed" : "E2E self-test reported failures");
+        } else {
+          showToast(res.error || "Failed running E2E self-test");
+        }
+        syncSelfCheckSlots();
+        break;
+      }
+      case "btn-ack-selfcheck": {
+        state.localSelfErrors = [];
+        const res = await apiFetch<SelfCheckReport>(orgUrl("self-check/ack/"), {
+          method: "POST",
+          body: { clear: true }
+        });
+        if (res.ok && res.data) {
+          state.selfCheck = res.data;
+          showToast("Internal errors acknowledged & cleared");
+        } else {
+          showToast(res.error || "Failed clearing internal errors");
+        }
+        syncSelfCheckSlots();
+        break;
+      }
+      case "btn-refresh-shield":
+        await loadCurrentTabData();
+        renderMainPane();
+        showToast("Security status refreshed");
+        break;
+      case "btn-totp-enroll": {
+        const res = await apiFetch<{ secret_b32: string; otpauth_uri: string; qr_svg: string }>(
+          "/api/auth/mfa/totp/enroll",
+          { method: "POST", body: {} }
+        );
+        if (!res.ok || !res.data) {
+          showToast(res.error || "Failed generating 2FA QR code");
+          return;
+        }
+        state.totpEnrollData = res.data;
+        state.recoveryCodes = null;
+        renderMainPane();
+        break;
+      }
+      case "btn-totp-disable":
+        await mutateWithReauth("/api/auth/mfa/totp/disable", { method: "POST", body: {} }, "2FA disabled", {
+          failMsg: "Failed disabling 2FA",
+          refreshSelfCheck: true,
+          onSuccess: () => {
+            state.recoveryCodes = null;
+          }
+        });
+        break;
+      case "btn-regen-recovery":
+        await mutateWithReauth<{ recovery_codes: string[] }>(
+          "/api/auth/mfa/recovery/regenerate",
+          { method: "POST", body: {} },
+          "New recovery codes generated",
+          {
+            failMsg: "Failed regenerating recovery codes",
+            onSuccess: (data) => {
+              if (data?.recovery_codes) state.recoveryCodes = data.recovery_codes;
+            }
+          }
+        );
+        break;
+      case "btn-revoke-other-sessions":
+        await mutateWithReauth(
+          "/api/auth/sessions/revoke-others",
+          { method: "POST", body: {} },
+          "Other sessions revoked",
+          { failMsg: "Failed revoking sessions" }
+        );
+        break;
+      case "btn-verify-audit": {
+        const res = await apiFetch<AuditVerifyResult>(orgUrl("audit-logs/verify/"));
+        if (res.ok && res.data) {
+          state.auditVerify = res.data;
+          renderMainPane();
+          showToast(res.data.valid ? "SHA-256 chain valid & intact" : "Tampering detected in audit trail!");
+        } else {
+          showToast(res.error || "Failed verifying integrity");
+        }
+        break;
+      }
+      case "btn-shield-settings": {
+        const pid = state.shieldProjectFilter ?? state.projects[0]?.id;
+        if (pid) openProjectSettingsDialog(pid);
+        break;
+      }
+    }
   });
 
-  document.getElementById("btn-refresh-issues")?.addEventListener("click", async () => {
-    const inp = document.getElementById("issue-search-input") as HTMLInputElement | null;
-    if (inp) state.issueSearch = inp.value;
-    await fetchIssuesPage(false);
-    renderMainPane();
+  mainPane.addEventListener("change", async (e) => {
+    const el = e.target as HTMLSelectElement | null;
+    if (!el) return;
+    if (el.id === "issue-sort-select") {
+      state.issueSort = (el.value as "date" | "freq" | "new") || "date";
+      await fetchIssuesPage(false);
+      renderMainPane();
+    } else if (el.id === "shield-project-filter") {
+      state.shieldProjectFilter = el.value ? Number(el.value) : null;
+      await loadCurrentTabData();
+      renderMainPane();
+    } else if (el.dataset.memberRole) {
+      const uid = Number(el.dataset.memberRole);
+      await mutateWithReauth<MemberItem>(
+        orgUrl(`members/${uid}/`),
+        { method: "PUT", body: { role: el.value } },
+        "Member role updated",
+        {
+          failMsg: "Failed updating member role",
+          onFailure: async () => {
+            await loadCurrentTabData();
+            renderMainPane();
+          }
+        }
+      );
+    }
   });
 
-  document.getElementById("issue-search-input")?.addEventListener("keydown", async (e) => {
-    if (e.key === "Enter") {
-      state.issueSearch = (e.target as HTMLInputElement).value;
+  mainPane.addEventListener("keydown", async (e) => {
+    const el = e.target as HTMLInputElement | null;
+    if (el?.id === "issue-search-input" && e.key === "Enter") {
+      state.issueSearch = el.value;
       await fetchIssuesPage(false);
       renderMainPane();
     }
   });
 
-  const issueSortSel = document.getElementById("issue-sort-select") as HTMLSelectElement | null;
-  issueSortSel?.addEventListener("change", async () => {
-    state.issueSort = (issueSortSel.value as "date" | "freq" | "new") || "date";
-    await fetchIssuesPage(false);
-    renderMainPane();
-  });
-
-  document.getElementById("btn-load-more-issues")?.addEventListener("click", async () => {
-    await fetchIssuesPage(true);
-    renderMainPane();
-  });
-
-  document.getElementById("btn-open-issue-filters")?.addEventListener("click", () => {
-    const sel = document.getElementById("filter-status-sel") as HTMLSelectElement | null;
-    if (sel) sel.value = state.issueFilterStatus;
-    const dlg = document.getElementById("dlg-filters") as HTMLDialogElement | null;
-    if (dlg) openDialog(dlg);
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-open-issue]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = Number(btn.dataset.openIssue);
-      state.selectedIssue = state.issues.find((i) => i.id === id) || null;
-      const evRes = await apiFetch<IssueEventDetail>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/issues/${id}/events/latest/`
-      );
-      state.selectedIssueEvent = evRes.ok ? evRes.data : null;
-      populateIssueDialog();
-      const dlg = document.getElementById("dlg-issue") as HTMLDialogElement | null;
-      if (dlg) openDialog(dlg);
-    });
-  });
-
-  // Logs tab handlers
-  document.getElementById("btn-toggle-live")?.addEventListener("click", toggleLiveTail);
-
-  document.getElementById("btn-search-logs")?.addEventListener("click", async () => {
-    const inp = document.getElementById("log-search-input") as HTMLInputElement | null;
-    const sel = document.getElementById("log-level-select") as HTMLSelectElement | null;
-    if (inp) state.logSearch = inp.value;
-    if (sel) state.logLevelFilter = sel.value;
-    if (state.liveTailOn) {
-      stopLiveTail();
-      state.liveEntries = [];
-      toggleLiveTail();
-    } else {
-      await fetchLogsPage(false);
-      renderMainPane();
-    }
-  });
-
-  document.getElementById("btn-load-more-logs")?.addEventListener("click", async () => {
-    await fetchLogsPage(true);
-    renderMainPane();
-  });
-
-  // Perf tab handlers
-  document.getElementById("btn-refresh-perf")?.addEventListener("click", async () => {
-    await loadCurrentTabData();
-    renderMainPane();
-  });
-
-  // Uptime & Alerts tab handlers
-  document.getElementById("btn-new-monitor")?.addEventListener("click", () => openCreateDialog("monitor"));
-  document.getElementById("btn-new-alert")?.addEventListener("click", () => openCreateDialog("alert"));
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-ping-monitor]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const uuid = btn.dataset.pingMonitor!;
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/heartbeat_check/${encodeURIComponent(uuid)}/`,
-        { method: "POST", body: {} }
-      );
-      showToast(res.ok ? "Heartbeat recorded (UP)" : res.error || "Ping failed");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-monitor]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.delMonitor!;
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/monitors/${encodeURIComponent(id)}/`,
-        { method: "DELETE" }
-      );
-      if (!res.ok) {
-        showToast(res.error || "Failed deleting monitor");
-        return;
-      }
-      showToast("Monitor deleted");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-test-alert]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.testAlert!;
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/${encodeURIComponent(id)}/test/`,
-        { method: "POST", body: {} }
-      );
-      showToast(res.ok ? "Test alert dispatched" : res.error || "Alert dispatch failed");
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-alert]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.delAlert!;
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/alerts/${encodeURIComponent(id)}/`,
-        { method: "DELETE" }
-      );
-      if (!res.ok) {
-        showToast(res.error || "Failed deleting alert rule");
-        return;
-      }
-      showToast("Alert rule deleted");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  // Projects, Members, Invitations & API Tokens handlers
-  document.getElementById("btn-new-project")?.addEventListener("click", () => openCreateDialog("project"));
-  document.getElementById("btn-add-member")?.addEventListener("click", () => openCreateDialog("member"));
-  document.getElementById("btn-create-invite-link")?.addEventListener("click", () => openCreateDialog("invite"));
-  document.getElementById("btn-create-token")?.addEventListener("click", () => openCreateDialog("token"));
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-enable-tunnel]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const slug = btn.dataset.enableTunnel!;
-      const res = await apiFetch(
-        `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(slug)}/tunnel/`,
-        { method: "POST", body: {} }
-      );
-      showToast(res.ok ? "Anti-AdBlock tunnel enabled" : res.error || "Tunnel update failed");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-open-proj-settings]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      openProjectSettingsDialog(Number(btn.dataset.openProjSettings));
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-connect-app]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      void openConnectAppModal(Number(btn.dataset.connectApp));
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-open-proj-keys]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      void openProjectKeysDialog(Number(btn.dataset.openProjKeys));
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLSelectElement>("[data-member-role]").forEach((sel) => {
-    sel.addEventListener("change", async () => {
-      const uid = Number(sel.dataset.memberRole);
-      const role = sel.value;
-      const sendRole = async () => {
-        const res = await apiFetch<MemberItem>(
-          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
-          { method: "PUT", body: { role } }
-        );
-        if (res.reauth_required) {
-          openReauthDialog(sendRole);
-          return;
-        }
-        if (!res.ok) {
-          showToast(res.error || "Failed updating member role");
-          await loadCurrentTabData();
-          renderMainPane();
-          return;
-        }
-        showToast("Member role updated");
-        await loadCurrentTabData();
-        renderMainPane();
-      };
-      await sendRole();
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-member]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const uid = Number(btn.dataset.delMember);
-      const sendDel = async () => {
-        const res = await apiFetch(
-          `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/members/${uid}/`,
-          { method: "DELETE" }
-        );
-        if (res.reauth_required) {
-          openReauthDialog(sendDel);
-          return;
-        }
-        if (!res.ok) {
-          showToast(res.error || "Failed removing member");
-          return;
-        }
-        showToast("Member removed");
-        await loadCurrentTabData();
-        renderMainPane();
-      };
-      await sendDel();
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-invite]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.delInvite!;
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/invitations/${encodeURIComponent(id)}/`,
-        { method: "DELETE" }
-      );
-      showToast(res.ok ? "Invitation revoked" : res.error || "Failed revoking invitation");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-token]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.delToken!;
-      const res = await apiFetch(`/api/0/api-tokens/${encodeURIComponent(id)}/`, { method: "DELETE" });
-      showToast(res.ok ? "API token revoked" : res.error || "Token revoke failed");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  // Auto-Check tab handlers
-  document.getElementById("btn-refresh-selfcheck")?.addEventListener("click", async () => {
-    await refreshSelfCheck();
-    showToast("Diagnostics refreshed");
-    syncSelfCheckSlots();
-  });
-
-  document.getElementById("btn-run-self-probe")?.addEventListener("click", async () => {
-    state.probeRunning = true;
-    renderMainPane();
-    const res = await apiFetch<SelfProbeResult>(
-      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/probe/`,
-      { method: "POST", body: { send_test_log: true } }
-    );
-    state.probeRunning = false;
-    if (res.ok && res.data) {
-      state.lastProbe = res.data;
-      state.selfCheck = res.data.report;
-      showToast(res.data.ok ? "E2E self-test passed" : "E2E self-test reported failures");
-    } else {
-      showToast(res.error || "Failed running E2E self-test");
-    }
-    syncSelfCheckSlots();
-  });
-
-  document.getElementById("btn-ack-selfcheck")?.addEventListener("click", async () => {
-    state.localSelfErrors = [];
-    const res = await apiFetch<SelfCheckReport>(
-      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/self-check/ack/`,
-      { method: "POST", body: { clear: true } }
-    );
-    if (res.ok && res.data) {
-      state.selfCheck = res.data;
-      showToast("Internal errors acknowledged & cleared");
-    } else {
-      showToast(res.error || "Failed clearing internal errors");
-    }
-    syncSelfCheckSlots();
-  });
-
-  // Security Shield, MFA & Audit sub-tabs handlers
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-shield-subtab]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      state.shieldSubTab = (btn.dataset.shieldSubtab as ShieldSubTab) || "anti-rea";
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  document.getElementById("btn-refresh-shield")?.addEventListener("click", async () => {
-    await loadCurrentTabData();
-    renderMainPane();
-    showToast("Security status refreshed");
-  });
-
-  document.getElementById("btn-totp-enroll")?.addEventListener("click", async () => {
-    const res = await apiFetch<{ secret_b32: string; otpauth_uri: string; qr_svg: string }>(
-      "/api/auth/mfa/totp/enroll",
-      { method: "POST", body: {} }
-    );
-    if (!res.ok || !res.data) {
-      showToast(res.error || "Failed generating 2FA QR code");
-      return;
-    }
-    state.totpEnrollData = res.data;
-    state.recoveryCodes = null;
-    renderMainPane();
-  });
-
-  const totpConfirmForm = document.getElementById("totp-confirm-form") as HTMLFormElement | null;
-  totpConfirmForm?.addEventListener("submit", async (e) => {
+  mainPane.addEventListener("submit", async (e) => {
+    const form = e.target as HTMLFormElement | null;
+    if (!form) return;
     e.preventDefault();
-    const code = (document.getElementById("totp-confirm-code") as HTMLInputElement | null)?.value || "";
-    const res = await apiFetch<{ ok: boolean; recovery_codes: string[] }>(
-      "/api/auth/mfa/totp/confirm",
-      { method: "POST", body: { code } }
-    );
-    if (!res.ok || !res.data) {
-      showToast(res.error || "Invalid 2FA code");
-      return;
-    }
-    state.totpEnrollData = null;
-    state.recoveryCodes = res.data.recovery_codes;
-    showToast("2FA authentication enabled!");
-    await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
-    renderMainPane();
-  });
 
-  document.getElementById("btn-totp-disable")?.addEventListener("click", async () => {
-    const sendDisable = async () => {
-      const res = await apiFetch("/api/auth/mfa/totp/disable", { method: "POST", body: {} });
-      if (res.reauth_required) {
-        openReauthDialog(sendDisable);
-        return;
-      }
-      if (!res.ok) {
-        showToast(res.error || "Failed disabling 2FA");
-        return;
-      }
-      state.recoveryCodes = null;
-      showToast("2FA disabled");
-      await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
-      renderMainPane();
-    };
-    await sendDisable();
-  });
-
-  document.getElementById("btn-regen-recovery")?.addEventListener("click", async () => {
-    const sendRegen = async () => {
-      const res = await apiFetch<{ recovery_codes: string[] }>(
-        "/api/auth/mfa/recovery/regenerate",
-        { method: "POST", body: {} }
+    if (form.id === "totp-confirm-form") {
+      const code = (document.getElementById("totp-confirm-code") as HTMLInputElement | null)?.value || "";
+      const res = await apiFetch<{ ok: boolean; recovery_codes: string[] }>(
+        "/api/auth/mfa/totp/confirm",
+        { method: "POST", body: { code } }
       );
-      if (res.reauth_required) {
-        openReauthDialog(sendRegen);
-        return;
-      }
       if (!res.ok || !res.data) {
-        showToast(res.error || "Failed regenerating recovery codes");
+        showToast(res.error || "Invalid 2FA code");
         return;
       }
+      state.totpEnrollData = null;
       state.recoveryCodes = res.data.recovery_codes;
-      showToast("New recovery codes generated");
-      await loadCurrentTabData();
-      renderMainPane();
-    };
-    await sendRegen();
-  });
-
-  const passkeyRegForm = document.getElementById("passkey-reg-form") as HTMLFormElement | null;
-  passkeyRegForm?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    if (!window.PublicKeyCredential || !navigator.credentials) {
-      showToast("WebAuthn Passkeys are not supported in this browser");
-      return;
-    }
-    const name = (document.getElementById("passkey-name-input") as HTMLInputElement | null)?.value?.trim() || "Security Passkey";
-    const begin = await apiFetch<any>("/api/auth/passkey/register/begin", { method: "POST", body: {} });
-    if (!begin.ok || !begin.data) {
-      showToast(begin.error || "Failed starting Passkey registration");
-      return;
-    }
-    try {
-      const o = begin.data;
-      const publicKey: PublicKeyCredentialCreationOptions = {
-        challenge: b64uToBuf(o.challenge),
-        rp: o.rp,
-        user: { ...o.user, id: b64uToBuf(o.user.id) },
-        pubKeyCredParams: o.pubKeyCredParams,
-        excludeCredentials: Array.isArray(o.excludeCredentials)
-          ? o.excludeCredentials.map((c: any) => ({ type: "public-key", id: b64uToBuf(c.id) }))
-          : [],
-        timeout: o.timeout || 120000,
-        authenticatorSelection: o.authenticatorSelection,
-        attestation: "none"
-      };
-      const cred = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
-      if (!cred) {
-        showToast("Passkey registration canceled");
-        return;
-      }
-      const resp = cred.response as AuthenticatorAttestationResponse;
-      const fin = await apiFetch("/api/auth/passkey/register/finish", {
-        method: "POST",
-        body: {
-          name,
-          clientDataJSON: bufToB64u(resp.clientDataJSON),
-          attestationObject: bufToB64u(resp.attestationObject)
-        }
-      });
-      if (!fin.ok) {
-        showToast(fin.error || "Failed saving Passkey");
-        return;
-      }
-      showToast("Passkey registered!");
+      showToast("2FA authentication enabled!");
       await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
       renderMainPane();
-    } catch (err: any) {
-      showToast(err?.message ? String(err.message) : "Error registering Passkey");
-    }
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-passkey]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = Number(btn.dataset.delPasskey);
-      const sendDel = async () => {
-        const res = await apiFetch(`/api/auth/passkeys/${id}`, { method: "DELETE" });
-        if (res.reauth_required) {
-          openReauthDialog(sendDel);
+    } else if (form.id === "passkey-reg-form") {
+      if (!window.PublicKeyCredential || !navigator.credentials) {
+        showToast("WebAuthn Passkeys are not supported in this browser");
+        return;
+      }
+      const name =
+        (document.getElementById("passkey-name-input") as HTMLInputElement | null)?.value?.trim() ||
+        "Security Passkey";
+      const begin = await apiFetch<any>("/api/auth/passkey/register/begin", { method: "POST", body: {} });
+      if (!begin.ok || !begin.data) {
+        showToast(begin.error || "Failed starting Passkey registration");
+        return;
+      }
+      try {
+        const o = begin.data;
+        const publicKey: PublicKeyCredentialCreationOptions = {
+          challenge: b64uToBuf(o.challenge),
+          rp: o.rp,
+          user: { ...o.user, id: b64uToBuf(o.user.id) },
+          pubKeyCredParams: o.pubKeyCredParams,
+          excludeCredentials: Array.isArray(o.excludeCredentials)
+            ? o.excludeCredentials.map((c: any) => ({ type: "public-key", id: b64uToBuf(c.id) }))
+            : [],
+          timeout: o.timeout || 120000,
+          authenticatorSelection: o.authenticatorSelection,
+          attestation: "none"
+        };
+        const cred = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
+        if (!cred) {
+          showToast("Passkey registration canceled");
           return;
         }
-        showToast(res.ok ? "Passkey removed" : res.error || "Failed removing Passkey");
+        const resp = cred.response as AuthenticatorAttestationResponse;
+        const fin = await apiFetch("/api/auth/passkey/register/finish", {
+          method: "POST",
+          body: {
+            name,
+            clientDataJSON: bufToB64u(resp.clientDataJSON),
+            attestationObject: bufToB64u(resp.attestationObject)
+          }
+        });
+        if (!fin.ok) {
+          showToast(fin.error || "Failed saving Passkey");
+          return;
+        }
+        showToast("Passkey registered!");
         await Promise.all([loadCurrentTabData(), refreshSelfCheck()]);
         renderMainPane();
-      };
-      await sendDel();
-    });
-  });
-
-  const pwChangeForm = document.getElementById("pw-change-form") as HTMLFormElement | null;
-  pwChangeForm?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const fd = new FormData(pwChangeForm);
-    const res = await apiFetch<{ ok: boolean; csrf_token?: string }>("/api/auth/password/change", {
-      method: "POST",
-      body: Object.fromEntries(fd.entries())
-    });
-    if (!res.ok) {
-      showToast(res.error || "Failed updating password");
-      return;
-    }
-    if (res.data?.csrf_token) setCsrfToken(res.data.csrf_token);
-    pwChangeForm.reset();
-    showToast("Password changed and other sessions revoked");
-    await loadCurrentTabData();
-    renderMainPane();
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-revoke-session]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = Number(btn.dataset.revokeSession);
-      const res = await apiFetch(`/api/auth/sessions/${id}`, { method: "DELETE" });
-      showToast(res.ok ? "Session revoked" : res.error || "Failed revoking session");
-      await loadCurrentTabData();
-      renderMainPane();
-    });
-  });
-
-  document.getElementById("btn-revoke-other-sessions")?.addEventListener("click", async () => {
-    const res = await apiFetch("/api/auth/sessions/revoke-others", { method: "POST", body: {} });
-    showToast(res.ok ? "Other sessions revoked" : res.error || "Failed revoking sessions");
-    await loadCurrentTabData();
-    renderMainPane();
-  });
-
-  const orgSecForm = document.getElementById("org-sec-form") as HTMLFormElement | null;
-  orgSecForm?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const payload: OrgSecuritySettings = {
-      scrub_ip_addresses: (document.getElementById("org-sec-ip") as HTMLInputElement | null)?.checked ?? false,
-      require_mfa_for_admins: (document.getElementById("org-sec-mfa") as HTMLInputElement | null)?.checked ?? false,
-      event_throttle_rate: Math.min(
-        100,
-        Math.max(0, Number((document.getElementById("org-sec-throttle") as HTMLInputElement | null)?.value || 0))
-      )
-    };
-    const sendSave = async () => {
-      const res = await apiFetch<OrgSecuritySettings>(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/security-settings/`,
-        { method: "PUT", body: payload }
-      );
-      if (res.reauth_required) {
-        openReauthDialog(sendSave);
-        return;
+      } catch (err: any) {
+        showToast(err?.message ? String(err.message) : "Error registering Passkey");
       }
-      if (!res.ok || !res.data) {
-        showToast(res.error || "Failed saving organization policies");
-        return;
-      }
-      state.orgSecurity = res.data;
-      showToast("Security policies saved");
-      await loadCurrentTabData();
-      renderMainPane();
-    };
-    await sendSave();
-  });
-
-  document.getElementById("btn-verify-audit")?.addEventListener("click", async () => {
-    const res = await apiFetch<AuditVerifyResult>(
-      `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/audit-logs/verify/`
-    );
-    if (res.ok && res.data) {
-      state.auditVerify = res.data;
-      renderMainPane();
-      showToast(res.data.valid ? "SHA-256 chain valid & intact" : "Tampering detected in audit trail!");
-    } else {
-      showToast(res.error || "Failed verifying integrity");
-    }
-  });
-
-  document.getElementById("btn-shield-settings")?.addEventListener("click", () => {
-    const pid = state.shieldProjectFilter ?? state.projects[0]?.id;
-    if (pid) openProjectSettingsDialog(pid);
-  });
-
-  const shProjSel = document.getElementById("shield-project-filter") as HTMLSelectElement | null;
-  shProjSel?.addEventListener("change", async () => {
-    state.shieldProjectFilter = shProjSel.value ? Number(shProjSel.value) : null;
-    await loadCurrentTabData();
-    renderMainPane();
-  });
-
-  mainPane.querySelectorAll<HTMLButtonElement>("[data-del-quarantine]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const id = Number(btn.dataset.delQuarantine);
-      const res = await apiFetch(
-        `/api/0/organizations/${encodeURIComponent(state.orgSlug)}/shield/quarantine/${id}/`,
-        { method: "DELETE" }
-      );
+    } else if (form.id === "pw-change-form") {
+      const fd = new FormData(form);
+      const res = await apiFetch<{ ok: boolean; csrf_token?: string }>("/api/auth/password/change", {
+        method: "POST",
+        body: Object.fromEntries(fd.entries())
+      });
       if (!res.ok) {
-        showToast(res.error || "Failed releasing quarantine");
+        showToast(res.error || "Failed updating password");
         return;
       }
-      showToast("Quarantine released");
+      if (res.data?.csrf_token) setCsrfToken(res.data.csrf_token);
+      form.reset();
+      showToast("Password changed and other sessions revoked");
       await loadCurrentTabData();
       renderMainPane();
-    });
+    } else if (form.id === "org-sec-form") {
+      const payload: OrgSecuritySettings = {
+        scrub_ip_addresses: (document.getElementById("org-sec-ip") as HTMLInputElement | null)?.checked ?? false,
+        require_mfa_for_admins: (document.getElementById("org-sec-mfa") as HTMLInputElement | null)?.checked ?? false,
+        event_throttle_rate: Math.min(
+          100,
+          Math.max(0, Number((document.getElementById("org-sec-throttle") as HTMLInputElement | null)?.value || 0))
+        )
+      };
+      await mutateWithReauth<OrgSecuritySettings>(
+        orgUrl("security-settings/"),
+        { method: "PUT", body: payload },
+        "Security policies saved",
+        {
+          failMsg: "Failed saving organization policies",
+          onSuccess: (data) => {
+            if (data) state.orgSecurity = data;
+          }
+        }
+      );
+    }
   });
 }
 
@@ -3939,7 +3834,6 @@ function openProjectSettingsDialog(projectId: number): void {
   const bodyEl = document.getElementById("dlg-proj-settings-body");
   if (!proj || !dlg || !titleEl || !bodyEl) return;
 
-  state.activeProjectModalId = proj.id;
   const f = proj.filters;
   const sh: ShieldPolicy = f.shield || {
     enabled: true,
@@ -4138,16 +4032,8 @@ function renderProjectKeysDialogBody(proj: Project): void {
         </label>
         <button type="submit">Create DSN Key</button>
       </form>
-      <div tabindex="0" role="region" aria-labelledby="pkeys-cap" class="table-wrapper">
-        <table class="data-table">
-          <caption id="pkeys-cap" class="hp-field">Project DSN Keys</caption>
-          <thead><tr><th>Label</th><th>Public Key</th><th>Limit/min</th><th>Active</th><th>Actions</th></tr></thead>
-          <tbody>${keyRows}</tbody>
-        </table>
-      </div>
+      ${renderDataTable("pkeys-cap", "Project DSN Keys", ["Label", "Public Key", "Limit/min", "Active", "Actions"], keyRows)}
     </div>`;
-
-  bindCopyButtons(bodyEl);
 
   bodyEl.querySelectorAll<HTMLButtonElement>("[data-save-proj-key]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -4218,7 +4104,6 @@ async function openProjectKeysDialog(projectId: number): Promise<void> {
   const titleEl = document.getElementById("dlg-proj-keys-title");
   if (!proj || !dlg || !titleEl) return;
 
-  state.activeProjectModalId = proj.id;
   titleEl.textContent = `DSN Keys — ${proj.name}`;
   const res = await apiFetch<ProjectKeyItem[]>(
     `/api/0/projects/${encodeURIComponent(state.orgSlug)}/${encodeURIComponent(proj.slug)}/keys/`
@@ -4561,7 +4446,7 @@ function openCreateDialog(kind: "project" | "monitor" | "alert" | "member" | "in
       const res = await apiFetch<any>(url, { method: "POST", body: raw });
       if (res.reauth_required) {
         dlg.close();
-        openReauthDialog(submitCreate);
+        openReauthDialog(submitCreate, res.code === "mfa_step_up_required");
         return;
       }
       if (!res.ok) {

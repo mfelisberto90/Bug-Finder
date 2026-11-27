@@ -17,8 +17,6 @@ enum CborVal {
     Int(i64),
     Bytes(Vec<u8>),
     Text(String),
-    #[allow(dead_code)]
-    Array(Vec<CborVal>),
     Map(Vec<(CborVal, CborVal)>),
     Simple,
 }
@@ -125,11 +123,10 @@ impl<'a> CborCursor<'a> {
                 if len > 64 {
                     return Err("CBOR array too large".into());
                 }
-                let mut arr = Vec::with_capacity(len);
                 for _ in 0..len {
-                    arr.push(self.decode(depth + 1)?);
+                    let _ = self.decode(depth + 1)?;
                 }
-                Ok(CborVal::Array(arr))
+                Ok(CborVal::Simple)
             }
             5 => {
                 let len = self.read_arg(ai)? as usize;

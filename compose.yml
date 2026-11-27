@@ -13,7 +13,7 @@ services:
       BUGFINDER_RETENTION_DAYS: "30"
     volumes:
       - bugfinder_data:/data
-    mem_limit: 64m
+    mem_limit: 128m
     pids_limit: 64
     read_only: true
     tmpfs:

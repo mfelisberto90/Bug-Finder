@@ -51,6 +51,19 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         false
     };
     let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
+    let is_discard = seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0;
+    let is_ietf_special = seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0;
+    let is_isatap_blocked = if (seg[4] & 0xfcff) == 0 && seg[5] == 0x5efe {
+        let embedded = Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            (seg[6] & 0xff) as u8,
+            (seg[7] >> 8) as u8,
+            (seg[7] & 0xff) as u8,
+        );
+        is_blocked_v4(embedded)
+    } else {
+        false
+    };
     ip.is_loopback()                  // ::1
         || ip.is_unspecified()        // ::
         || ip.is_multicast()
@@ -58,11 +71,30 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         || is_ipv4_compat
         || is_6to4_blocked
         || is_teredo
+        || is_discard
+        || is_ietf_special
+        || is_isatap_blocked
         || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
         || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 deprecated site-local
         || (seg[0..6] == [0, 0, 0, 0, 0xffff, 0]) // ::ffff:0:0:0/96 SIIT IPv4-translated
         || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+}
+
+fn is_allowed_webhook_port(port: u16, allow_http_dev: bool) -> bool {
+    if allow_http_dev {
+        return port > 0;
+    }
+    if matches!(port, 80 | 443 | 8080 | 8443) {
+        return true;
+    }
+    if let Ok(extra) = std::env::var("BUGFINDER_ALLOWED_WEBHOOK_PORTS") {
+        return extra
+            .split(',')
+            .filter_map(|p| p.trim().parse::<u16>().ok())
+            .any(|p| p == port);
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +155,12 @@ pub fn validate_webhook_url(raw: &str, allow_http_dev: bool) -> Result<Validated
         let p = if scheme == "https" { 443 } else { 80 };
         (authority.to_ascii_lowercase(), p)
     };
+
+    if !is_allowed_webhook_port(port, allow_http_dev) {
+        return Err(SsrfError(format!(
+            "Webhook port {port} is not allowed in production (allowed: 80, 443, 8080, 8443)"
+        )));
+    }
 
     let host_trimmed = host.trim_end_matches('.');
     if host_trimmed.is_empty()
