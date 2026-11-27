@@ -1,6 +1,6 @@
 # 1-Prompt Autonomous AI Integration & MCP Guide
 
-Bug-Finder v2.0 is designed so you can point any AI coding assistant (Claude Code, Antigravity, Cursor, Codex, Windsurf, Copilot) at your repository and wire **every tracking and protection endpoint in a single prompt**.
+Bug-Finder v2.1 is designed so you can point any AI coding assistant (Claude Code, Antigravity, Cursor, Codex, Windsurf, Copilot) at your repository and wire **every tracking and protection endpoint in a single prompt**.
 
 ## 1. Public Agent Discovery (`GET /llms.txt`)
 
