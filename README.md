@@ -1,91 +1,120 @@
 # Bug-Finder
 
-[![Rust](https://img.shields.io/badge/Rust-Axum%20%2B%20Tokio-000000?logo=rust)](Cargo.toml)
-[![Memory](https://img.shields.io/badge/VmRSS-~8--11%20MB-16a34a)](#measured-benchmarks-empirical-single-host-comparison)
-[![Binary](https://img.shields.io/badge/Single%20Binary-~6.5%20MB-2563eb)](#quickstart)
-[![Telemetry](https://img.shields.io/badge/Protocols-Sentry%20%7C%20GlitchTip%20%7C%20OTLP-7c3aed)](#connect-any-app-with-1-ai-prompt)
-[![Security](https://img.shields.io/badge/Defense-SIMD%20WAF%20%2B%20Anti--REA%20%2B%20FORCE%20RLS-dc2626)](docs/ENDPOINTS_AND_SECURITY.md)
+[![Rust](https://img.shields.io/badge/Rust-Single%20Binary-000000?logo=rust)](Cargo.toml)
+[![Memory](https://img.shields.io/badge/RAM-~10%20MB%20VmRSS-16a34a)](#measured-benchmarks)
+[![Binary](https://img.shields.io/badge/Size-~6.5%20MB-2563eb)](#quickstart)
+[![CVEs](https://img.shields.io/badge/OSV%20CVEs-0%20Active-16a34a)](SECURITY.md)
+[![Protocols](https://img.shields.io/badge/Compatible-Sentry%20%7C%20GlitchTip%20%7C%20OTLP-7c3aed)](#connect-any-app-in-one-ai-prompt)
+[![Security](https://img.shields.io/badge/Defense-Edge%20WAF%20%2B%20PG17%20RLS%20%2B%20Passkeys-dc2626)](docs/ENDPOINTS_AND_SECURITY.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0d9488.svg)](LICENSE)
 
-**Pure-Rust, zero-Python observability and active runtime defense server** for error tracking, distributed tracing, structured logs, private SourceMaps, uptime heartbeats, and `< 1 µs` SIMD Layer-7 attack protection. Compiled into a single **~6.5 MB** executable running at **~8–11 MB VmRSS**, with drop-in compatibility for **Sentry SDKs**, **GlitchTip clients**, and **OpenTelemetry OTLP/HTTP**.
+**Self-hosted error tracking, live logs, uptime alerts, and built-in web attack protection in one tiny Rust binary.**
+
+Bug-Finder catches crashes across your frontend and backend, streams structured logs in real time, monitors cron jobs and APIs, and blocks common web attacks from a single **~6.5 MB** executable using **~10 MB of RAM**. It works as a drop-in backend for existing **Sentry**, **GlitchTip**, and **OpenTelemetry (OTLP)** SDKs, with zero Python, no Redis, and no background worker fleet to maintain.
 
 ![Bug-Finder Issues Inbox](docs/screenshots/issues-inbox.png)
 
-## Documentation Index
-
-- [Architecture & Performance Pipeline](docs/ARCHITECTURE.md): Adaptive sub-millisecond `BatchWriter`, `ShardedBoundedMap` (16 shards), SIMD `AhoCorasick` WAF and Scrubber, SQLite WAL `mmap` + `prepare_cached`, and PostgreSQL 17 `FORCE RLS`.
-- [1-Prompt Autonomous AI Integration](docs/AI_INTEGRATION.md): `/llms.txt`, `/api/0/projects/:org/:proj/ai-blueprint/`, `bugfinder ai-prompt`, same-origin `/_obs/*` stealth proxy routes, and STDIO MCP tools.
-- [Endpoints & End-to-End Security](docs/ENDPOINTS_AND_SECURITY.md): Complete endpoint map, browser pre-wire URL scrubbing, RFC 9113 multi-header parsing, CSP `style-src-attr 'none'`, immutable `audit_logs` triggers, and `v2` anti-replay webhooks.
-- [CLI & 7-Layer Verification Shell](docs/CLI_AND_CHECK_SHELL.md): Full CLI reference plus `bugfinder check` and `./scripts/check.sh`.
-
 ---
 
-## What Bug-Finder v2.1 Covers
+## What You Get Out of the Box
 
-1. **Sub-Millisecond Error Tracking & Private SourceMaps**: Adaptive `BatchWriter` (`0 ms` idle flush, `5 ms` burst coalesce, `16 MiB` bounded memory with per-item NUL-byte resilience), immediate `< 0.2 ms` live SSE stream with `watch::channel` graceful shutdown (`<= 5 s` drain), FTS5 search, deterministic grouping & regression detection, root-cause diagnosis (`diagnose_issue` with `<untrusted_error_telemetry>` prompt-injection isolation), third-party widget filtering, and streaming zero-DOM private SourceMap v3 VLQ demangling (`debug_id` + hashed bundle basename fallback + per-org quota + `bugfinder sourcemaps upload`).
-2. **Structured Logs, OpenTelemetry OTLP & Trace Correlation**: Ingest Sentry `log` v2 envelopes, OTLP/HTTP (`application/x-protobuf` and JSON on `/v1/logs`, plus `/v1/traces` and `/v1/metrics` `202` endpoints), direct JSON logs, or terminal streams (`bugfinder wrap` / `pipe`), correlated via `trace_id`/`span_id` and same-origin `traceparent` propagation.
-3. **1-Prompt Autonomous AI Integration**: Open **Connect App -> AI Auto-Setup (1-Prompt)** or run `bugfinder ai-prompt` (also published generically at `GET /llms.txt`) to generate one self-contained prompt containing every tracking, proxy, WAF, SourceMap, and MCP endpoint so your AI coding agent wires everything in one pass.
-4. **7-Layer Verification Shell (`bugfinder check` & `./scripts/check.sh`)**: Verify server health, CSP, `/llms.txt`, error/session dry-probe ingest, OTLP log dry-probe, Shield + `ETag` blocklist, app HTML SDK/SRI tags, SourceMap zero-leak, and Edge WAF blocking in `< 250 ms`.
-5. **Deterministic `< 1 µs` Rust SIMD Edge WAF & Secret Leak Radar**: Single-pass `AhoCorasick` URI/UA inspection with 2-pass stack percent decoding (`SQLi`, path traversal, AWS/GCP/Oracle/Alibaba cloud metadata IPv4/IPv6 SSRF including `fd00:ec2::254`, `XSS`, `Command Injection`, `JNDI/SSTI`, `Prototype Pollution`, root dotfiles, `.js.map` 404 blocking without CGNAT bans, WebDAV methods), CGNAT-safe `ShardedBoundedMap<[u8; 32], V, 16>` counters, and SIMD-prefiltered PII/credential scrubbing (`~15 ns` on clean strings) starting in the browser before transmission (`bugfinder-mini.js` preserves `Request` headers and exposes `window.__bfOrigFetch`).
-6. **Zero-Python Toolchain, Zero-CVE Supply Chain & Enterprise Cryptography**: Native `bugfinder lint` (`< 3 ms`, blocking `gitleaks:allow` and Python drift) and `bugfinder keygen` eliminate Python dependencies in dev and CI. Direct `sqlx-core` + `sqlx-postgres`, `rusqlite 0.43`, and `ruzstd 0.9.1` (with RFC 8878 `<= 8 MiB` frame window pre-check) keep the dependency graph at `239` crates with `0` active CVEs verified on every CI run via OSV.dev. Secrets use `100%` OS CSPRNG (`OsRng`) and `enc:v2:` AEAD (`HKDF-SHA256` + `AES-256-GCM`) with `BUGFINDER_PREVIOUS_APP_KEYS` rotation, backed by PostgreSQL 17 `ENABLE + FORCE ROW LEVEL SECURITY` across all `15` tables (including `users` and `login_attempts` under `NOBYPASSRLS`), append-only `audit_logs` triggers, TOTP 2FA, WebAuthn Passkeys with step-up re-authentication, and OIDC PKCE SSO (`(iss, sub)` binding + local MFA enforcement).
-
----
-
-## Measured Benchmarks (Empirical Single-Host Comparison)
-
-Sequential baseline measured on `Ubuntu 24.04 Linux x86_64` (12 threads, `postgres:17-alpine`) with a 1.53 KB Sentry envelope across 50 rotating fingerprints (3 frames, 5 breadcrumbs):
-
-| Metric | Bug-Finder (SQLite WAL) | Bug-Finder (PG17 `FORCE RLS`) | GlitchTip 7.0.0 (PG17, No-Valkey) |
-|---|---|---|---|
-| **Binary / Container Size** | **~6.5 MB single binary** | ~6.5 MB binary + PG | 953 MB app image + PG |
-| **Idle App RAM (`VmRSS`)** | **8.8 – 9.6 MiB** | **9.5 MiB** | 162.3 MiB |
-| **Total Stack RAM Post-Load (App + DB)** | **14.3 MiB** | **71.8 MiB** | 379.7 MiB |
-| **Cold Start to HTTP `200 /api/health`** | **18.7 – 21.0 ms** | **56.7 ms** (`SKIP_MIGRATIONS=1`) | 5,114 ms *(excl. 22.1 s init)* |
-| **Sequential Ingest (`100 x 1`)** | **907.9 req/s** (`p50 = 1.04 ms`) | **892.8 req/s** (`p50 = 1.12 ms`) | 203.9 req/s (`p50 = 4.88 ms`) |
-| **Burst Ingest (`1,000 x 16` threads)** | **2,248 – 2,421 req/s** (`p50 = 5.8 ms`) | **2,208.9 req/s** (`p50 = 6.08 ms`) | 517.5 req/s (`p50 = 29.14 ms`) |
-| **Issues List API Read (`200 x 8` threads)** | **2,020.3 req/s** (`p50 = 3.50 ms`) | **1,979.1 req/s** (`p50 = 3.62 ms`) | 9.7 req/s (`p50 = 725.5 ms`) |
-| **Lint Invariants Check** | **< 3 ms** (`bugfinder lint`, 0 Python) | **< 3 ms** (`bugfinder lint`) | External scripts |
-
-> **When to use GlitchTip vs Bug-Finder:** Choose **GlitchTip** for native C/C++/Rust minidump (`difs`) symbolication or S3/Parquet cold storage. Choose **Bug-Finder** for a **~10 MiB** single-binary runtime, **sub-25 ms** cold starts, strict PostgreSQL `FORCE RLS`, immutable audit logs, and built-in `< 1 µs` Rust SIMD Edge WAF without running Django, workers, or Redis/Valkey.
+- **Error Tracking & Private SourceMaps**: Group identical crashes automatically, detect regressions after deploys, view click/network breadcrumbs, and demangle minified JavaScript stack traces privately without exposing `.js.map` files to the public.
+- **Live Logs & Distributed Traces**: Search structured logs with full-text search (FTS5), watch live traffic via Server-Sent Events (SSE), ingest OpenTelemetry `/v1/logs`, `/v1/traces`, and `/v1/metrics`, or stream terminal output directly with `bugfinder wrap` and `bugfinder pipe`.
+- **Built-In Edge WAF & Security Shield**: Inspect incoming requests in under `1 us` with a Rust SIMD firewall that blocks SQL injection, path traversal, XSS, cloud metadata SSRF, command injection, and dotfile probes (`/.env`, `/.git`), plus automatic secret-leak detection and CGNAT-safe quarantine.
+- **Uptime Heartbeats & Multi-Channel Alerts**: Track scheduled jobs and health pings, and receive instant alerts on Slack, Discord, Telegram, Email (native TLS SMTP), or HMAC-signed Webhooks.
+- **1-Prompt AI Setup & Verification Shell**: Copy one auto-generated prompt from the dashboard or `bugfinder ai-prompt` (also published at `GET /llms.txt`) so your AI coding assistant wires every endpoint for you, then verify all 7 integration layers in `< 250 ms` with `bugfinder check`.
+- **Enterprise Security by Default**: Runs on embedded SQLite WAL or PostgreSQL 17 with `ENABLE + FORCE ROW LEVEL SECURITY` across all 15 tables, `enc:v2:` AES-256-GCM secret encryption with key rotation, TOTP 2FA, WebAuthn Passkeys with step-up re-auth, OIDC SSO, an immutable SHA-256 audit log, and `0` active CVEs verified on every CI run.
 
 ---
 
 ## Visual Tour
 
-### Stack Traces, Root-Cause Diagnosis & Correlated Traces
+### 1. Stack Traces, Source Context & Breadcrumbs
+Inspect demangled source lines, exact function frames, and the user clicks or failed API calls leading up to every crash.
+
 ![Issue Detail Stack Trace](docs/screenshots/issue-detail.png)
 
-### Structured Logs & Real-Time SSE Live Tail
+### 2. Structured Logs & Real-Time Live Tail
+Filter logs by severity, service, or full-text search, jump directly to correlated `trace_id` entries, or stream live events with SSE.
+
 ![Structured Logs & Live Tail](docs/screenshots/logs-live-tail.png)
 
-### Connect App Wizard & 1-Prompt AI Auto-Setup
+### 3. Uptime Heartbeats & Multi-Channel Alerts
+Monitor recurring workers and endpoints alongside alert rules for Slack, Discord, Telegram, SMTP email, and signed webhooks.
+
+![Uptime Heartbeats & Alerts](docs/screenshots/uptime-alerts.png)
+
+### 4. Guided App Connection & 1-Prompt AI Setup
+Copy a single CSP-compatible HTML script tag, run `bugfinder init`, or grab a complete AI auto-setup prompt with live connection verification.
+
 ![Connect App Wizard](docs/screenshots/connect-app-wizard.png)
 
-### Anti-REA Security Shield, Edge WAF & Secret Leak Radar
-![Anti-REA Shield & Active Quarantine](docs/screenshots/security-shield.png)
+### 5. Security Shield, Edge WAF & Secret Leak Radar
+Review blocked attacks, secret-leak alerts, and active CGNAT-safe quarantines with one-click release controls.
 
-### Immutable SHA-256 Audit Chain, 2FA (TOTP) & WebAuthn Passkeys
+![Security Shield & Active Quarantine](docs/screenshots/security-shield.png)
+
+### 6. Immutable Audit Log, 2FA & Passkeys
+Enforce organization-wide IP scrubbing and admin MFA policies backed by a tamper-evident SHA-256 hash-chained audit trail.
+
 ![Immutable Audit Log & Organization Policies](docs/screenshots/security-audit-chain.png)
 
-### Built-In Auto-Check & Self-Diagnostics
+### 7. Built-In Auto-Check & Self-Diagnostics
+Check storage health, disk budget, live RAM usage, ingestion queue depth, and end-to-end telemetry delivery directly from the UI.
+
 ![Auto-Check & Self-Diagnostics](docs/screenshots/auto-check-diagnostics.png)
+
+### 8. Responsive Mobile Dashboard
+Triage issues, check regressions, and monitor alerts from a phone with touch-friendly navigation.
+
+<img src="docs/screenshots/mobile-issues.png" alt="Mobile Issues Inbox" width="320" />
 
 ---
 
-## Connect Any App with 1 AI Prompt
+## Quickstart
 
-Bug-Finder publishes `GET /llms.txt` publicly (zero cookies) and `GET /api/0/projects/:org/:proj/ai-blueprint/` per project so an AI coding assistant can wire everything in one step:
+### Option 1: One-Command Installer (Linux Binary, `systemd`, or Docker)
 
 ```bash
-# 1. Print a complete, stack-aware 1-prompt brief pre-wired with every endpoint:
+./scripts/install.sh            # Installs ~/.local/bin/bugfinder + 0600 .env + runs doctor
+./scripts/install.sh --service  # Installs an auto-starting user systemd service
+./scripts/install.sh --docker   # Starts the hardened Docker Compose stack
+```
+
+### Option 2: Hardened Docker Compose (`128 MB` RAM Cap, Read-Only Rootfs)
+
+```bash
+docker compose up -d --build
+```
+
+`compose.yml` runs Bug-Finder with `mem_limit: 128m`, `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true`, and `pids_limit: 64`.
+
+### Option 3: Build from Source
+
+```bash
+./scripts/build-release.sh
+./target/release/bugfinder --headless --bind 127.0.0.1:8080 --data ./data
+```
+
+Replace `--headless` with `--app` to launch Bug-Finder as a local desktop window.
+
+---
+
+## Connect Any App in One AI Prompt
+
+Bug-Finder exposes `GET /llms.txt` publicly (zero cookies) and `GET /api/0/projects/:org/:proj/ai-blueprint/` per project so an AI coding assistant can wire your app end to end:
+
+```bash
+# 1. Generate a stack-aware setup prompt containing all endpoints for your project:
 bugfinder ai-prompt \
   --dsn "https://<PUBLIC_KEY>@bugs.example.com/1" \
   --app-url "https://app.example.com" \
   --dir .
 
-# 2. Let your AI assistant implement /_obs/* proxy, SDK/SRI tag, traceparent logs, Edge WAF, SourceMaps, and MCP.
+# 2. Paste the prompt into your AI assistant to configure the SDK, proxy routes,
+#    WAF blocklist sync, private SourceMaps, structured logs, and MCP server.
 
-# 3. Verify all 7 layers in one command (< 250 ms, zero phantom issues created):
+# 3. Verify all 7 integration and security layers in < 250 ms (creates zero test issues):
 bugfinder check \
   --dsn "https://<PUBLIC_KEY>@bugs.example.com/1" \
   --app-url "https://app.example.com"
@@ -94,12 +123,12 @@ bugfinder check \
 ./scripts/check.sh --app-url "https://app.example.com"
 ```
 
-### All Endpoints Covered Automatically
+### Endpoints Covered Automatically
 
 | Purpose | Method & Path | Notes |
 |---|---|---|
 | Health & AI Spec | `GET /api/health`, `GET /llms.txt` | Cookie-free, strict security headers |
-| Browser Mini-SDK | `GET /sdk/bugfinder-mini.js` | Pre-wire URL fragment/secret scrubbing, `visibilitychange` flush, optional same-origin `traceparent` |
+| Browser Mini-SDK | `GET /sdk/bugfinder-mini.js` | Pre-wire URL secret scrubbing, `Request` header cloning, optional same-origin `traceparent` |
 | Anti-REA Shield SDK | `GET /sdk/bugfinder-shield.js` | CDP/WebDriver/tamper detection (`detect` / `defend` / `lockdown`) |
 | Error & Session Ingest | `POST /api/:id/envelope/`, `POST /api/:id/store/` | Supports `X-BugFinder-Check: dry-probe` and timestamp skew clamping |
 | Anti-AdBlock Tunnel | `POST /t/:slug` | Reverse-proxied via `/_obs/e` on the monitored app |
@@ -110,32 +139,32 @@ bugfinder check \
 
 ---
 
-## Quickstart
+## Measured Benchmarks
 
-### 1. One-Command Installer (Binary, `systemd --user`, or Docker)
+Measured on a single `Ubuntu 24.04 Linux x86_64` host (12 threads, `postgres:17-alpine`) using a 1.53 KB Sentry envelope across 50 rotating fingerprints (3 stack frames, 5 breadcrumbs):
 
-```bash
-./scripts/install.sh            # Binary (~/.local/bin/bugfinder) + 0600 .env + bugfinder doctor
-./scripts/install.sh --service  # Auto-starting user systemd unit (64 MB RAM cap)
-./scripts/install.sh --docker   # Hardened Docker Compose deployment
-```
+| Metric | Bug-Finder (SQLite WAL) | Bug-Finder (PG17 `FORCE RLS`) | GlitchTip 7.0.0 (PG17, No-Valkey) |
+|---|---|---|---|
+| **Binary / Container Size** | **~6.5 MB single binary** | ~6.5 MB binary + PG | 953 MB app image + PG |
+| **Idle App RAM (`VmRSS`)** | **8.8 – 9.6 MiB** | **9.5 MiB** | 162.3 MiB |
+| **Total Stack RAM Post-Load (App + DB)** | **14.3 MiB** | **71.8 MiB** | 379.7 MiB |
+| **Cold Start to HTTP `200 /api/health`** | **18.7 – 21.0 ms** | **56.7 ms** (`SKIP_MIGRATIONS=1`) | 5,114 ms *(excl. 22.1 s init)* |
+| **Sequential Ingest (`100 x 1`)** | **907.9 req/s** (`p50 = 1.04 ms`) | **892.8 req/s** (`p50 = 1.12 ms`) | 203.9 req/s (`p50 = 4.88 ms`) |
+| **Burst Ingest (`1,000 x 16` threads)** | **2,248 – 2,421 req/s** (`p50 = 5.8 ms`) | **2,208.9 req/s** (`p50 = 6.08 ms`) | 517.5 req/s (`p50 = 29.14 ms`) |
+| **Issues List API Read (`200 x 8` threads)** | **2,020.3 req/s** (`p50 = 3.50 ms`) | **1,979.1 req/s** (`p50 = 3.62 ms`) | 9.7 req/s (`p50 = 725.5 ms`) |
+| **Security Invariant Linter** | **< 3 ms** (`bugfinder lint`, 0 Python) | **< 3 ms** (`bugfinder lint`) | External scripts |
 
-### 2. Hardened Docker Compose (`128 MB` RAM Cap, Read-Only Rootfs)
+> **When to choose GlitchTip vs Bug-Finder:** Pick **GlitchTip** if you need native C/C++/Rust minidump (`difs`) symbolication or S3/Parquet cold storage. Pick **Bug-Finder** for a **~10 MiB** single-binary footprint, **sub-25 ms** cold starts, strict PostgreSQL `FORCE RLS`, immutable audit logs, and a built-in Rust Edge WAF without running Django, workers, or Redis.
 
-```bash
-docker compose up -d --build
-```
+---
 
-`compose.yml` enforces `mem_limit: 128m` (covering `mmap` + SourceMap headroom), `read_only: true`, `noexec,nosuid,nodev` on `/tmp`, `cap_drop: [ALL]`, `no-new-privileges:true`, and `pids_limit: 64`.
+## Documentation
 
-### 3. Manual Release Build & Verification
-
-```bash
-./scripts/build-release.sh
-./target/release/bugfinder --headless --bind 127.0.0.1:8080 --data ./data
-```
-
-Use `--app` instead of `--headless` to launch Bug-Finder as a local desktop window. See [docs/CLI_AND_CHECK_SHELL.md](docs/CLI_AND_CHECK_SHELL.md) for all subcommands and flags.
+- [Architecture & Performance Pipeline](docs/ARCHITECTURE.md): Adaptive `BatchWriter`, 16-shard `ShardedBoundedMap`, SIMD `AhoCorasick` WAF and Scrubber, SQLite WAL `mmap`, and PostgreSQL 17 `FORCE RLS`.
+- [1-Prompt Autonomous AI Integration & MCP](docs/AI_INTEGRATION.md): `/llms.txt`, `ai-blueprint`, `bugfinder ai-prompt`, stealth proxy routes, and read-only STDIO MCP tools.
+- [Endpoints & End-to-End Security](docs/ENDPOINTS_AND_SECURITY.md): Complete endpoint map, browser pre-wire scrubbing, RFC 9113 multi-header parsing, Passkey step-up re-auth, `enc:v2:` key rotation, and `v2` anti-replay webhooks.
+- [CLI Reference & 7-Layer Verification Shell](docs/CLI_AND_CHECK_SHELL.md): All 19 CLI subcommands plus `bugfinder check` and `./scripts/check.sh`.
+- [Security Policy](SECURITY.md): Vulnerability disclosure process, supported versions, and supply-chain guarantees.
 
 ---
 
